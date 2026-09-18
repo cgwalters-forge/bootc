@@ -488,9 +488,10 @@ pub(crate) enum ContainerOpts {
 
         /// EROFS format version to use when computing the composefs digest.
         ///
-        /// V1 produces a `composefs.digest=v1-sha512-12:<hex>` karg (C-tool compatible).
-        /// V2 produces the legacy `composefs=<hex>` karg (composefs-rs native).
-        /// Must match the format version used when images were committed to the repository.
+        /// By default, produce V1 then V2 kargs for compatibility. V1 produces a
+        /// `composefs.digest=v1-sha512-12:<hex>` karg (C-tool compatible), while V2
+        /// produces the legacy `composefs=<hex>` karg (composefs-rs native).
+        /// Explicit V2 produces only the V2 karg as a compatibility escape hatch.
         #[clap(long)]
         erofs_version: Option<ErofsVersionArg>,
 
