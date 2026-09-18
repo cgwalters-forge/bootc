@@ -66,6 +66,109 @@ use crate::lsm;
 use crate::podstorage::CStorage;
 use crate::progress_jsonl::ProgressWriter;
 
+/// An external image copied once to a target-backed OCI directory.  Keeping
+/// the directory alive makes both the preflight inspection and the real pull
+/// consume the same verified bytes.
+pub(crate) struct StagedSource {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) imgref: containers_image_proxy::ImageReference,
+}
+
+pub(crate) async fn stage_external_source(
+    source: &containers_image_proxy::ImageReference,
+    target_root: &std::path::Path,
+    expected_digest: Option<&str>,
+) -> Result<StagedSource> {
+    let stage_root = target_root.join("var/tmp");
+    std::fs::create_dir_all(&stage_root).context("Creating target-backed image staging area")?;
+    let dir = tempfile::Builder::new()
+        .prefix("bootc-composefs-")
+        .tempdir_in(&stage_root)
+        .context("Creating target-backed image staging directory")?;
+    let oci_dir = dir.path().join("oci");
+    std::fs::create_dir(&oci_dir)?;
+    let staged_tag = containers_image_proxy::ImageReference {
+        transport: containers_image_proxy::Transport::OciDir,
+        name: format!("{}:bootc-stage", oci_dir.display()),
+    };
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    let (auth_path, _empty_auth) =
+        if let Some((path, _)) = ostree_ext::globals::get_global_authfile(&root)? {
+            (path.as_std_path().to_owned(), None)
+        } else {
+            let auth = tempfile::NamedTempFile::new()?;
+            std::fs::write(auth.path(), b"{}")?;
+            let path = auth.into_temp_path();
+            (path.to_path_buf(), Some(path))
+        };
+    let digest =
+        ostree_ext::container::skopeo::copy(source, &staged_tag, Some(&auth_path), None, false)
+            .await
+            .context("Staging external image with signature policy")?;
+    if let Some(expected) = expected_digest {
+        anyhow::ensure!(
+            digest.to_string() == expected,
+            "Staged image digest {digest} does not match source digest {expected}"
+        );
+    }
+    let staged = containers_image_proxy::ImageReference {
+        transport: containers_image_proxy::Transport::OciDir,
+        // An OCI directory reference uses a tag after the directory path;
+        // `oci:/path@sha256:...` is interpreted as a literal directory name.
+        name: format!("{}:bootc-stage", oci_dir.display()),
+    };
+    Ok(StagedSource {
+        dir,
+        imgref: staged,
+    })
+}
+
+/// Pull the staged image into a private, insecure repository only to inspect
+/// UKI cmdlines.  The private repository is never used as an install target.
+pub(crate) async fn inspect_staged_uki_policy(
+    staged: &containers_image_proxy::ImageReference,
+    staging_dir: &std::path::Path,
+) -> Result<Option<bool>> {
+    let dir = tempfile::Builder::new()
+        .prefix("inspection-")
+        .tempdir_in(staging_dir)
+        .context("Creating temporary composefs inspection repo")?;
+    let root = Dir::open_ambient_dir(dir.path(), ambient_authority())?;
+    let config = composefs_repository_config(true);
+    let (repo, _) = crate::store::ComposefsRepository::init_path(&root, "repo", config)?;
+    let repo = Arc::new(repo);
+    let pulled = pull_composefs_direct(&repo, staged, true, ProgressWriter::default()).await?;
+    let fs = create_composefs_filesystem(
+        &*repo,
+        &pulled.config_digest,
+        Some(&pulled.config_verity),
+        &composefs_oci::OciTransformOptions::default(),
+    )?;
+    let entries = get_boot_resources(&fs, &*repo).context("Extracting staged boot entries")?;
+    crate::bootc_composefs::boot::uki_fsverity_policy(&repo, &entries)
+}
+
+/// Select the policy written to a new repository.  An insecure initial UKI
+/// opts into missing verity, while a strict UKI must not be weakened by an
+/// automatic filesystem-based default or an explicit option.
+pub(crate) fn resolve_initial_uki_policy(
+    filesystem_supports_fsverity: bool,
+    requested_allow_missing: bool,
+    uki_policy: Option<bool>,
+) -> Result<bool> {
+    match uki_policy {
+        Some(true) => Ok(true),
+        Some(false) => {
+            anyhow::ensure!(
+                filesystem_supports_fsverity,
+                "Initial UKI requires fs-verity, but the target filesystem does not support it"
+            );
+            Ok(false)
+        }
+        None => Ok(requested_allow_missing),
+    }
+}
+
 /// Create a composefs OCI tag name for the given manifest digest.
 ///
 /// Returns a tag like `localhost/bootc-sha256:abc...` which acts as a GC root
@@ -112,6 +215,7 @@ pub(crate) async fn initialize_composefs_repository(
     root_setup: &RootSetup,
     allow_missing_fsverity: bool,
     use_unified: bool,
+    fetch_imgref: Option<&containers_image_proxy::ImageReference>,
 ) -> Result<PullResult<Sha512HashValue>> {
     const COMPOSEFS_REPO_INIT_JOURNAL_ID: &str = "5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9";
 
@@ -145,13 +249,14 @@ pub(crate) async fn initialize_composefs_repository(
         repo.set_insecure();
     }
 
-    let imgref: containers_image_proxy::ImageReference = state
+    let original_imgref: containers_image_proxy::ImageReference = state
         .source
         .imageref
         .to_string()
         .as_str()
         .try_into()
         .context("Parsing source image reference")?;
+    let imgref = fetch_imgref.unwrap_or(&original_imgref);
 
     // Ensure the compatibility symlink ostree/bootc -> ../composefs/bootc
     // exists.  This is needed for LBI and (when unified storage is enabled)
@@ -223,6 +328,47 @@ pub(crate) struct PullRepoResult {
     pub(crate) manifest_digest: String,
     /// The untransformed OCI filesystem (still has /boot, /sysroot, etc.)
     pub(crate) fs: FileSystem<Sha512HashValue>,
+}
+
+/// The boot-facing artifacts reconstructed from a pulled OCI image.
+pub(crate) struct BootImage {
+    pub(crate) id: Sha512HashValue,
+    pub(crate) fs: FileSystem<Sha512HashValue>,
+    pub(crate) entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
+}
+
+/// Generate the boot image, reconstruct the untransformed filesystem for boot
+/// entry discovery, and reconcile the generated digest with a UKI, if present.
+///
+/// Keeping this sequence next to the pull paths is important: install and
+/// update must not independently generate images or recover a different digest.
+pub(crate) fn prepare_boot_image(
+    repo: &Arc<crate::store::ComposefsRepository>,
+    pull_result: &PullResult<Sha512HashValue>,
+) -> Result<BootImage> {
+    let generated_id = composefs_oci::generate_boot_image(
+        repo,
+        &pull_result.manifest_digest,
+        &composefs_oci::OciTransformOptions::default(),
+    )
+    .context("Generating bootable EROFS image")?;
+
+    let fs = create_composefs_filesystem(
+        &**repo,
+        &pull_result.config_digest,
+        Some(&pull_result.config_verity),
+        &composefs_oci::OciTransformOptions::default(),
+    )
+    .context("Creating composefs filesystem for boot entry discovery")?;
+    let entries =
+        get_boot_resources(&fs, &**repo).context("Extracting boot entries from OCI image")?;
+    let id = print_uki_dumpfile_diff_on_mismatch(
+        ensure_correct_composefs_digest(repo, &pull_result.manifest_digest, generated_id, &entries),
+        repo,
+        &fs,
+    )?;
+
+    Ok(BootImage { id, fs, entries })
 }
 
 /// Pull an image directly into the composefs repository via skopeo.
@@ -427,38 +573,7 @@ pub(crate) async fn pull_composefs_repo(
         "Pulled image into composefs repository",
     );
 
-    // Generate the bootable EROFS image (idempotent).
-    let generated_id = composefs_oci::generate_boot_image(
-        &repo,
-        &pull_result.manifest_digest,
-        &composefs_oci::OciTransformOptions::default(),
-    )
-    .context("Generating bootable EROFS image")?;
-
-    // Get boot entries from the OCI filesystem (untransformed).
-    let fs = create_composefs_filesystem(
-        &*repo,
-        &pull_result.config_digest,
-        Some(&pull_result.config_verity),
-        &composefs_oci::OciTransformOptions::default(),
-    )
-    .context("Creating composefs filesystem for boot entry discovery")?;
-    let entries =
-        get_boot_resources(&fs, &*repo).context("Extracting boot entries from OCI image")?;
-
-    // If the UKI was built by tooling using a different xattr filtering
-    // mode, find the mode whose boot image matches the digest embedded in
-    // the UKI.
-    let id = print_uki_dumpfile_diff_on_mismatch(
-        ensure_correct_composefs_digest(
-            &repo,
-            &pull_result.manifest_digest,
-            generated_id,
-            &entries,
-        ),
-        &repo,
-        &fs,
-    )?;
+    let BootImage { id, fs, entries } = prepare_boot_image(&repo, &pull_result)?;
 
     // Unwrap the Arc to get the owned repo back.
     let mut repo = Arc::try_unwrap(repo).map_err(|_| {
@@ -562,5 +677,47 @@ mod tests {
         )
         .unwrap();
         assert!(validate_repository_policy(&insecure_repo, false).is_err());
+    }
+
+    #[test]
+    fn test_initial_uki_policy_matrix() {
+        let cases = [
+            (true, false, None, Some(false)),
+            (false, true, None, Some(true)),
+            (true, true, Some(false), Some(false)),
+            (false, true, Some(false), None),
+            (false, false, Some(true), Some(true)),
+            (true, true, Some(true), Some(true)),
+        ];
+        for (supports, requested, uki_policy, expected) in cases {
+            let result = resolve_initial_uki_policy(supports, requested, uki_policy);
+            assert_eq!(result.ok(), expected);
+        }
+        assert!(resolve_initial_uki_policy(false, false, Some(false)).is_err());
+    }
+
+    #[test]
+    fn test_staged_reference_is_transport_aware() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("oci");
+        let reference = format!("oci:{}:bootc-stage", path.display());
+        let parsed: containers_image_proxy::ImageReference = reference.parse().unwrap();
+        assert_eq!(parsed.transport, containers_image_proxy::Transport::OciDir);
+        assert_eq!(parsed.name, format!("{}:bootc-stage", path.display()));
+
+        for (reference, transport) in [
+            (
+                "docker://example.test/os:latest",
+                containers_image_proxy::Transport::Registry,
+            ),
+            (
+                "containers-storage:localhost/os:latest",
+                containers_image_proxy::Transport::ContainerStorage,
+            ),
+        ] {
+            let parsed: containers_image_proxy::ImageReference = reference.parse().unwrap();
+            assert_eq!(parsed.transport, transport);
+            assert_eq!(parsed.to_string(), reference);
+        }
     }
 }

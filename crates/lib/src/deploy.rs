@@ -47,6 +47,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::os::fd::{AsFd, AsRawFd};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -447,6 +448,21 @@ fn check_disk_space_inner(
         );
     }
     Ok(())
+}
+
+/// Reserve room for the compressed OCI staging copy, the private inspection
+/// repository, and the final composefs import before downloading any layers.
+pub(crate) fn check_disk_space_for_composefs_staging(
+    staging_dir: &Path,
+    manifest: &ostree_ext::oci_spec::image::ImageManifest,
+    imgref: &ImageReference,
+) -> Result<()> {
+    const STAGING_SPACE_MULTIPLIER: u64 = 4;
+    let bytes: u64 = manifest.layers().iter().map(|layer| layer.size()).sum();
+    let required = bytes.saturating_mul(STAGING_SPACE_MULTIPLIER);
+    let dir = std::fs::File::open(staging_dir)
+        .with_context(|| format!("Opening staging filesystem {}", staging_dir.display()))?;
+    check_disk_space_inner(dir.as_fd(), required, 0, imgref)
 }
 
 /// Verify there is sufficient disk space to pull an image into the ostree repo.
