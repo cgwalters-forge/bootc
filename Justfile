@@ -65,6 +65,14 @@ testimage_label := "bootc.testimage=1"
 lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest"
 fedora-coreos := "quay.io/fedora/fedora-coreos:testing-devel"
 generic_buildargs := ""
+# Optional resource controls for containerized builds.  These are deliberately
+# opt-in so local and CI defaults remain unchanged.
+jobs := env("BOOTC_jobs", "")
+memory := env("BOOTC_memory", "")
+memory_swap := env("BOOTC_memory_swap", "")
+_resource_buildargs := if jobs != "" { " --build-arg=CARGO_BUILD_JOBS=" + jobs } else { "" }
+_resource_podman_args := (if memory != "" { " --memory=" + memory } else { "" }) \
+                         + (if memory_swap != "" { " --memory-swap=" + memory_swap } else { "" })
 _extra_src_args := if extra_src != "" { "-v " + extra_src + ":/run/extra-src:ro --security-opt=label=disable" } else { "" }
 # filesystem arg: required for bootc container ukify to allow missing fsverity
 # CARGO_INCREMENTAL is passed through as-is (CI sets it to 0); empty is a no-op,
@@ -78,7 +86,8 @@ base_buildargs := generic_buildargs + " " + _extra_src_args \
                   + " --build-arg=seal_state=" + seal_state \
                   + " --build-arg=filesystem=" + filesystem \
                   + " --build-arg=erofs_version=" + erofs_version \
-                  + " --build-arg=baseconfigs=" + baseconfigs
+                   + " --build-arg=baseconfigs=" + baseconfigs \
+                   + _resource_buildargs + _resource_podman_args
 buildargs := base_buildargs \
              + " --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse" \
              + " --secret=id=secureboot_key,src=target/test-secureboot/db.key --secret=id=secureboot_cert,src=target/test-secureboot/db.crt"

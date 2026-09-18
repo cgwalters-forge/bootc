@@ -25,6 +25,9 @@ ARG initramfs=1
 # When unset (local dev), cargo uses its profile defaults.
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+# Optional cargo parallelism, passed by Justfile for resource-constrained builds.
+ARG CARGO_BUILD_JOBS
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # This installs our buildroot, and we want to cache it independently of the rest.
 # Basically we don't want changing a .rs file to blow out the cache of packages.
 # Use tmpfs for /run and /tmp with bind mounts inside to avoid leaking mount stubs into the image
