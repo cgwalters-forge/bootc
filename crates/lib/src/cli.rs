@@ -809,7 +809,8 @@ pub(crate) enum InternalsOpts {
     ComposefsGC {
         #[clap(long)]
         dry_run: bool,
-        /// Exit with an error if GC would remove any objects or prune any symlinks.
+        /// Exit with an error if GC would remove anything (objects, symlinks,
+        /// boot binaries, state directories, tags, or the staged deployment).
         /// Implies `--dry-run`.  Intended for use in tests and health-checks.
         #[clap(long)]
         assert_no_op: bool,
@@ -2499,30 +2500,34 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                             println!("Dry run (no files deleted)");
                         }
 
+                        let repo = &gc_result.repo;
                         println!(
                             "Objects: {} removed ({} bytes)",
-                            gc_result.objects_removed, gc_result.objects_bytes
+                            repo.objects_removed, repo.objects_bytes
                         );
 
-                        if gc_result.images_pruned > 0 || gc_result.streams_pruned > 0 {
+                        if repo.images_pruned > 0 || repo.streams_pruned > 0 {
                             println!(
                                 "Pruned symlinks: {} images, {} streams",
-                                gc_result.images_pruned, gc_result.streams_pruned
+                                repo.images_pruned, repo.streams_pruned
                             );
                         }
 
-                        if assert_no_op {
-                            let is_noop = gc_result.objects_removed == 0
-                                && gc_result.images_pruned == 0
-                                && gc_result.streams_pruned == 0;
-                            if !is_noop {
-                                anyhow::bail!(
-                                    "--assert-no-op: GC would remove {} object(s), {} image symlink(s), {} stream symlink(s) (issue #1808)",
-                                    gc_result.objects_removed,
-                                    gc_result.images_pruned,
-                                    gc_result.streams_pruned,
-                                );
+                        for (what, n) in [
+                            ("Boot binaries", gc_result.boot_binaries_removed),
+                            ("State directories", gc_result.state_dirs_removed),
+                            ("Tags", gc_result.tags_removed),
+                            ("Staged deployment", gc_result.staged_removed.into()),
+                        ] {
+                            if n > 0 {
+                                println!("{what}: {n} removed");
                             }
+                        }
+
+                        if assert_no_op && !gc_result.is_noop() {
+                            anyhow::bail!(
+                                "--assert-no-op: GC would remove {gc_result} (issue #1808)"
+                            );
                         }
 
                         Ok(())
