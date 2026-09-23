@@ -30,6 +30,7 @@ use crate::bootc_composefs::status::{
     ComposefsCmdline, StagedDeployment, get_sorted_type1_boot_entries,
 };
 use crate::parsers::bls_config::{BLSConfigType, EFIKey};
+use crate::progress_jsonl::ProgressWriter;
 use crate::store::{BootedComposefs, Storage};
 use crate::{
     composefs_consts::{
@@ -328,10 +329,13 @@ pub(crate) async fn write_composefs_state(
     Ok(())
 }
 
-pub(crate) fn composefs_usr_overlay(access_mode: FilesystemOverlayAccessMode) -> Result<()> {
+pub(crate) fn composefs_usr_overlay(
+    access_mode: FilesystemOverlayAccessMode,
+    prog: &ProgressWriter,
+) -> Result<()> {
     let status = get_composefs_usr_overlay_status()?;
     if status.is_some() {
-        println!("An overlayfs is already mounted on /usr");
+        prog.info("An overlayfs is already mounted on /usr");
         return Ok(());
     }
 
@@ -345,8 +349,11 @@ pub(crate) fn composefs_usr_overlay(access_mode: FilesystemOverlayAccessMode) ->
     let overlay_fd = overlay_transient(usr.as_fd(), "transient", mount_attr_flags)?;
     mount_at_wrapper(overlay_fd, &usr, ".").context("Attaching /usr overlay")?;
 
-    println!("A {} overlayfs is now mounted on /usr", access_mode);
-    println!("All changes there will be discarded on reboot.");
+    prog.info(format!(
+        "A {} overlayfs is now mounted on /usr",
+        access_mode
+    ));
+    prog.info("All changes there will be discarded on reboot.");
 
     Ok(())
 }
