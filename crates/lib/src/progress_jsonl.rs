@@ -313,6 +313,11 @@ impl ProgressWriter {
         self.message(MessageLevel::Info, text)
     }
 
+    /// Shorthand for [`Self::message`] with [`MessageLevel::Warning`].
+    pub(crate) fn warning(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Warning, text)
+    }
+
     fn send_or_disable(&self, event: Event<'_>, required: bool) {
         if let Err(e) = self.send_impl(event, required) {
             eprintln!("Failed to write to jsonl: {e}");
