@@ -15,6 +15,7 @@ use rustix::fs::Mode;
 use rustix::fs::OFlags;
 
 use crate::podstorage::CStorage;
+use crate::progress_jsonl::ProgressWriter;
 use crate::utils::deployment_fd;
 
 use super::config;
@@ -42,7 +43,11 @@ pub(crate) const RUN_BOOTC_INSTALL_RECONCILED: &str = "run/bootc-install-reconci
 
 /// Assuming that the current root is an ostree deployment, pull kargs
 /// from it and inject them.
-fn reconcile_kargs(sysroot: &ostree::Sysroot, deployment: &ostree::Deployment) -> Result<()> {
+fn reconcile_kargs(
+    sysroot: &ostree::Sysroot,
+    deployment: &ostree::Deployment,
+    prog: &ProgressWriter,
+) -> Result<()> {
     let deployment_root = &crate::utils::deployment_fd(sysroot, deployment)?;
     let cancellable = gio::Cancellable::NONE;
 
@@ -58,7 +63,7 @@ fn reconcile_kargs(sysroot: &ostree::Sysroot, deployment: &ostree::Deployment) -
     let current_kargs = ostree::KernelArgs::from_string(&current_kargs);
 
     // Keep this in sync with install_container
-    let install_config = config::load_config()?;
+    let install_config = config::load_config(prog)?;
     let install_config_kargs = install_config
         .as_ref()
         .and_then(|c| c.kargs.as_ref())
@@ -197,6 +202,7 @@ fn open_proc1_root(rootfs: &Dir) -> Result<Dir> {
 
 /// Core entrypoint invoked when we are likely being invoked from inside Anaconda as a `%post`.
 pub(crate) async fn run_from_anaconda(rootfs: &Dir) -> Result<()> {
+    let prog = &ProgressWriter::default();
     // unshare our mount namespace, so any *further* mounts aren't leaked.
     // Note that because this does a re-exec, anything *before* this point
     // should be idempotent.
@@ -221,7 +227,7 @@ pub(crate) async fn run_from_anaconda(rootfs: &Dir) -> Result<()> {
         .try_exists(RUN_BOOTC_INSTALL_RECONCILED)
         .context("Querying reconciliation")?
     {
-        println!("Reconciliation already completed.");
+        prog.info("Reconciliation already completed.");
         return Ok(());
     }
 
@@ -235,7 +241,7 @@ pub(crate) async fn run_from_anaconda(rootfs: &Dir) -> Result<()> {
     sysroot
         .load(gio::Cancellable::NONE)
         .context("Loading sysroot")?;
-    impl_completion(rootfs, &sysroot, None).await?;
+    impl_completion(rootfs, &sysroot, None, prog).await?;
 
     proc1_root
         .write(RUN_BOOTC_INSTALL_RECONCILED, b"")
@@ -253,7 +259,13 @@ pub async fn run_from_ostree(rootfs: &Dir, sysroot: &Utf8Path, stateroot: &str) 
     let sysroot = ostree::Sysroot::new(Some(&gio::File::for_path(sysroot)));
     sysroot.load(gio::Cancellable::NONE)?;
 
-    impl_completion(rootfs, &sysroot, Some(stateroot)).await?;
+    impl_completion(
+        rootfs,
+        &sysroot,
+        Some(stateroot),
+        &ProgressWriter::default(),
+    )
+    .await?;
 
     // In this case we write the completion directly to /run as we're running from
     // the host context.
@@ -275,6 +287,7 @@ pub(crate) async fn impl_completion(
     rootfs: &Dir,
     sysroot: &ostree::Sysroot,
     stateroot: Option<&str>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     // Log the completion operation to systemd journal
     const COMPLETION_JOURNAL_ID: &str = "0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4";
@@ -295,7 +308,7 @@ pub(crate) async fn impl_completion(
     let rundir = &rootfs.open_dir(rundir)?;
 
     // ostree-ext doesn't do kargs, so handle that now
-    reconcile_kargs(&sysroot, deployment)?;
+    reconcile_kargs(&sysroot, deployment, prog)?;
 
     // ostree-ext doesn't do logically bound images
     let bound_images = crate::boundimage::query_bound_images_for_deployment(sysroot, deployment)?;
