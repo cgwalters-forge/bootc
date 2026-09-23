@@ -1064,7 +1064,8 @@ async fn pull_ostree_install_once(
     target_imgref: &ostree_container::OstreeImageReference,
     progress: PullProgress,
 ) -> Result<Box<crate::deploy::ImageState>> {
-    let prepared = prepare_for_pull(repo, imgref, Some(target_imgref), None).await?;
+    let prepared =
+        prepare_for_pull(repo, imgref, Some(target_imgref), None, progress.writer()).await?;
     pull_ostree_install_from_prepared(repo, imgref, prepared, progress).await
 }
 
@@ -1143,6 +1144,7 @@ async fn install_container(
             Some(&state.target_imgref),
             storage,
             None,
+            progress.writer(),
         )
         .await?;
         pull_ostree_install_from_prepared(repo, &spec_imgref, prepared, progress.clone()).await?

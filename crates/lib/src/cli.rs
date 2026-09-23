@@ -2482,7 +2482,9 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 crate::fsck::fsck(&storage, std::io::stdout().lock()).await?;
                 Ok(())
             }
-            InternalsOpts::FixupEtcFstab => crate::deploy::fixup_etc_fstab(&root),
+            InternalsOpts::FixupEtcFstab => {
+                crate::deploy::fixup_etc_fstab(&root, &ProgressWriter::default())
+            }
             InternalsOpts::SysusersSync => crate::sysusers_cleanup::run(&root),
             InternalsOpts::PrintJsonSchema { of } => {
                 let schema = match of {
@@ -2495,7 +2497,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             }
             InternalsOpts::Cleanup => {
                 let storage = get_storage().await?;
-                crate::deploy::cleanup(&storage).await
+                crate::deploy::cleanup(&storage, &ProgressWriter::default()).await
             }
             InternalsOpts::Relabel { as_path, path } => {
                 let root = &Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
