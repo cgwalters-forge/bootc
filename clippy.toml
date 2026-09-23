@@ -2,3 +2,16 @@ disallowed-methods = [
   # https://github.com/rust-lang/rust-clippy/issues/13434#issuecomment-2484292914
   { path = "str::len", reason = "use <str>.as_bytes().len() instead" }
 ]
+
+# anstream's print macros aren't covered by clippy::print_stdout/print_stderr,
+# which crates/lib denies. Only crates/lib denies this lint, and it's the
+# only user of these macros.
+disallowed-macros = [
+  { path = "anstream::print", reason = "use ProgressWriter::message() or an explicit writer" },
+  { path = "anstream::println", reason = "use ProgressWriter::message() or an explicit writer" },
+  { path = "anstream::eprint", reason = "use ProgressWriter::message() or an explicit writer" },
+  { path = "anstream::eprintln", reason = "use ProgressWriter::message() or an explicit writer" },
+]
+
+# Printing from tests is fine; see the print_stdout deny in crates/lib
+allow-print-in-tests = true
