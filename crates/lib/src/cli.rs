@@ -2095,7 +2095,9 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             };
             match env {
                 Environment::OstreeBooted => usroverlay(access_mode).await,
-                Environment::ComposefsBooted(_) => composefs_usr_overlay(access_mode),
+                Environment::ComposefsBooted(_) => {
+                    composefs_usr_overlay(access_mode, &ProgressWriter::default())
+                }
                 _ => anyhow::bail!("usroverlay only applies on booted hosts"),
             }
         }
@@ -2602,8 +2604,9 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                     }
 
                     BootedStorageKind::Composefs(booted_cfs) => {
+                        let prog = &ProgressWriter::default();
                         if reset {
-                            return reset_soft_reboot().map(|()| CliExitStatus::Success);
+                            return reset_soft_reboot(prog).map(|()| CliExitStatus::Success);
                         }
 
                         prepare_soft_reboot_composefs(
@@ -2612,6 +2615,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                             deployment.as_deref(),
                             SoftRebootMode::Required,
                             reboot,
+                            prog,
                         )
                         .await
                     }
