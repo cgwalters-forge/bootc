@@ -922,7 +922,7 @@ fn composefs_fetch_reference(
 }
 
 pub(crate) fn print_configuration(opts: InstallPrintConfigurationOpts) -> Result<()> {
-    let mut install_config = config::load_config()?.unwrap_or_default();
+    let mut install_config = config::load_config(&ProgressWriter::default())?.unwrap_or_default();
     if !opts.all {
         install_config.filter_to_external();
     }
@@ -1302,7 +1302,7 @@ async fn install_container(
     }
 
     if let Some(contents) = state.root_ssh_authorized_keys.as_deref() {
-        osconfig::inject_root_ssh_authorized_keys(&root, sepolicy, contents)?;
+        osconfig::inject_root_ssh_authorized_keys(&root, sepolicy, contents, &state.prog)?;
     }
 
     let aleph = InstallAleph::new(
@@ -1664,7 +1664,7 @@ async fn prepare_install(
 
     // Load install configuration from TOML drop-in files early, so that
     // config values are available when constructing the target image reference.
-    let install_config = config::load_config()?;
+    let install_config = config::load_config(&prog)?;
     if let Some(ref config) = install_config {
         tracing::debug!("Loaded install configuration");
         // Merge config file values into config_opts (CLI takes precedence)
