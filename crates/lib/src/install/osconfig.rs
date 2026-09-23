@@ -8,6 +8,8 @@ use cap_std_ext::{cap_std, dirext::CapStdExtDirExt};
 use fn_error_context::context;
 use ostree_ext::ostree;
 
+use crate::progress_jsonl::ProgressWriter;
+
 const ETC_TMPFILES: &str = "etc/tmpfiles.d";
 const ROOT_SSH_TMPFILE: &str = "bootc-root-ssh.conf";
 
@@ -20,6 +22,7 @@ pub(crate) fn inject_root_ssh_authorized_keys(
     dest: &Dir,
     sepolicy: Option<&ostree::SePolicy>,
     contents: &str,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     // While not documented right now, this one looks like it does not newline wrap
     let b64_encoded = ostree_ext::glib::base64_encode(contents.as_bytes());
@@ -46,7 +49,7 @@ pub(crate) fn inject_root_ssh_authorized_keys(
         w.write_all(tmpfiles_content.as_bytes()).map_err(Into::into)
     })?;
 
-    println!("Injected: {target}");
+    prog.info(format!("Injected: {target}"));
     Ok(())
 }
 
@@ -73,6 +76,7 @@ mod tests {
             root,
             Some(&policy),
             "ssh-ed25519 ABCDE example@demo\n",
+            &ProgressWriter::default(),
         )?;
 
         let expected = crate::lsm::require_label(
@@ -98,8 +102,14 @@ mod tests {
         root.create_dir("etc")?;
         // Test with a symlink
         root.symlink("var/roothome", "root")?;
-        inject_root_ssh_authorized_keys(root, root, None, "ssh-ed25519 ABCDE example@demo\n")
-            .unwrap();
+        inject_root_ssh_authorized_keys(
+            root,
+            root,
+            None,
+            "ssh-ed25519 ABCDE example@demo\n",
+            &ProgressWriter::default(),
+        )
+        .unwrap();
 
         let content = root.read_to_string(format!("etc/tmpfiles.d/{ROOT_SSH_TMPFILE}"))?;
         assert_eq!(
@@ -116,8 +126,14 @@ mod tests {
 
         root.create_dir("etc")?;
         root.create_dir("root")?;
-        inject_root_ssh_authorized_keys(root, root, None, "ssh-ed25519 ABCDE example@demo\n")
-            .unwrap();
+        inject_root_ssh_authorized_keys(
+            root,
+            root,
+            None,
+            "ssh-ed25519 ABCDE example@demo\n",
+            &ProgressWriter::default(),
+        )
+        .unwrap();
 
         let content = root.read_to_string(format!("etc/tmpfiles.d/{ROOT_SSH_TMPFILE}"))?;
         assert_eq!(
@@ -134,8 +150,14 @@ mod tests {
 
         root.symlink("var/roothome", "root")?;
         dest.create_dir("etc")?;
-        inject_root_ssh_authorized_keys(root, dest, None, "ssh-ed25519 ABCDE example@demo\n")
-            .unwrap();
+        inject_root_ssh_authorized_keys(
+            root,
+            dest,
+            None,
+            "ssh-ed25519 ABCDE example@demo\n",
+            &ProgressWriter::default(),
+        )
+        .unwrap();
 
         let content = dest.read_to_string(format!("etc/tmpfiles.d/{ROOT_SSH_TMPFILE}"))?;
         assert_eq!(

@@ -14,6 +14,7 @@ use ostree_ext::containers_image_proxy;
 use ostree_ext::ostree::Deployment;
 
 use crate::podstorage::{CStorage, PullMode};
+use crate::progress_jsonl::ProgressWriter;
 use crate::store::Storage;
 
 /// The path in a root for bound images; this directory should only contain
@@ -38,7 +39,11 @@ pub(crate) struct ResolvedBoundImage {
 }
 
 /// Given a deployment, pull all container images it references.
-pub(crate) async fn pull_bound_images(sysroot: &Storage, deployment: &Deployment) -> Result<()> {
+pub(crate) async fn pull_bound_images(
+    sysroot: &Storage,
+    deployment: &Deployment,
+    prog: &ProgressWriter,
+) -> Result<()> {
     // Log the bound images operation to systemd journal
     const BOUND_IMAGES_JOURNAL_ID: &str = "1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5";
     tracing::info!(
@@ -56,7 +61,7 @@ pub(crate) async fn pull_bound_images(sysroot: &Storage, deployment: &Deployment
         "Found {} bound images to pull",
         bound_images.len()
     );
-    pull_images(sysroot, bound_images).await
+    pull_images(sysroot, bound_images, prog).await
 }
 
 #[context("Querying bound images")]
@@ -164,19 +169,21 @@ fn parse_container_file(file_contents: &tini::Ini) -> Result<BoundImage> {
 pub(crate) async fn pull_images(
     sysroot: &Storage,
     bound_images: Vec<crate::boundimage::BoundImage>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     // Always initialize the img store to ensure labels are set when upgrading
     let imgstore = sysroot.get_ensure_imgstore()?;
     if bound_images.is_empty() {
         return Ok(());
     }
-    pull_images_impl(imgstore, bound_images).await
+    pull_images_impl(imgstore, bound_images, prog).await
 }
 
 #[context("Pulling bound images")]
 pub(crate) async fn pull_images_impl(
     imgstore: &CStorage,
     bound_images: Vec<crate::boundimage::BoundImage>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     let n = bound_images.len();
     tracing::debug!("Pulling bound images: {n}");
@@ -196,7 +203,7 @@ pub(crate) async fn pull_images_impl(
         .await?;
     }
 
-    println!("Bound images stored: {n}");
+    prog.info(format!("Bound images stored: {n}"));
 
     Ok(())
 }

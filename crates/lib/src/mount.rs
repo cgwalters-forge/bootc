@@ -30,6 +30,7 @@ use ostree_ext::{ostree, ostree_prepareroot};
 use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
 
 use crate::composefs_consts::STATE_DIR_RELATIVE;
+use crate::progress_jsonl::ProgressWriter;
 
 const ETC: &str = "etc";
 const VAR: &str = "var";
@@ -58,14 +59,16 @@ pub(crate) struct MountOpts {
 
 /// Open the mount target. Like mount(8), this mounts wherever the caller asks;
 /// like systemd, it warns when that hides existing content.
-fn open_mount_target(target: &Utf8Path) -> Result<Dir> {
+fn open_mount_target(target: &Utf8Path, prog: &ProgressWriter) -> Result<Dir> {
     let target_dir = Dir::open_ambient_dir(target, ambient_authority())
         .with_context(|| format!("Opening mount target {target}"))?;
     let mut entries = target_dir
         .entries()
         .with_context(|| format!("Reading mount target {target}"))?;
     if entries.next().is_some() {
-        eprintln!("warning: mount target {target} is not empty; its contents will be hidden");
+        prog.warning(format!(
+            "warning: mount target {target} is not empty; its contents will be hidden"
+        ));
     }
     Ok(target_dir)
 }
@@ -94,7 +97,7 @@ pub(crate) async fn mount(opts: MountOpts) -> Result<()> {
     // clap already requires --latest, the only selector so far.
     ensure!(opts.latest, "no deployment selected; pass --latest");
     let target = &opts.target;
-    let target_dir = open_mount_target(target)?;
+    let target_dir = open_mount_target(target, &ProgressWriter::default())?;
     let sysroot_dir = Dir::open_ambient_dir(&opts.sysroot, ambient_authority())
         .with_context(|| format!("Opening target sysroot {}", opts.sysroot))?;
 
@@ -294,6 +297,7 @@ fn attach(tree: impl AsFd, target: &Dir, name: &str) -> Result<()> {
 mod tests {
     use super::{DeploymentBackend, open_mount_target, select_backend};
     use crate::cli::{InstallOpts, Opt};
+    use crate::progress_jsonl::ProgressWriter;
     use camino::Utf8Path;
     use clap::Parser;
 
@@ -345,10 +349,11 @@ mod tests {
         let temp = Utf8Path::from_path(temp.path()).unwrap();
         let target = temp.join("target");
         std::fs::create_dir(&target).unwrap();
-        open_mount_target(&target).unwrap();
+        let prog = &ProgressWriter::default();
+        open_mount_target(&target, prog).unwrap();
         // Non-empty only warns, as with systemd.
         std::fs::create_dir(target.join("nested")).unwrap();
-        open_mount_target(&target).unwrap();
-        assert!(open_mount_target(&temp.join("missing")).is_err());
+        open_mount_target(&target, prog).unwrap();
+        assert!(open_mount_target(&temp.join("missing"), prog).is_err());
     }
 }
