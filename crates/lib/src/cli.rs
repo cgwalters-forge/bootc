@@ -1740,8 +1740,9 @@ async fn rollback_ostree(
     opts: &RollbackOpts,
     storage: &Storage,
     booted_ostree: &BootedOstree<'_>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
-    crate::deploy::rollback(storage).await?;
+    crate::deploy::rollback(storage, prog).await?;
 
     if opts.soft_reboot.is_some() {
         // Get status of rollback deployment to check soft-reboot capability
@@ -1762,11 +1763,14 @@ async fn rollback_ostree(
 #[context("Rollback")]
 async fn rollback(opts: &RollbackOpts) -> Result<()> {
     let storage = &get_storage().await?;
+    let prog = &ProgressWriter::default();
     match storage.kind()? {
         BootedStorageKind::Ostree(booted_ostree) => {
-            rollback_ostree(opts, storage, &booted_ostree).await
+            rollback_ostree(opts, storage, &booted_ostree, prog).await
         }
-        BootedStorageKind::Composefs(booted_cfs) => composefs_rollback(storage, &booted_cfs).await,
+        BootedStorageKind::Composefs(booted_cfs) => {
+            composefs_rollback(storage, &booted_cfs, prog).await
+        }
     }
 }
 
@@ -1803,7 +1807,7 @@ async fn edit_ostree(
     // We only support two state transitions right now; switching the image,
     // or flipping the bootloader ordering.
     if host.spec.boot_order != new_host.spec.boot_order {
-        return crate::deploy::rollback(storage).await;
+        return crate::deploy::rollback(storage, &prog).await;
     }
 
     let fetched = crate::deploy::pull(
