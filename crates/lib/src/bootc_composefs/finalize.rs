@@ -15,7 +15,7 @@ use cap_std_ext::dirext::CapStdExtDirExt;
 use composefs::generic_tree::{FileSystem, Stat};
 use composefs_ctl::composefs;
 use etc_merge::{Diff, compute_diff, merge, traverse_etc};
-use rustix::fs::fsync;
+use rustix::fs::{Mode, OFlags, fsync};
 
 use fn_error_context::context;
 
@@ -165,6 +165,35 @@ pub(crate) async fn composefs_backend_finalize(
     .await?;
 
     Ok(())
+}
+
+/// The mount that must stay busy while a deployment is staged.
+const HOLD_PATH: &str = "/boot";
+
+/// Keep [`HOLD_PATH`] open until we're killed, which systemd does with SIGTERM
+/// when `bootc-finalize-staged-hold.service` is stopped after
+/// `bootc-finalize-staged.service`.
+///
+/// When /boot is an automount (e.g. the ESP set up by
+/// systemd-gpt-auto-generator), an idle expire breaks finalization in two
+/// ways. If it races with shutdown, it deadlocks: the finalization (which
+/// looks up /boot) blocks on the expire, while the unmount is ordered after
+/// the finalization. If it completes before shutdown, systemd won't remount
+/// /boot once shutdown has begun, so finalization fails to open it (EHOSTDOWN)
+/// and the old deployment boots. An open file descriptor makes autofs treat
+/// the mount as busy, so it never expires. Note this only works from the
+/// root mount namespace.
+pub(crate) fn hold_boot() -> Result<()> {
+    let _fd = rustix::fs::open(
+        HOLD_PATH,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("Opening {HOLD_PATH}"))?;
+    tracing::debug!("Holding {HOLD_PATH} open until terminated");
+    loop {
+        std::thread::park();
+    }
 }
 
 #[context("Grub: Finalizing staged UKI")]
