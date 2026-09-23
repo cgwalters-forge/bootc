@@ -12,9 +12,17 @@ pub(crate) fn reboot() -> anyhow::Result<()> {
     // Flush output streams
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+    // Wait for the transient unit and pass through its stderr, so that if
+    // the reboot is refused (e.g. due to an inhibitor) we report an error
+    // instead of sleeping forever below. Note --wait/--pipe talk to systemd
+    // via the D-Bus system bus rather than /run/systemd/private, so without
+    // dbus (e.g. rescue.target) this fails loudly; staged changes are kept.
     Command::new("systemd-run")
         .args([
             "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
             "--",
             "systemctl",
             "reboot",
