@@ -119,6 +119,11 @@ impl PullProgress {
         }
     }
 
+    /// The writer for `--progress-fd` output and status messages.
+    pub(crate) fn writer(&self) -> &ProgressWriter {
+        &self.json
+    }
+
     fn clear(&self) {
         if let Err(error) = self.bars.clear() {
             tracing::debug!(%error, "Clearing pull progress");
@@ -548,6 +553,7 @@ pub(crate) async fn prepare_for_pull(
     imgref: &ImageReference,
     target_imgref: Option<&OstreeImageReference>,
     booted_deployment: Option<&ostree::Deployment>,
+    prog: &ProgressWriter,
 ) -> Result<PreparedPullResult> {
     let imgref_canonicalized = imgref.clone().canonicalize()?;
     tracing::debug!("Canonicalized image reference: {imgref_canonicalized:#}");
@@ -558,7 +564,7 @@ pub(crate) async fn prepare_for_pull(
     }
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
-            println!("No changes in {imgref:#} => {}", c.manifest_digest);
+            prog.info(format!("No changes in {imgref:#} => {}", c.manifest_digest));
             return Ok(PreparedPullResult::AlreadyPresent(Box::new((*c).into())));
         }
         PrepareResult::Ready(p) => p,
@@ -689,6 +695,7 @@ pub(crate) async fn prepare_for_pull_unified(
     target_imgref: Option<&OstreeImageReference>,
     store: &Storage,
     booted_deployment: Option<&ostree::Deployment>,
+    prog: &ProgressWriter,
 ) -> Result<PreparedPullResult> {
     // Get or initialize the bootc container storage (same as used for LBIs)
     let imgstore = store.get_ensure_imgstore()?;
@@ -737,7 +744,7 @@ pub(crate) async fn prepare_for_pull_unified(
     }
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
-            println!("No changes in {imgref:#} => {}", c.manifest_digest);
+            prog.info(format!("No changes in {imgref:#} => {}", c.manifest_digest));
             return Ok(PreparedPullResult::AlreadyPresent(Box::new((*c).into())));
         }
         PrepareResult::Ready(p) => p,
@@ -785,7 +792,16 @@ pub(crate) async fn pull_unified(
     booted_deployment: Option<&ostree::Deployment>,
 ) -> Result<Box<ImageState>> {
     let progress = PullProgress::new(quiet, prog);
-    match prepare_for_pull_unified(repo, imgref, target_imgref, store, booted_deployment).await? {
+    match prepare_for_pull_unified(
+        repo,
+        imgref,
+        target_imgref,
+        store,
+        booted_deployment,
+        progress.writer(),
+    )
+    .await?
+    {
         PreparedPullResult::AlreadyPresent(existing) => {
             // Log that the image was already present (Debug level since it's not actionable)
             const IMAGE_ALREADY_PRESENT_ID: &str = "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9";
@@ -951,7 +967,15 @@ async fn pull_once(
     progress: PullProgress,
     booted_deployment: Option<&ostree::Deployment>,
 ) -> Result<Box<ImageState>> {
-    match prepare_for_pull(repo, imgref, target_imgref, booted_deployment).await? {
+    match prepare_for_pull(
+        repo,
+        imgref,
+        target_imgref,
+        booted_deployment,
+        progress.writer(),
+    )
+    .await?
+    {
         PreparedPullResult::AlreadyPresent(existing) => {
             // Log that the image was already present (Debug level since it's not actionable)
             const IMAGE_ALREADY_PRESENT_ID: &str = "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9";
@@ -1019,7 +1043,7 @@ pub(crate) async fn wipe_ostree(sysroot: Sysroot) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
+pub(crate) async fn cleanup(sysroot: &Storage, prog: &ProgressWriter) -> Result<()> {
     // Log the cleanup operation to systemd journal
     const CLEANUP_JOURNAL_ID: &str = "2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6";
 
@@ -1033,6 +1057,7 @@ pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
     // We create clones (just atomic reference bumps) here to move to the thread.
     let ostree = sysroot.get_ostree_cloned()?;
     let repo = ostree.repo();
+    let prog = prog.clone();
     let repo_prune =
         ostree_ext::tokio_util::spawn_blocking_cancellable_flatten(move |cancellable| {
             let locked_sysroot = &SysrootLock::from_assumed_locked(&ostree);
@@ -1067,10 +1092,10 @@ pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
                 ostree_container::deploy::prune(locked_sysroot).context("Pruning images")?;
             if !pruned.is_empty() {
                 let size = glib::format_size(pruned.objsize);
-                println!(
+                prog.info(format!(
                     "Pruned images: {} (layers: {}, objsize: {})",
                     pruned.n_images, pruned.n_layers, size
-                );
+                ));
             } else {
                 tracing::debug!("Nothing to prune");
             }
@@ -1343,7 +1368,7 @@ pub(crate) async fn stage(
             .chain([subtask.clone()])
             .collect(),
     });
-    crate::deploy::cleanup(sysroot).await?;
+    crate::deploy::cleanup(sysroot, &prog).await?;
 
     if !lock_finalization {
         prog.info(format!("Queued for next boot: {:#}", spec.image));
@@ -1396,7 +1421,7 @@ fn write_reboot_required(image: &str) -> Result<()> {
 pub(crate) const ROLLBACK_JOURNAL_ID: &str = "26f3b1eb24464d12aa5e7b544a6b5468";
 
 /// Implementation of rollback functionality
-pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
+pub(crate) async fn rollback(sysroot: &Storage, prog: &ProgressWriter) -> Result<()> {
     let ostree = sysroot.get_ostree()?;
     let (booted_ostree, deployments, host) = crate::status::get_status_require_booted(ostree)?;
 
@@ -1413,7 +1438,7 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
 
     let reverting = new_spec.boot_order == BootOrder::Default;
     if reverting {
-        println!("notice: Reverting queued rollback state");
+        prog.info("notice: Reverting queued rollback state");
     }
     let rollback_status = host
         .status
@@ -1458,9 +1483,9 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
         .sysroot
         .write_deployments(&new_deployments, gio::Cancellable::NONE)?;
     if reverting {
-        println!("Next boot: current deployment");
+        prog.info("Next boot: current deployment");
     } else {
-        println!("Next boot: rollback deployment");
+        prog.info("Next boot: rollback deployment");
     }
 
     write_reboot_required(rollback_image.manifest_digest.as_ref())?;
@@ -1549,7 +1574,7 @@ pub(crate) fn switch_origin_inplace(root: &Dir, imgref: &ImageReference) -> Resu
 /// A workaround for <https://github.com/ostreedev/ostree/issues/3193>
 /// as generated by anaconda.
 #[context("Updating /etc/fstab for anaconda+composefs")]
-pub(crate) fn fixup_etc_fstab(root: &Dir) -> Result<()> {
+pub(crate) fn fixup_etc_fstab(root: &Dir, prog: &ProgressWriter) -> Result<()> {
     let fstab_path = "etc/fstab";
     // Read the old file
     let fd = root
@@ -1622,7 +1647,7 @@ pub(crate) fn fixup_etc_fstab(root: &Dir) -> Result<()> {
     })
     .context("Replacing /etc/fstab")?;
 
-    println!("Updated /etc/fstab to add `ro` for `/`");
+    prog.info("Updated /etc/fstab to add `ro` for `/`");
     Ok(())
 }
 
@@ -1861,7 +1886,7 @@ mod tests {
         let default = "UUID=f7436547-20ac-43cb-aa2f-eac9632183f6 /boot auto ro 0 0\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1873,7 +1898,7 @@ mod tests {
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1886,7 +1911,7 @@ UUID=1eef9f42-40e3-4bd8-ae20-e9f2325f8b52 /                     xfs   ro 0 0\n\
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1904,7 +1929,7 @@ UUID=1eef9f42-40e3-4bd8-ae20-e9f2325f8b52 / xfs defaults,ro 0 0\n\
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, modified);
         Ok(())
     }
