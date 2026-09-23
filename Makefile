@@ -40,16 +40,27 @@ CARGO_FEATURES_DEFAULT ?= $(shell . /usr/lib/os-release; \
   echo $$features)
 # You can set this to override all cargo features, including the defaults
 CARGO_FEATURES ?= $(CARGO_FEATURES_DEFAULT)
+# Set to 1 to build without the crates' default features, such as `selinux`
+# (which links libselinux). Re-enable the ones you want via CARGO_FEATURES,
+# e.g. `make CARGO_NO_DEFAULT_FEATURES=1 CARGO_FEATURES="install-to-disk pre-6.15"`.
+# Note this applies to every crate in the workspace, so it also drops e.g.
+# the initramfs crate's default `pre-6.15` unless it is listed again.
+# It only affects `bin` and `manpages`; the unit test targets
+# (install-unit-tests) still build with the default features and need
+# libselinux.
+CARGO_NO_DEFAULT_FEATURES ?=
+CARGO_NO_DEFAULT_FEATURES_ARG = $(if $(filter 1,$(CARGO_NO_DEFAULT_FEATURES)),--no-default-features)
 
 # Build all binaries
 .PHONY: bin
 bin: manpages
-	cargo build --release --features "$(CARGO_FEATURES)" --bins
+	cargo build --release $(CARGO_NO_DEFAULT_FEATURES_ARG) --features "$(CARGO_FEATURES)" --bins
 
-# Note this cargo build is run without features (such as rhsm)
+# Note this build doesn't use CARGO_FEATURES (such as rhsm); the man pages
+# document the full CLI regardless.
 .PHONY: manpages
 manpages:
-	cargo run --release --package xtask -- manpages
+	cargo run --release --package xtask -- manpages $(CARGO_NO_DEFAULT_FEATURES_ARG)
 
 .PHONY: completion
 completion: bin

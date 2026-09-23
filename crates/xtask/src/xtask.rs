@@ -69,7 +69,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate man pages
-    Manpages,
+    Manpages {
+        /// Build bootc without its default cargo features (e.g. `selinux`)
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Update or check generated files
     UpdateGenerated {
         #[command(subcommand)]
@@ -367,7 +371,9 @@ fn try_main() -> Result<()> {
     let sh = xshell::Shell::new()?;
 
     match cli.command {
-        Commands::Manpages => man::generate_man_pages(&sh),
+        Commands::Manpages {
+            no_default_features,
+        } => man::generate_man_pages(&sh, no_default_features),
         Commands::UpdateGenerated { command } => match command {
             UpdateGeneratedCommands::Direct { check } => {
                 if check {

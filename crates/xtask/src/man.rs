@@ -52,9 +52,12 @@ pub struct CliPositional {
     pub multiple: bool,
 }
 
-/// Extract CLI structure by running the JSON dump command
+/// Extract CLI structure by running the JSON dump command.
+///
+/// With `no_default_features`, bootc is built without its default cargo
+/// features, e.g. so that it doesn't need libselinux.
 #[context("Extracting CLI")]
-pub fn extract_cli_json(sh: &Shell) -> Result<CliCommand> {
+pub fn extract_cli_json(sh: &Shell, no_default_features: bool) -> Result<CliCommand> {
     // If we have a release binary, assume that we should compile
     // in release mode as hopefully we'll have incremental compilation
     // enabled.
@@ -63,9 +66,16 @@ pub fn extract_cli_json(sh: &Shell) -> Result<CliCommand> {
         .try_exists()
         .context("Querying release bin")?
         .then_some("--release");
+    // Even without default features, keep install-to-disk: it has no extra
+    // build dependencies, and the man pages document the full CLI.
+    let features: &[&str] = if no_default_features {
+        &["--no-default-features", "--features=docgen,install-to-disk"]
+    } else {
+        &["--features=docgen"]
+    };
     let json_output = cmd!(
         sh,
-        "cargo run {release...} --features=docgen -- internals dump-cli-json"
+        "cargo run {release...} {features...} -- internals dump-cli-json"
     )
     .read()
     .context("Running CLI JSON dump command")?;
@@ -380,8 +390,8 @@ fn find_command_path_for_filename(
 
 /// Sync all man pages with their corresponding CLI commands
 #[context("Syncing man pages")]
-pub fn sync_all_man_pages(sh: &Shell) -> Result<()> {
-    let cli_structure = extract_cli_json(sh)?;
+pub fn sync_all_man_pages(sh: &Shell, no_default_features: bool) -> Result<()> {
+    let cli_structure = extract_cli_json(sh, no_default_features)?;
 
     // Discover man page files automatically
     let mappings = discover_man_page_mappings(&cli_structure)?;
@@ -432,7 +442,7 @@ pub fn sync_all_man_pages(sh: &Shell) -> Result<()> {
 
 /// Generate man pages from hand-written markdown sources
 #[context("Generating manpages")]
-pub fn generate_man_pages(sh: &Shell) -> Result<()> {
+pub fn generate_man_pages(sh: &Shell, no_default_features: bool) -> Result<()> {
     let man_src_dir = Utf8Path::new("docs/src/man");
     let man_output_dir = Utf8Path::new("target/man");
 
@@ -441,7 +451,7 @@ pub fn generate_man_pages(sh: &Shell) -> Result<()> {
         .with_context(|| format!("Creating {man_output_dir}"))?;
 
     // First, sync the markdown files with current CLI options
-    sync_all_man_pages(sh)?;
+    sync_all_man_pages(sh, no_default_features)?;
 
     // Get version for replacement during generation
     let version = get_package_version()?;
@@ -527,7 +537,7 @@ fn get_package_version() -> Result<String> {
 /// Single command to update all man pages - auto-discover new commands and sync existing ones
 pub fn update_manpages(sh: &Shell) -> Result<()> {
     println!("Discovering CLI structure...");
-    let cli_structure = extract_cli_json(sh)?;
+    let cli_structure = extract_cli_json(sh, false)?;
 
     println!("Checking for missing man pages...");
     let mut created_count = 0;
@@ -634,7 +644,7 @@ TODO: Add practical examples showing how to use this command.
     }
 
     println!("Syncing OPTIONS sections...");
-    sync_all_man_pages(sh)?;
+    sync_all_man_pages(sh, false)?;
 
     println!("Man pages updated.");
     println!("");
@@ -649,7 +659,7 @@ TODO: Add practical examples showing how to use this command.
 /// Fails with an error if any file would change, similar to `cargo fmt --check`.
 #[context("Checking man pages")]
 pub fn check_manpages(sh: &Shell) -> Result<()> {
-    let cli_structure = extract_cli_json(sh)?;
+    let cli_structure = extract_cli_json(sh, false)?;
 
     // First: check no man pages are missing
     fn collect_commands(cmd: &CliCommand, path: Vec<String>, acc: &mut Vec<Vec<String>>) {

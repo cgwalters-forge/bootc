@@ -105,6 +105,22 @@ To explicitly control features:
 make all CARGO_FEATURES="rhsm"
 ```
 
+The `selinux` feature is enabled by default and links against libselinux.
+Distributions that do not use SELinux (and may not ship libselinux) can
+build without the default features and add back the others they want
+(`pre-6.15` is only needed to boot composefs systems on kernels older
+than 6.15). Such a build still detects an enabled SELinux via selinuxfs,
+but operations that need libselinux, such as relabeling files that are
+`unlabeled_t`, then fail, so only do this for systems without SELinux:
+
+```bash
+make bin CARGO_NO_DEFAULT_FEATURES=1 CARGO_FEATURES="install-to-disk pre-6.15"
+```
+
+Note that libostree may still link libselinux itself, depending on how it
+was built, and that the unit test targets (`make install-unit-tests`) always
+use the default features.
+
 ## Integration Testing
 
 For distributions that want to include integration tests, use:
