@@ -12,6 +12,7 @@ use fn_error_context::context;
 use bootc_mount as mount;
 
 use crate::bootc_composefs::boot::{MountedImageRoot, SecurebootKeys};
+use crate::progress_jsonl::ProgressWriter;
 use crate::utils;
 
 /// The name of the mountpoint for efi (as a subdirectory of /boot, or at the toplevel)
@@ -151,6 +152,7 @@ pub(crate) fn install_via_bootupd(
     configopts: &crate::install::InstallConfigOpts,
     chroot_target: Option<&Utf8Path>,
     bind_boot_path: Option<&Utf8Path>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     let verbose = std::env::var_os("BOOTC_BOOTLOADER_DEBUG").map(|_| "-vvvv");
     // bootc defaults to only targeting the platform boot method.
@@ -167,7 +169,7 @@ pub(crate) fn install_via_bootupd(
         "/"
     };
 
-    println!("Installing bootloader via bootupd");
+    prog.info("Installing bootloader via bootupd");
 
     // Build the bootupctl arguments
     let mut bootupd_args: Vec<&str> = vec!["backend", "install"];
@@ -268,8 +270,9 @@ pub(crate) fn install_systemd_boot(
     prepared_root: &MountedImageRoot,
     configopts: &crate::install::InstallConfigOpts,
     autoenroll: Option<SecurebootKeys>,
+    prog: &ProgressWriter,
 ) -> Result<()> {
-    println!("Installing bootloader via systemd-boot");
+    prog.info("Installing bootloader via systemd-boot");
 
     // We use the --root of the mounted target root, so we have the right /etc/os-release.
     let root_path = prepared_root
@@ -347,11 +350,11 @@ pub(crate) fn install_systemd_boot(
             }
             dir.copy(filename, &keys_dir, filename)
                 .with_context(|| format!("Copying secure boot key {filename:?}"))?;
-            println!(
+            prog.info(format!(
                 "Wrote Secure Boot key: {}/{}",
                 keys_path.display(),
                 filename.as_str()
-            );
+            ));
         }
         if keys.is_empty() {
             tracing::debug!("No Secure Boot keys provided for systemd-boot enrollment");
@@ -390,7 +393,11 @@ fn parse_systemd_version(output: &str) -> Result<u32> {
 }
 
 #[context("Installing bootloader using zipl")]
-pub(crate) fn install_via_zipl(device: &bootc_blockdev::Device, boot_uuid: &str) -> Result<()> {
+pub(crate) fn install_via_zipl(
+    device: &bootc_blockdev::Device,
+    boot_uuid: &str,
+    prog: &ProgressWriter,
+) -> Result<()> {
     // Identify the target boot partition from UUID
     let fs = mount::inspect_filesystem_by_uuid(boot_uuid)?;
     let boot_dir = Utf8Path::new(&fs.target);
@@ -452,7 +459,7 @@ pub(crate) fn install_via_zipl(device: &bootc_blockdev::Device, boot_uuid: &str)
     let ramdisk = boot_dir.join(initrd).canonicalize_utf8()?;
 
     // Execute the zipl command to install bootloader
-    println!("Running zipl on {device_path}");
+    prog.info(format!("Running zipl on {device_path}"));
     Command::new("zipl")
         .args(["--target", boot_dir.as_str()])
         .args(["--image", image.as_str()])

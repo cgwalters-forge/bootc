@@ -1942,7 +1942,11 @@ async fn install_with_sysroot(
     if cfg!(target_arch = "s390x") {
         // TODO: Integrate s390x support into install_via_bootupd
         // zipl only supports single device
-        crate::bootloader::install_via_zipl(&rootfs.device_info.require_single_root()?, boot_uuid)?;
+        crate::bootloader::install_via_zipl(
+            &rootfs.device_info.require_single_root()?,
+            boot_uuid,
+            &state.prog,
+        )?;
     } else {
         match postfetch.detected_bootloader {
             Bootloader::Grub => {
@@ -1958,6 +1962,7 @@ async fn install_with_sysroot(
                     &state.config_opts,
                     Some(chroot_target.as_path()),
                     Some(bind_boot_path.as_path()),
+                    &state.prog,
                 )?;
             }
             Bootloader::Systemd | Bootloader::GrubCC => {
