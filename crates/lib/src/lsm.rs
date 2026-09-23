@@ -25,9 +25,13 @@ const SELINUXFS: &str = "/sys/fs/selinux";
 /// The SELinux xattr
 const SELINUX_XATTR: &[u8] = b"security.selinux\0";
 /// The kernel initial SID used for objects without a label.
+#[cfg(feature = "selinux")]
 const SELINUX_INITIAL_SID_UNLABELED: &str = "unlabeled";
 const SELF_CURRENT: &str = "/proc/self/attr/current";
+/// Error message for operations which require libselinux.
+const SELINUX_NOT_BUILT: &str = "bootc was built without SELinux support (the `selinux` feature)";
 
+#[cfg(feature = "selinux")]
 fn unlabeled_type() -> Result<CString> {
     let context =
         selinux::SecurityContext::of_initial_kernel_context(SELINUX_INITIAL_SID_UNLABELED, true)
@@ -35,12 +39,42 @@ fn unlabeled_type() -> Result<CString> {
     context_type(context.as_bytes())
 }
 
+#[cfg(not(feature = "selinux"))]
+fn unlabeled_type() -> Result<CString> {
+    anyhow::bail!(SELINUX_NOT_BUILT)
+}
+
 /// Whether SELinux is enabled for the current process.
 ///
 /// libselinux caches this state process-wide, so mounting selinuxfs requires a
 /// re-exec before this result can change.
+#[cfg(feature = "selinux")]
 pub(crate) fn selinux_enabled() -> bool {
     selinux::kernel_support() != selinux::KernelSupport::Unsupported
+}
+
+/// Without libselinux, check for a mounted selinuxfs directly (like
+/// [`ostree_ext::selinux::is_selinux_enabled`]), so that a build without the
+/// `selinux` feature still notices SELinux on the host: it then enters
+/// install_t and checks policy compatibility as usual, and operations that
+/// need libselinux (such as detecting `unlabeled_t` when relabeling) fail
+/// instead of silently doing the wrong thing.
+#[cfg(not(feature = "selinux"))]
+pub(crate) fn selinux_enabled() -> bool {
+    Path::new(SELINUXFS).join("enforce").exists()
+}
+
+/// Return an error unless bootc was built with the `selinux` feature.
+pub(crate) fn require_selinux_built() -> Result<()> {
+    anyhow::ensure!(cfg!(feature = "selinux"), SELINUX_NOT_BUILT);
+    Ok(())
+}
+
+/// Return an error unless SELinux is enabled for the current process.
+pub(crate) fn require_selinux_enabled() -> Result<()> {
+    require_selinux_built()?;
+    anyhow::ensure!(selinux_enabled(), "SELinux is not enabled");
+    Ok(())
 }
 
 /// Whether SELinux is enabled on the host, as observed from PID 1's mount namespace.
@@ -290,6 +324,7 @@ pub(crate) enum SELinuxLabelState {
     Labeled,
 }
 
+#[cfg(feature = "selinux")]
 fn context_type(context: &[u8]) -> Result<CString> {
     // security.selinux xattrs may include a trailing NUL terminator.
     let context = context.strip_suffix(b"\0").unwrap_or(context);
@@ -301,6 +336,11 @@ fn context_type(context: &[u8]) -> Result<CString> {
         .context("Parsing SELinux context")?
         .the_type()
         .context("Reading SELinux context type")
+}
+
+#[cfg(not(feature = "selinux"))]
+fn context_type(_context: &[u8]) -> Result<CString> {
+    anyhow::bail!(SELINUX_NOT_BUILT)
 }
 
 /// Query the SELinux labeling for a particular path
@@ -645,6 +685,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "selinux"))]
+    fn test_selinux_not_built() {
+        let enforce = Path::new(SELINUXFS).join("enforce");
+        assert_eq!(selinux_enabled(), enforce.exists());
+        for err in [
+            require_selinux_built().unwrap_err(),
+            require_selinux_enabled().unwrap_err(),
+            unlabeled_type().unwrap_err(),
+            context_type(b"system_u:object_r:var_t:s0").unwrap_err(),
+        ] {
+            assert_eq!(err.to_string(), SELINUX_NOT_BUILT);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "selinux")]
     fn test_context_type() {
         let cases: &[(&[u8], Option<&str>)] = &[
             (b"system_u:object_r:unlabeled_t:s0", Some("unlabeled_t")),

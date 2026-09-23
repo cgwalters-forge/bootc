@@ -1448,6 +1448,12 @@ pub(crate) fn reexecute_self_for_selinux_if_needed(
             println!("notice: Target has SELinux enabled, overriding to disable");
             SELinuxFinalState::ForceTargetDisabled
         } else if host_selinux {
+            // Labeling the target needs libselinux (e.g. to detect unlabeled_t
+            // content), so fail before touching the disk rather than partway
+            // through the install.
+            crate::lsm::require_selinux_built().context(
+                "Target image and host have SELinux enabled; use --disable-selinux to install without it",
+            )?;
             // /sys/fs/selinuxfs is not normally mounted, so we do that now.
             // Because SELinux enablement status is cached process-wide and was very likely
             // already queried by something else (e.g. glib's constructor), we would also need

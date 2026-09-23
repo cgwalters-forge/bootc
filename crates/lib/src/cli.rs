@@ -2460,7 +2460,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 }
             },
             InternalsOpts::Selinux(SelinuxOpts::IsUnlabeled { path }) => {
-                ensure!(crate::lsm::selinux_enabled(), "SELinux is not enabled");
+                crate::lsm::require_selinux_enabled()?;
                 let path = path
                     .strip_prefix("/")
                     .expect("absolute paths have a root prefix");
