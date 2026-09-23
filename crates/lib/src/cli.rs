@@ -1305,7 +1305,7 @@ async fn apply_from_downloaded_ostree(
         .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
 
     if staged_deployment.is_finalization_locked() {
-        crate::boundimage::pull_bound_images(storage, &staged_deployment).await?;
+        crate::boundimage::pull_bound_images(storage, &staged_deployment, prog).await?;
         ostree.change_finalization(&staged_deployment)?;
         prog.info("Staged deployment will now be applied on reboot");
     } else {

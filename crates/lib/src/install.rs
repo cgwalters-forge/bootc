@@ -1987,7 +1987,7 @@ async fn install_with_sysroot(
             }
         }
         BoundImages::Unresolved(bound_images) => {
-            crate::boundimage::pull_images_impl(c_storage, bound_images)
+            crate::boundimage::pull_images_impl(c_storage, bound_images, &state.prog)
                 .await
                 .context("pulling bound images")?;
         }

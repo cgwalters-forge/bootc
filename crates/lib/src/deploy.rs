@@ -1149,7 +1149,11 @@ impl MergeState {
 
 /// Pull the bound images referenced by an imported commit before staging it.
 #[context("Pulling bound images for ostree commit {commit}")]
-async fn pull_bound_images_for_commit(sysroot: &Storage, commit: &str) -> Result<()> {
+async fn pull_bound_images_for_commit(
+    sysroot: &Storage,
+    commit: &str,
+    prog: &ProgressWriter,
+) -> Result<()> {
     let repo = sysroot.get_ostree()?.repo();
     let repo_dir = Dir::reopen_dir(&repo.dfd_borrow())?;
     let repo_tmp = repo_dir
@@ -1176,7 +1180,7 @@ async fn pull_bound_images_for_commit(sysroot: &Storage, commit: &str) -> Result
     .context("Checking out imported commit")?;
     let root = td.open_dir(root_name)?;
     let bound_images = crate::boundimage::query_bound_images(&root)?;
-    crate::boundimage::pull_images(sysroot, bound_images).await
+    crate::boundimage::pull_images(sysroot, bound_images, prog).await
 }
 
 /// Stage (queue deployment of) a fetched container image.
@@ -1242,7 +1246,7 @@ pub(crate) async fn stage(
             .chain([subtask.clone()])
             .collect(),
     });
-    pull_bound_images_for_commit(sysroot, &image.ostree_commit).await?;
+    pull_bound_images_for_commit(sysroot, &image.ostree_commit, &prog).await?;
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
