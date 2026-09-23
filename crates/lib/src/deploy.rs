@@ -1338,7 +1338,7 @@ fn write_reboot_required(image: &str) -> Result<()> {
 pub(crate) const ROLLBACK_JOURNAL_ID: &str = "26f3b1eb24464d12aa5e7b544a6b5468";
 
 /// Implementation of rollback functionality
-pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
+pub(crate) async fn rollback(sysroot: &Storage, prog: &ProgressWriter) -> Result<()> {
     let ostree = sysroot.get_ostree()?;
     let (booted_ostree, deployments, host) = crate::status::get_status_require_booted(ostree)?;
 
@@ -1355,7 +1355,7 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
 
     let reverting = new_spec.boot_order == BootOrder::Default;
     if reverting {
-        println!("notice: Reverting queued rollback state");
+        prog.info("notice: Reverting queued rollback state");
     }
     let rollback_status = host
         .status
@@ -1400,9 +1400,9 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
         .sysroot
         .write_deployments(&new_deployments, gio::Cancellable::NONE)?;
     if reverting {
-        println!("Next boot: current deployment");
+        prog.info("Next boot: current deployment");
     } else {
-        println!("Next boot: rollback deployment");
+        prog.info("Next boot: rollback deployment");
     }
 
     write_reboot_required(rollback_image.manifest_digest.as_ref())?;
