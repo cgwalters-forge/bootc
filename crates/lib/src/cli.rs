@@ -65,7 +65,8 @@ use crate::{bootc_composefs, lints};
 /// Shared progress options
 #[derive(Clone, Debug, Parser, PartialEq, Eq)]
 pub(crate) struct ProgressOptions {
-    /// File descriptor number which must refer to an open pipe.
+    /// File descriptor number to write progress to, typically the write end
+    /// of a pipe.
     ///
     /// Progress is written as JSON lines to this file descriptor.
     #[clap(long, hide = true)]
