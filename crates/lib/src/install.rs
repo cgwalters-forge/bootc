@@ -655,6 +655,9 @@ pub(crate) struct State {
     pub(crate) composefs_options: InstallComposefsOpts,
     pub(crate) composefs_fsverity_supported: bool,
     pub(crate) allow_missing_verity_explicit: bool,
+
+    /// Status output, see [`ProgressWriter::message`]
+    pub(crate) prog: ProgressWriter,
 }
 
 // Shared read-only global state
@@ -944,7 +947,7 @@ async fn initialize_ostree_root(state: &State, root_setup: &RootSetup) -> Result
             .cwd(rootfs_dir)?
             .run()?;
     } else {
-        println!("Reusing extant ostree layout");
+        state.prog.info("Reusing extant ostree layout");
 
         let path = ".".into();
         let _ = crate::utils::open_dir_remount_rw(rootfs_dir, path)
@@ -1441,13 +1444,14 @@ impl SELinuxFinalState {
 pub(crate) fn reexecute_self_for_selinux_if_needed(
     srcdata: &SourceInfo,
     override_disable_selinux: bool,
+    prog: &ProgressWriter,
 ) -> Result<SELinuxFinalState> {
     // If the target state has SELinux enabled, we need to check the host state.
     if srcdata.selinux {
         let host_selinux = crate::lsm::host_selinux_enabled()?;
         tracing::debug!("Target has SELinux, host={host_selinux}");
         let r = if override_disable_selinux {
-            println!("notice: Target has SELinux enabled, overriding to disable");
+            prog.info("notice: Target has SELinux enabled, overriding to disable");
             SELinuxFinalState::ForceTargetDisabled
         } else if host_selinux {
             // /sys/fs/selinuxfs is not normally mounted, so we do that now.
@@ -1611,6 +1615,7 @@ async fn prepare_install(
     mut target_opts: InstallTargetOpts,
     mut composefs_options: InstallComposefsOpts,
     target_fs: Option<FilesystemEnum>,
+    prog: ProgressWriter,
 ) -> Result<Arc<State>> {
     tracing::trace!("Preparing install");
     let allow_missing_verity_explicit = composefs_options.allow_missing_verity;
@@ -1763,12 +1768,13 @@ async fn prepare_install(
     setup_sys_mount("efivarfs", EFIVARFS)?;
 
     // Now, deal with SELinux state.
-    let selinux_state = reexecute_self_for_selinux_if_needed(&source, config_opts.disable_selinux)?;
+    let selinux_state =
+        reexecute_self_for_selinux_if_needed(&source, config_opts.disable_selinux, &prog)?;
     tracing::debug!("SELinux state: {selinux_state:?}");
 
-    println!("Installing image: {:#}", &target_imgref);
+    prog.info(format!("Installing image: {:#}", &target_imgref));
     if let Some(digest) = source.digest.as_deref() {
-        println!("Digest: {digest}");
+        prog.info(format!("Digest: {digest}"));
     }
 
     let root_filesystem = target_fs
@@ -1873,6 +1879,7 @@ async fn prepare_install(
         composefs_options,
         composefs_fsverity_supported,
         allow_missing_verity_explicit,
+        prog,
     });
 
     Ok(state)
@@ -1893,7 +1900,9 @@ impl PostFetchState {
                 }
             }
         };
-        println!("Bootloader: {detected_bootloader}");
+        state
+            .prog
+            .info(format!("Bootloader: {detected_bootloader}"));
         let r = Self {
             detected_bootloader,
         };
@@ -2077,14 +2086,16 @@ async fn install_to_filesystem_impl(
 
     match rootfs.device_info.pttype.as_deref() {
         Some("dos") => crate::utils::medium_visibility_warning(
+            &state.prog,
             "Installing to `dos` format partitions is not recommended",
         ),
         Some("gpt") => {
             // The only thing we should be using in general
         }
-        Some(o) => {
-            crate::utils::medium_visibility_warning(&format!("Unknown partition table type {o}"))
-        }
+        Some(o) => crate::utils::medium_visibility_warning(
+            &state.prog,
+            &format!("Unknown partition table type {o}"),
+        ),
         None => {
             // No partition table type - may be a filesystem install or loop device
         }
@@ -2205,8 +2216,8 @@ async fn install_to_filesystem_impl(
     Ok(())
 }
 
-fn installation_complete() {
-    println!("Installation complete!");
+fn installation_complete(prog: &ProgressWriter) {
+    prog.info("Installation complete!");
 }
 
 /// Implementation of the `bootc install to-disk` CLI command.
@@ -2222,6 +2233,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         .map(|s| s.as_str())
         .unwrap_or("none");
     let target_device = opts.block_opts.device.as_str();
+    let prog = ProgressWriter::default();
 
     tracing::info!(
         message_id = INSTALL_DISK_JOURNAL_ID,
@@ -2241,6 +2253,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
     if opts.via_loopback {
         if !opts.config_opts.generic_image {
             crate::utils::medium_visibility_warning(
+                &prog,
                 "Automatically enabling --generic-image when installing via loopback",
             );
             opts.config_opts.generic_image = true;
@@ -2261,6 +2274,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         opts.target_opts,
         opts.composefs_opts,
         block_opts.filesystem,
+        prog.clone(),
     )
     .await?;
 
@@ -2308,7 +2322,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         tracing::warn!("Failed to consume state Arc");
     }
 
-    installation_complete();
+    installation_complete(&prog);
 
     Ok(())
 }
@@ -2501,7 +2515,7 @@ fn find_root_args_to_inherit(
     Ok(RootMountInfo { mount_spec, kargs })
 }
 
-fn warn_on_host_root(rootfs_fd: &Dir) -> Result<()> {
+fn warn_on_host_root(rootfs_fd: &Dir, prog: &ProgressWriter) -> Result<()> {
     // Seconds for which we wait while warning
     const DELAY_SECONDS: u64 = 20;
 
@@ -2514,12 +2528,16 @@ fn warn_on_host_root(rootfs_fd: &Dir) -> Result<()> {
     }
     let dashes = "----------------------------";
     let timeout = Duration::from_secs(DELAY_SECONDS);
-    eprintln!("{dashes}");
+    // Purely visual framing, so only for the terminal
+    let _ = writeln!(std::io::stderr(), "{dashes}");
     crate::utils::medium_visibility_warning(
+        prog,
         "WARNING: This operation will OVERWRITE THE BOOTED HOST ROOT FILESYSTEM and is NOT REVERSIBLE.",
     );
-    eprintln!("Waiting {timeout:?} to continue; interrupt (Control-C) to cancel.");
-    eprintln!("{dashes}");
+    prog.warning(format!(
+        "Waiting {timeout:?} to continue; interrupt (Control-C) to cancel."
+    ));
+    let _ = writeln!(std::io::stderr(), "{dashes}");
 
     let bar = indicatif::ProgressBar::new_spinner();
     bar.enable_steady_tick(Duration::from_millis(100));
@@ -2550,6 +2568,7 @@ pub(crate) async fn install_to_filesystem(
         .map(|s| s.as_str())
         .unwrap_or("none");
     let target_path = opts.filesystem_opts.root_path.as_str();
+    let prog = ProgressWriter::default();
 
     tracing::info!(
         message_id = INSTALL_FILESYSTEM_JOURNAL_ID,
@@ -2648,18 +2667,19 @@ pub(crate) async fn install_to_filesystem(
         opts.target_opts,
         opts.composefs_opts,
         Some(inspect.fstype.as_str().try_into()?),
+        prog.clone(),
     )
     .await?;
 
     // Check to see if this happens to be the real host root
     if !fsopts.acknowledge_destructive {
-        warn_on_host_root(&target_rootfs_fd)?;
+        warn_on_host_root(&target_rootfs_fd, &prog)?;
     }
 
     match fsopts.replace {
         Some(ReplaceMode::Wipe) => {
             let rootfs_fd = rootfs_fd.try_clone()?;
-            println!("Wiping contents of root");
+            prog.info("Wiping contents of root");
             tokio::task::spawn_blocking(move || remove_all_in_dir_no_xdev(&rootfs_fd, true))
                 .await??;
         }
@@ -2816,7 +2836,7 @@ pub(crate) async fn install_to_filesystem(
     // Drop all data about the root except the path to ensure any file descriptors etc. are closed.
     drop(rootfs);
 
-    installation_complete();
+    installation_complete(&prog);
 
     Ok(())
 }
