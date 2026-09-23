@@ -1887,6 +1887,7 @@ fn join_host_ipc_namespace() -> Result<()> {
 /// Perform process global initialization. This should be called as early as possible
 /// in the standard `main` function.
 #[allow(unsafe_code)]
+#[expect(clippy::print_stderr, reason = "runs before tracing is initialized")]
 pub fn global_init() -> Result<()> {
     join_host_ipc_namespace()?;
     // In some cases we re-exec with a temporary binary,

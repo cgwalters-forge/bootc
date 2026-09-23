@@ -172,6 +172,10 @@ pub(crate) fn sigpolicy_from_opt(enforce_container_verification: bool) -> Signat
 ///
 /// Unlike [`ProgressWriter::message`], this highlights the warning on
 /// the terminal; it is sent to any progress fd as a regular warning.
+#[expect(
+    clippy::disallowed_macros,
+    reason = "colored output for the terminal; also sent as a Message event below"
+)]
 pub(crate) fn medium_visibility_warning(prog: &ProgressWriter, s: &str) {
     anstream::eprintln!(
         "{}{s}{}",
@@ -190,6 +194,10 @@ pub(crate) fn medium_visibility_warning(prog: &ProgressWriter, s: &str) {
 /// with an automatic spinner to show that we're not blocked.
 /// Note that generally the called function should not output
 /// anything to stderr as this will interfere with the spinner.
+#[expect(
+    clippy::print_stderr,
+    reason = "fallback when the progress bar is hidden (no tty)"
+)]
 pub(crate) async fn async_task_with_spinner<F, T>(msg: &str, f: F) -> T
 where
     F: Future<Output = T>,
