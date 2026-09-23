@@ -318,6 +318,10 @@ impl ProgressWriter {
         self.message(MessageLevel::Warning, text)
     }
 
+    #[expect(
+        clippy::print_stderr,
+        reason = "the progress fd itself is failing, so report it on stderr"
+    )]
     fn send_or_disable(&self, event: Event<'_>, required: bool) {
         if let Err(e) = self.send_impl(event, required) {
             eprintln!("Failed to write to jsonl: {e}");
