@@ -281,7 +281,7 @@ pub(crate) async fn fsck(storage: &Storage, mut output: impl std::io::Write) -> 
         };
         match r {
             Ok(Ok(())) => {
-                println!("ok: {name}");
+                writeln!(output, "ok: {name}")?;
             }
             Ok(Err(e)) => {
                 errors = true;
