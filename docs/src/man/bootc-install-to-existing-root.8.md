@@ -226,6 +226,10 @@ of migrating the fstab entries. See the "Injecting kernel arguments" section abo
     - systemd
     - none
 
+**--skip-lints**
+
+    Skip checking the source container image with the fatal lints from `bootc container lint` before installing
+
 **--acknowledge-destructive**
 
     Accept that this is a destructive action and skip a warning timer

@@ -93,6 +93,40 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
             cmd!(sh, "sudo {BASE_ARGS...} -v {tmpdisk}:/disk {image} bootc install to-disk --via-loopback /disk").run()?;
             Ok(())
         }),
+        Trial::test("install checks fatal lints", move || {
+            let sh = &xshell::Shell::new()?;
+            reset_root(sh, image)?;
+            // A /var/run directory is a classic mistake from legacy packages
+            let derived = "localhost/bootc-install-lint-var-run";
+            let ctx = sh.create_temp_dir()?;
+            let ctx = ctx.path().to_str().unwrap();
+            let containerfile = format!("FROM {image}\nRUN rm /var/run && mkdir /var/run\n");
+            cmd!(sh, "sudo podman build -t {derived} -f - {ctx}")
+                .stdin(containerfile)
+                .run()?;
+            let size = 10 * 1000 * 1000 * 1000;
+            let mut tmpdisk = tempfile::NamedTempFile::new_in("/var/tmp")?;
+            tmpdisk.as_file_mut().set_len(size)?;
+            let tmpdisk = tmpdisk.into_temp_path();
+            let tmpdisk = tmpdisk.to_str().unwrap();
+            let install = &["bootc", "install", "to-disk", "--via-loopback", "/disk"];
+            let out = cmd!(
+                sh,
+                "sudo {BASE_ARGS...} -v {tmpdisk}:/disk {derived} {install...}"
+            )
+            .ignore_status()
+            .output()?;
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success());
+            assert!(stderr.contains("Failed lint: var-run"), "{stderr}");
+            cmd!(
+                sh,
+                "sudo {BASE_ARGS...} -v {tmpdisk}:/disk {derived} {install...} --skip-lints"
+            )
+            .run()?;
+            cmd!(sh, "sudo podman rmi {derived}").run()?;
+            Ok(())
+        }),
         Trial::test(
             "replace=alongside with ssh keys and a karg, and SELinux disabled",
             move || {

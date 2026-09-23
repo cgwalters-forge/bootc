@@ -124,6 +124,10 @@ is currently expected to be empty by default.
     - systemd
     - none
 
+**--skip-lints**
+
+    Skip checking the source container image with the fatal lints from `bootc container lint` before installing
+
 **--composefs-backend**
 
     If true, composefs backend is used, else ostree backend is used

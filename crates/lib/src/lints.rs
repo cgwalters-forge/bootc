@@ -13,7 +13,7 @@ use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootc_utils::PathQuotedDisplay;
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs::Dir;
@@ -81,6 +81,24 @@ impl LintError {
 #[derive(Debug, Default)]
 struct LintExecutionConfig {
     no_truncate: bool,
+    /// Only run lints of type [`LintType::Fatal`]; the rest count as skipped.
+    fatal_only: bool,
+    /// Also skip mount points on the same filesystem (e.g. bind mounts)
+    /// when walking the root for recursive lints, not just ones on other
+    /// devices.
+    skip_mountpoints: bool,
+}
+
+impl LintExecutionConfig {
+    /// The configuration for walking the root for recursive lints.
+    fn walk_configuration(&self) -> WalkConfiguration<'static> {
+        let c = walk_configuration();
+        if self.skip_mountpoints {
+            c.skip_mountpoints()
+        } else {
+            c
+        }
+    }
 }
 
 type LintFn = fn(&Dir, config: &LintExecutionConfig) -> LintResult;
@@ -278,6 +296,9 @@ fn lint_inner<'skip>(
         if skip.contains(lint.name) {
             return false;
         }
+        if config.fatal_only && !matches!(lint.ty, LintType::Fatal) {
+            return false;
+        }
         if let Some(lint_root_type) = lint.root_type {
             if lint_root_type != root_type {
                 return false;
@@ -305,7 +326,7 @@ fn lint_inner<'skip>(
     let mut recursive_lints = BTreeSet::from_iter(recursive_lints);
     let mut recursive_errors = BTreeMap::new();
     root.walk(
-        &walk_configuration().path_base(Path::new("/")),
+        &config.walk_configuration().path_base(Path::new("/")),
         |e| -> std::io::Result<_> {
             // If there's no recursive lints, we're done!
             if recursive_lints.is_empty() {
@@ -382,7 +403,10 @@ pub(crate) fn lint<'skip>(
     mut output: impl std::io::Write,
     no_truncate: bool,
 ) -> Result<()> {
-    let config = LintExecutionConfig { no_truncate };
+    let config = LintExecutionConfig {
+        no_truncate,
+        ..Default::default()
+    };
     let r = lint_inner(root, root_type, &config, skip, &mut output)?;
     writeln!(output, "Checks passed: {}", r.passed)?;
     if r.skipped > 0 {
@@ -398,6 +422,63 @@ pub(crate) fn lint<'skip>(
     }
     if fatal > 0 {
         anyhow::bail!("Checks failed: {}", fatal)
+    }
+    Ok(())
+}
+
+/// Fatal lints which only warn at install time, for compatibility with
+/// existing images.
+const INSTALL_WARNING_LINTS: &[&str] = &["etc-usretc"];
+/// Fatal lints which only apply when installing with the ostree backend.
+const INSTALL_OSTREE_ONLY_LINTS: &[&str] = &["baseimage-root", "utf8"];
+
+/// Run the fatal lints against the root of the container image we are about
+/// to install, so that we fail before writing anything to the target.
+#[context("Checking container image")]
+pub(crate) fn lint_for_install(root: &Dir, composefs_backend: bool) -> Result<()> {
+    // At install time the container root has host mounts (the target,
+    // container storage, etc.) which may be on the same filesystem, e.g.
+    // with the vfs storage driver, so noxdev alone would walk into them.
+    let config = LintExecutionConfig {
+        fatal_only: true,
+        skip_mountpoints: true,
+        ..Default::default()
+    };
+    let ostree_only = if composefs_backend {
+        INSTALL_OSTREE_ONLY_LINTS
+    } else {
+        &[]
+    };
+    let skip = INSTALL_WARNING_LINTS.iter().chain(ostree_only).copied();
+    let mut output = Vec::new();
+    let start = std::time::Instant::now();
+    let r = lint_inner(root, RootType::Running, &config, skip, &mut output)
+        .context("Linting (use --skip-lints to bypass)")?;
+    tracing::debug!(
+        "Install lints: passed={} skipped={} in {:?}",
+        r.passed,
+        r.skipped,
+        start.elapsed()
+    );
+    if r.fatal > 0 {
+        let output = String::from_utf8_lossy(&output);
+        anyhow::bail!(
+            "{} fatal check(s) failed (use --skip-lints to bypass):\n{}",
+            r.fatal,
+            output.trim_end()
+        );
+    }
+
+    for lint in LINTS
+        .iter()
+        .filter(|lint| INSTALL_WARNING_LINTS.contains(&lint.name))
+    {
+        let LintFnTy::Regular(f) = lint.f else {
+            continue;
+        };
+        if let Err(e) = f(root, &config)? {
+            crate::utils::medium_visibility_warning(&format!("Lint warning: {}: {e}", lint.name));
+        }
     }
     Ok(())
 }
@@ -1071,6 +1152,40 @@ mod tests {
     }
 
     #[test]
+    fn test_lint_for_install() -> Result<()> {
+        let root = &passing_fixture()?;
+        for composefs in [false, true] {
+            lint_for_install(root, composefs)?;
+        }
+
+        // Warnings are not checked at install time
+        root.create_dir_all("var/log")?;
+        root.write("var/log/dnf.log", "some log")?;
+        lint_for_install(root, false)?;
+
+        // For compatibility, /usr/etc only warns
+        root.create_dir_all("etc")?;
+        root.create_dir_all("usr/etc")?;
+        lint_for_install(root, false)?;
+        root.remove_dir("usr/etc")?;
+
+        // /ostree is only required for the ostree backend
+        root.remove_file("ostree")?;
+        let e = format!("{:#}", lint_for_install(root, false).unwrap_err());
+        assert!(e.contains("Failed lint: baseimage-root"), "{e}");
+        lint_for_install(root, true)?;
+
+        // But fatal lints are checked for both backends
+        root.create_dir_all("var/run/foo")?;
+        for composefs in [false, true] {
+            let e = format!("{:#}", lint_for_install(root, composefs).unwrap_err());
+            assert!(e.contains("Failed lint: var-run"), "{e}");
+            assert!(e.contains("fatal check(s) failed"), "{e}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_kernel_lint() -> Result<()> {
         let root = &fixture()?;
         let config = &LintExecutionConfig::default();
@@ -1414,7 +1529,10 @@ mod tests {
 
     #[test]
     fn test_format_items_no_truncate() -> Result<()> {
-        let config = LintExecutionConfig { no_truncate: true };
+        let config = LintExecutionConfig {
+            no_truncate: true,
+            ..Default::default()
+        };
         let header = "Test Header";
         let mut output_str = String::new();
 

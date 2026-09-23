@@ -170,6 +170,10 @@ set `discoverable-partitions = true` in their install configuration
     - systemd
     - none
 
+**--skip-lints**
+
+    Skip checking the source container image with the fatal lints from `bootc container lint` before installing
+
 **--via-loopback**
 
     Instead of targeting a block device, write to a file via loopback
