@@ -13,6 +13,8 @@
 //! for environments like ext4 where podman access to the OS image matters
 //! more than disk efficiency.
 
+use std::io::Write;
+
 use anyhow::{Context, Result, bail};
 use bootc_utils::CommandRunExt;
 use cap_std_ext::cap_std::{self, fs::Dir};
@@ -175,7 +177,7 @@ pub(crate) async fn list_entrypoint(
                 table.add_row([image.image, image.image_type.to_string()]);
             }
 
-            println!("{table}");
+            writeln!(std::io::stdout(), "{table}")?;
         }
         ImageListFormat::Json => {
             let mut stdout = std::io::stdout();

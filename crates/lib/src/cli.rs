@@ -4,7 +4,7 @@
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -2167,7 +2167,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                     write_dumpfile_to.as_deref(),
                 )
                 .await?;
-                println!("{digest}");
+                writeln!(std::io::stdout(), "{digest}")?;
                 Ok(())
             }
             ContainerOpts::ComputeComposefsDigestFromStorage {
@@ -2220,7 +2220,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 .context("Populating fs")?;
                 fs.transform_for_boot(&repo).context("Preparing for boot")?;
                 let id = fs.compute_image_id(repo.erofs_version());
-                println!("{}", id.to_hex());
+                writeln!(std::io::stdout(), "{}", id.to_hex())?;
 
                 if let Some(path) = write_dumpfile_to.as_deref() {
                     let mut w = File::create(path)
@@ -2443,7 +2443,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                         std::fs::File::open(&path).with_context(|| format!("Reading {path}"))?;
                     let digest: fsverity::Sha256HashValue = fsverity::measure_verity(&fd)?;
                     let digest = digest.to_hex();
-                    println!("{digest}");
+                    writeln!(std::io::stdout(), "{digest}")?;
                     Ok(())
                 }
                 FsverityOpts::Enable { path } => {
@@ -2518,14 +2518,18 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 let loopback = crate::blockdev::LoopbackDevice::new(temp_path)
                     .context("Failed to create loopback device")?;
 
-                println!("Created loopback device: {}", loopback.path());
+                writeln!(
+                    std::io::stdout(),
+                    "Created loopback device: {}",
+                    loopback.path()
+                )?;
 
                 // Close the device to test cleanup
                 loopback
                     .close()
                     .context("Failed to close loopback device")?;
 
-                println!("Successfully closed loopback device");
+                writeln!(std::io::stdout(), "Successfully closed loopback device")?;
                 Ok(())
             }
             #[cfg(feature = "rhsm")]
@@ -2535,7 +2539,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 use clap::CommandFactory;
                 let cmd = Opt::command();
                 let json = crate::cli_json::dump_cli_json(&cmd)?;
-                println!("{}", json);
+                writeln!(std::io::stdout(), "{json}")?;
                 Ok(())
             }
             InternalsOpts::DirDiff {
@@ -2618,20 +2622,23 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                         )
                         .await?;
 
+                        let mut stdout = std::io::stdout().lock();
                         if dry_run {
-                            println!("Dry run (no files deleted)");
+                            writeln!(stdout, "Dry run (no files deleted)")?;
                         }
 
-                        println!(
+                        writeln!(
+                            stdout,
                             "Objects: {} removed ({} bytes)",
                             gc_result.objects_removed, gc_result.objects_bytes
-                        );
+                        )?;
 
                         if gc_result.images_pruned > 0 || gc_result.streams_pruned > 0 {
-                            println!(
+                            writeln!(
+                                stdout,
                                 "Pruned symlinks: {} images, {} streams",
                                 gc_result.images_pruned, gc_result.streams_pruned
-                            );
+                            )?;
                         }
 
                         if assert_no_op {
@@ -2660,8 +2667,9 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                         crate::blockdev::list_dev_by_dir(&dir)?
                     }
                 };
-                serde_json::to_writer_pretty(std::io::stdout().lock(), &dev)?;
-                println!();
+                let mut stdout = std::io::stdout().lock();
+                serde_json::to_writer_pretty(&mut stdout, &dev)?;
+                writeln!(stdout)?;
                 Ok(())
             }
             InternalsOpts::Uki(uki_opts) => match uki_opts {
