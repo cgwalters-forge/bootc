@@ -1263,15 +1263,18 @@ pub(crate) async fn stage(
     crate::deploy::cleanup(sysroot).await?;
 
     if !lock_finalization {
-        println!("Queued for next boot: {:#}", spec.image);
+        prog.info(format!("Queued for next boot: {:#}", spec.image));
     } else {
-        println!("Staged but not queued for next boot: {:#}", spec.image);
+        prog.info(format!(
+            "Staged but not queued for next boot: {:#}",
+            spec.image
+        ));
     }
 
     if let Some(version) = image.version.as_deref() {
-        println!("  Version: {version}");
+        prog.info(format!("  Version: {version}"));
     }
-    println!("  Digest: {}", image.manifest_digest);
+    prog.info(format!("  Digest: {}", image.manifest_digest));
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1632,7 +1635,9 @@ mod tests {
         let mut lines = BufReader::new(recv).lines();
         let start_line = lines.next_line().await?.unwrap();
         let start: Event = serde_json::from_str(&start_line)?;
-        assert!(matches!(start, Event::Start { version } if version == "0.1.0"));
+        assert!(
+            matches!(start, Event::Start { version } if version == crate::progress_jsonl::API_VERSION)
+        );
 
         let retry_line = lines.next_line().await?.unwrap();
         let retry: Event = serde_json::from_str(&retry_line)?;

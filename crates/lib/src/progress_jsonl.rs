@@ -19,7 +19,7 @@ use tokio::net::unix::pipe::Sender;
 const REFRESH_HZ: u16 = 5;
 
 /// Semantic version of the protocol.
-const API_VERSION: &str = "0.1.0";
+pub(crate) const API_VERSION: &str = "0.2.0";
 
 /// An incremental update to e.g. a container image layer download.
 /// The first time a given "subtask" name is seen, a new progress bar should be created.
@@ -69,6 +69,17 @@ pub struct SubTaskStep<'t> {
     pub id: Cow<'t, str>,
     /// Starts as false when beginning to execute and turns true when completed.
     pub completed: bool,
+}
+
+/// The severity of a `Message` event.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageLevel {
+    /// Regular status output, e.g. which image was queued for the next boot.
+    Info,
+    /// Something the user should pay attention to, which did not cause
+    /// the operation to fail.
+    Warning,
 }
 
 /// An event emitted as JSON.
@@ -135,6 +146,15 @@ pub enum Event<'t> {
         steps_total: u64,
         /// The currently running subtasks.
         subtasks: Vec<SubTaskStep<'t>>,
+    },
+    /// A human readable status message, with the same text that is
+    /// printed to the terminal. The text is not a stable interface.
+    Message {
+        /// The severity of the message.
+        level: MessageLevel,
+        /// The message text, without a trailing newline.
+        #[serde(borrow)]
+        text: Cow<'t, str>,
     },
 }
 
@@ -270,6 +290,29 @@ impl ProgressWriter {
         self.send_or_disable(event, false)
     }
 
+    /// Print a status message for the user, and if a progress fd is
+    /// attached, also send it there as an [`Event::Message`].
+    ///
+    /// Like `println!()` and `eprintln!()`, info messages go to stdout
+    /// and warnings to stderr; unlike them, a failure to write (e.g. a
+    /// closed pipe) is ignored rather than causing a panic.
+    pub(crate) fn message(&self, level: MessageLevel, text: impl AsRef<str>) {
+        let text = text.as_ref();
+        let _ = match level {
+            MessageLevel::Info => writeln!(std::io::stdout().lock(), "{text}"),
+            MessageLevel::Warning => writeln!(std::io::stderr().lock(), "{text}"),
+        };
+        self.send(Event::Message {
+            level,
+            text: text.into(),
+        });
+    }
+
+    /// Shorthand for [`Self::message`] with [`MessageLevel::Info`].
+    pub(crate) fn info(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Info, text)
+    }
+
     fn send_or_disable(&self, event: Event<'_>, required: bool) {
         if let Err(e) = self.send_impl(event, required) {
             eprintln!("Failed to write to jsonl: {e}");
@@ -310,6 +353,10 @@ mod test {
                 steps_total: 3,
                 subtasks: Vec::new(),
             },
+            Event::Message {
+                level: MessageLevel::Warning,
+                text: "some warning".into(),
+            },
         ];
         // ProgressWriter does blocking writes, and the sender and reader
         // below run on the same thread, so the whole output must fit in
@@ -319,7 +366,11 @@ mod test {
         let sender = async move {
             let w = ProgressWriter::try_from(send)?;
             for value in testvalues_sender {
-                w.send(value);
+                match value {
+                    // Exercise the helper, which should send the same event
+                    Event::Message { level, text } => w.message(level, text),
+                    value => w.send(value),
+                }
             }
             anyhow::Ok(())
         };
