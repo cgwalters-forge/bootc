@@ -112,8 +112,8 @@ impl PullProgress {
         }
     }
 
-    async fn send(&self, event: Event<'_>) {
-        self.json.send(event.clone()).await;
+    fn send(&self, event: Event<'_>) {
+        self.json.send(event.clone());
         if let Event::ProgressSteps { description, .. } = &event {
             self.println(description);
         }
@@ -355,7 +355,7 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
                             steps: layers_bar.position(),
                             steps_total: config.n_layers_to_fetch as u64,
                             subtasks: subtasks.clone(),
-                        }).await;
+                        });
                     }
                 } else {
                     // If the receiver is disconnected, then we're done
@@ -390,7 +390,7 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
                         steps: layers_bar.position(),
                         steps_total: config.n_layers_to_fetch as u64,
                         subtasks: subtasks.clone().into_iter().chain([subtask.clone()]).collect(),
-                    }).await;
+                    });
                 }
             }
         }
@@ -414,25 +414,21 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
     // Since the progress notifier closed, we know import has started
     // use as a heuristic to begin import progress
     // Cannot be lossy or it is dropped
-    config
-        .progress
-        .json
-        .send(Event::ProgressSteps {
-            task: "importing".into(),
+    config.progress.json.send(Event::ProgressSteps {
+        task: "importing".into(),
+        description: "Importing Image".into(),
+        id: (*config.digest).into(),
+        steps_cached: 0,
+        steps: 0,
+        steps_total: 1,
+        subtasks: [SubTaskStep {
+            subtask: "importing".into(),
             description: "Importing Image".into(),
-            id: (*config.digest).into(),
-            steps_cached: 0,
-            steps: 0,
-            steps_total: 1,
-            subtasks: [SubTaskStep {
-                subtask: "importing".into(),
-                description: "Importing Image".into(),
-                id: "importing".into(),
-                completed: false,
-            }]
-            .into(),
-        })
-        .await;
+            id: "importing".into(),
+            completed: false,
+        }]
+        .into(),
+    });
 }
 
 /// Gather all bound images in all deployments, then prune the image store,
@@ -848,24 +844,21 @@ pub(crate) async fn pull_from_prepared(
     let import = prepared_image.imp.import(prepared_image.prep).await;
     printer.await?;
     // Both the progress and the import are done, so import is done as well
-    progress
-        .json
-        .send(Event::ProgressSteps {
-            task: "importing".into(),
+    progress.json.send(Event::ProgressSteps {
+        task: "importing".into(),
+        description: "Importing Image".into(),
+        id: digest_imp.clone().as_ref().into(),
+        steps_cached: 0,
+        steps: 1,
+        steps_total: 1,
+        subtasks: [SubTaskStep {
+            subtask: "importing".into(),
             description: "Importing Image".into(),
-            id: digest_imp.clone().as_ref().into(),
-            steps_cached: 0,
-            steps: 1,
-            steps_total: 1,
-            subtasks: [SubTaskStep {
-                subtask: "importing".into(),
-                description: "Importing Image".into(),
-                id: "importing".into(),
-                completed: true,
-            }]
-            .into(),
-        })
-        .await;
+            id: "importing".into(),
+            completed: true,
+        }]
+        .into(),
+    });
     let import = import?;
     let imgref_canonicalized = imgref.clone().canonicalize()?;
     tracing::debug!("Canonicalized image reference: {imgref_canonicalized:#}");
@@ -934,17 +927,15 @@ where
                     "Container image pull failed; retrying in {} seconds ({attempt}/{PULL_MAX_RETRIES}): {error}",
                     retry_delay.as_secs()
                 );
-                progress
-                    .send(Event::ProgressSteps {
-                        task: "pulling".into(),
-                        description: description.into(),
-                        id: "pull-retry".into(),
-                        steps_cached: 0,
-                        steps: attempt.into(),
-                        steps_total: PULL_MAX_RETRIES.into(),
-                        subtasks: Vec::new(),
-                    })
-                    .await;
+                progress.send(Event::ProgressSteps {
+                    task: "pulling".into(),
+                    description: description.into(),
+                    id: "pull-retry".into(),
+                    steps_cached: 0,
+                    steps: attempt.into(),
+                    steps_total: PULL_MAX_RETRIES.into(),
+                    subtasks: Vec::new(),
+                });
                 retries += 1;
                 tokio::time::sleep(retry_delay).await;
             }
@@ -1288,8 +1279,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1309,8 +1299,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
     pull_bound_images_for_commit(sysroot, &image.ostree_commit).await?;
 
     subtask.completed = true;
@@ -1331,8 +1320,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
     let origin = origin_from_imageref(spec.image)?;
     crate::deploy::deploy(sysroot, from, image, &origin, lock_finalization).await?;
 
@@ -1354,20 +1342,22 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
     crate::deploy::cleanup(sysroot).await?;
 
     if !lock_finalization {
-        println!("Queued for next boot: {:#}", spec.image);
+        prog.info(format!("Queued for next boot: {:#}", spec.image));
     } else {
-        println!("Staged but not queued for next boot: {:#}", spec.image);
+        prog.info(format!(
+            "Staged but not queued for next boot: {:#}",
+            spec.image
+        ));
     }
 
     if let Some(version) = image.version.as_deref() {
-        println!("  Version: {version}");
+        prog.info(format!("  Version: {version}"));
     }
-    println!("  Digest: {}", image.manifest_digest);
+    prog.info(format!("  Digest: {}", image.manifest_digest));
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1383,8 +1373,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
 
     // Unconditionally create or update /run/reboot-required to signal a reboot is needed.
     // This is monitored by kured (Kubernetes Reboot Daemon).
@@ -1707,8 +1696,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_retry_pull_operation_reports_progress() -> Result<()> {
         let attempts = std::cell::Cell::new(0);
+        // ProgressWriter does blocking writes and we only read the pipe
+        // afterwards on this same thread, so the output must fit in the
+        // pipe buffer.
         let (send, recv) = tokio::net::unix::pipe::pipe()?;
-        let progress = PullProgress::new(true, ProgressWriter::from(send));
+        let progress = PullProgress::new(true, ProgressWriter::try_from(send)?);
 
         retry_pull_operation(&progress, || {
             let attempt = attempts.get() + 1;
@@ -1726,7 +1718,9 @@ mod tests {
         let mut lines = BufReader::new(recv).lines();
         let start_line = lines.next_line().await?.unwrap();
         let start: Event = serde_json::from_str(&start_line)?;
-        assert!(matches!(start, Event::Start { version } if version == "0.1.0"));
+        assert!(
+            matches!(start, Event::Start { version } if version == crate::progress_jsonl::API_VERSION)
+        );
 
         let retry_line = lines.next_line().await?.unwrap();
         let retry: Event = serde_json::from_str(&retry_line)?;
