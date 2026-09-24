@@ -63,7 +63,7 @@
 //! deployment is created via `ostree admin deploy`, and bootloader entries are
 //! managed via BLS (Boot Loader Specification) files.
 //!
-//! ### Composefs Backend (Experimental)
+//! ### Composefs Backend
 //!
 //! Alternative backend using composefs overlayfs for the root filesystem. Provides
 //! stronger integrity guarantees via fs-verity and supports UKI (Unified Kernel
@@ -397,7 +397,7 @@ pub(crate) struct InstallConfigOpts {
 
 #[derive(Debug, Default, Clone, clap::Parser, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstallComposefsOpts {
-    /// If true, composefs backend is used, else ostree backend is used
+    /// Use the composefs backend instead of ostree (implied when the image contains a UKI)
     #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) composefs_backend: bool,
@@ -407,7 +407,7 @@ pub(crate) struct InstallComposefsOpts {
     #[serde(default)]
     pub(crate) allow_missing_verity: bool,
 
-    /// Name of the UKI addons to install without the ".efi.addon" suffix.
+    /// Name of the UKI addons to install without the ".efi.addon" suffix (experimental).
     /// This option can be provided multiple times if multiple addons are to be installed.
     #[clap(long, requires = "composefs_backend")]
     #[serde(default)]

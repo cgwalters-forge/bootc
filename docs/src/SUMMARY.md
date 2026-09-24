@@ -51,6 +51,9 @@
 
 - [Read-only when in a default container](bootc-in-container.md)
 - [`man bootc-container-lint`](man/bootc-container-lint.8.md)
+- [`man bootc-container-split-kernel-and-rootfs`](man/bootc-container-split-kernel-and-rootfs.8.md)
+- [`man bootc-container-ukify`](man/bootc-container-ukify.8.md)
+- [`man bootc-container-compute-composefs-digest`](man/bootc-container-compute-composefs-digest.8.md)
 
 # Architecture
 
@@ -59,6 +62,8 @@
 - [Filesystem: sysroot](filesystem-sysroot.md)
 - [Container storage](filesystem-storage.md)
 - [composefs backend](composefs.md)
+- [`man bootc-root-setup.service`](man/bootc-root-setup.service.5.md)
+- [`man bootc-setup-root-conf.toml`](man/bootc-setup-root-conf.5.md)
 - [Bootloader](bootloaders.md)
 - [Disk encryption (e.g. LUKS)](filesystem-encryption.md)
 
@@ -70,8 +75,6 @@
 
 - [bootc image](experimental-bootc-image.md)
 - [unified storage](experimental-unified-storage.md)
-- [`man bootc-root-setup.service`](man/bootc-root-setup.service.5.md)
-- [`man bootc-setup-root-conf.toml`](man/bootc-setup-root-conf.5.md)
 - [fsck](experimental-fsck.md)
 - [install reset](experimental-install-reset.md)
 - [--progress-fd](experimental-progress-fd.md)

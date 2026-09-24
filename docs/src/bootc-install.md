@@ -127,7 +127,20 @@ For more information, see [Image building and configuration guidance](building/g
 
 ## composefs backend
 
-There is a `--composefs-backend` option for `bootc install` to explicitly select a composefs backend apart from sealed images; this is not as heavily tested yet.
+By default `bootc install` uses the ostree backend. Pass `--composefs-backend`
+to use the [composefs backend](composefs.md) instead; it is selected
+automatically when the image contains a UKI, as a UKI can only be installed
+with the composefs backend. With a traditional kernel and initramfs, the
+backend doesn't change how the image is built, except that the initramfs
+must include bootc's dracut module (`51bootc`), which mounts the composefs
+root. It is not enabled by default: the reference
+[baseimage](https://github.com/bootc-dev/bootc/tree/main/baseimage) configuration
+enables it, and other base images need to as well; see
+[bootc-root-setup.service(5)](man/bootc-root-setup.service.5.md).
+
+On a root filesystem without fs-verity support (such as XFS), fs-verity is
+made optional automatically for a traditional kernel install;
+`--allow-missing-verity` does this explicitly.
 
 ## More advanced installation with `to-filesystem`
 

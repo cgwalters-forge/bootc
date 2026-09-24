@@ -132,7 +132,7 @@ A lower-level primitive, used internally by `ukify` above, that computes just th
 - `--erofs-version <v1|v2>`: EROFS format for the computed digest (default: `v1`)
 - `--write-dumpfile-to <PATH>`: Generate a dumpfile for debugging
 
-> **Note**: This command is currently hidden from `--help` output as it's part of the experimental composefs feature set.
+See also [bootc-container-compute-composefs-digest(8)](../man/bootc-container-compute-composefs-digest.8.md).
 
 ### Final Image Structure
 

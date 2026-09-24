@@ -1,11 +1,20 @@
 # composefs backend
 
-Experimental features are subject to change or removal. Please
-do provide feedback on them.
+bootc has two storage backends. The default is [ostree](https://github.com/ostreedev/ostree),
+and the composefs backend uses [composefs-rs](https://github.com/composefs/composefs-rs)
+instead of ostree to store and manage deployments. Both are supported and
+covered by the project's [stability guarantees](https://github.com/bootc-dev/bootc/blob/main/RELEASES.md#stability-guarantees).
+In particular, the project is committed to upgrading every composefs system
+installed since bootc 1.16.0 in place; see [Limitations](#limitations) for
+which upgrade paths are tested today.
+
+The composefs backend is required for [sealed images](building/sealed-images.md),
+and bootc selects it automatically when installing an image that contains a
+UKI. Otherwise, pass `--composefs-backend` to `bootc install`; see
+[Understanding `bootc install`](bootc-install.md#composefs-backend). Its
+on-disk layout is described in [Filesystem: sysroot](filesystem-sysroot.md#composefs-backend-storage).
 
 ## Overview
-
-The composefs backend is an experimental alternative storage backend that uses [composefs-rs](https://github.com/composefs/composefs-rs) instead of ostree for storing and managing bootc system deployments.
 
 The composefs backend has two independent integrity controls:
 
@@ -80,37 +89,82 @@ moves the system to V1. bootc 1.16.4 and later already understand
 
 The 1.16.0 path is covered by the `test-49-composefs-1-16-bridge` TMT test for
 both sealed and `--allow-missing-verity` UKIs, including rollback and garbage
-collection. Upgrades from other releases, and from BLS (non-UKI) composefs
-installs, are not yet tested.
+collection. Upgrades of UKI installs from other releases are not yet tested.
 
-## Developing and Testing bootc with composefs
+## Supported configurations
 
-See [CONTRIBUTING.md](https://github.com/bootc-dev/bootc/blob/main/CONTRIBUTING.md) for information on building and testing bootc itself with composefs support.
+The following are supported with the composefs backend:
 
-## Known issues
+- `bootc install`, `upgrade`, `switch`, `rollback`, `status`, `usr-overlay`
+  and soft reboots.
+- [`bootc install mount`](man/bootc-install-mount.8.md), for changing an
+  installed deployment before its first boot.
+- Traditional kernel and initramfs installs booted through BLS entries, with
+  either GRUB (via `bootupd`) or systemd-boot, and UKIs booted with
+  systemd-boot, including sealed UKIs signed for Secure Boot. See
+  [Bootloaders](bootloaders.md#composefs-backend).
+- Root filesystems with fs-verity support, and filesystems without it (such
+  as XFS) with fs-verity made optional. Sealed images require fs-verity.
+  CI covers ext4 and XFS; btrfs is expected to work but is not tested.
+- The [EROFS formats](#erofs-formats) and kernel arguments described above.
+- The image build commands `bootc container ukify`,
+  `bootc container split-kernel-and-rootfs` and
+  `bootc container compute-composefs-digest`, and the initramfs setup
+  configured by [`setup-root-conf.toml`](man/bootc-setup-root-conf.5.md).
 
-The composefs backend is experimental; on-disk formats are subject to change.
+On CentOS Stream 9, only sealed UKIs are tested; traditional kernel installs
+require newer dracut and systemd features. Its dracut also doesn't install
+`setup-root-conf.toml` into the initramfs automatically.
 
-- Upgrades are tested only from bootc 1.16.0 UKI installs (see
-  [Upgrading from bootc 1.16](#upgrading-from-bootc-116)), and that test
-  doesn't yet run in CI.
+## Experimental parts
+
+These remain [experimental](https://github.com/bootc-dev/bootc/blob/main/RELEASES.md#stability-guarantees)
+and may change or be removed:
+
+- The `grub-cc` bootloader (`--bootloader=grub-cc`).
+- UKI addons (`--uki-addon`). Addons are only installed by `bootc install`:
+  they aren't updated on upgrade, garbage collected, or reverted on
+  rollback.
+- [Unified storage](experimental-unified-storage.md).
+
+## Limitations
+
+- `bootc edit` and [`bootc install reset`](experimental-install-reset.md)
+  are not yet implemented for the composefs backend.
+- There is no `bootc-boot-complete.service` and no boot counting; see
+  [boot failure detection](boot-failure-detection.md#composefs-backend-boot-failure-detection).
+- There is no in-place transition from an ostree system to the composefs
+  backend; a system has to be reinstalled.
+- `--bootloader=none` is not supported.
+- Tested upgrade paths are limited. CI upgrades a traditional kernel
+  install (GRUB, ext4) made by the bootc release in the published CentOS
+  Stream 10 base image. Upgrades from bootc 1.16.0 UKI installs are covered
+  by the `test-49-composefs-1-16-bridge` test (see
+  [Upgrading from bootc 1.16](#upgrading-from-bootc-116)), which doesn't run
+  in CI. Upgrades on Fedora and from other releases are not tested.
+- Only a single ESP is used (the first one found), and a separate
+  XBOOTLDR partition is not supported.
+- Only x86_64 is tested in CI; other architectures, including s390x
+  (`zipl`), are untested.
+- Rollback with GRUB and UKIs assumes exactly two deployments.
 - Recovery from missing or corrupt images and deployment state is not yet
-  tested, nor is garbage collection when deployments are referenced by both V1
-  and V2 boot entries (for example, that GC keeps a V2 fallback image a
-  rollback deployment still boots from).
+  fully tested, nor is garbage collection when deployments are referenced by
+  both V1 and V2 boot entries (for example, that GC keeps a V2 fallback image
+  a rollback deployment still boots from).
 - How container signature enforcement carries over from installation into the
   installed system is not settled yet.
-- Extended install APIs: Ability to cleanly implement anaconda %post and osbuild post mutations and general post-install pre-reboot; right now some tools just mount the deployment directory (note this one also relates to [APIs in general](https://github.com/bootc-dev/bootc/issues/522))
-- [zstd:chunked pull failures](https://github.com/bootc-dev/bootc/issues/2408):
-  images pushed with `--compression-format zstd:chunked` currently fail to
-  pull on the composefs backend ("unexpected EOF reading tar entry"). Until a
-  composefs-rs decode fix is incorporated, publish with plain zstd or gzip.
+- Images pushed with `--compression-format zstd:chunked` fail to pull
+  ("unexpected EOF reading tar entry") with bootc releases before 1.16.12;
+  see [#2408](https://github.com/bootc-dev/bootc/issues/2408).
 
-## Related issues
+For building and testing bootc itself with the composefs backend, see
+[CONTRIBUTING.md](https://github.com/bootc-dev/bootc/blob/main/CONTRIBUTING.md).
 
-- [Unified storage](https://github.com/bootc-dev/bootc/issues/20): Not strictly a blocker but a really nice to have
+## Future work
+
+- [Unified storage](https://github.com/bootc-dev/bootc/issues/20)
 - [Sealed image build UX](https://github.com/bootc-dev/bootc/issues/1498): Streamlined tooling for building sealed images
-- In place transitions: 
+- In place transitions:
   - First: support [factory reset](https://github.com/bootc-dev/bootc/issues/404) from ostree to composefs
   - Next: Support copying /etc and /var
 
@@ -118,6 +172,7 @@ The composefs backend is experimental; on-disk formats are subject to change.
 
 - See [filesystem.md](filesystem.md) for information about composefs in the standard ostree backend
 - See [bootloaders.md](bootloaders.md) for bootloader configuration details
+- See [sealed images](building/sealed-images.md) for building UKIs and sealed images
 - [composefs-rs](https://github.com/composefs/composefs-rs) - The underlying composefs implementation
 - [composefs-rs repository format](https://github.com/composefs/composefs-rs/blob/main/crates/composefs/src/repository_format.rs) - Detailed on-disk layout of the `/composefs` repository
 - [Unified Kernel Images specification](https://uapi-group.org/specifications/specs/unified_kernel_image/)

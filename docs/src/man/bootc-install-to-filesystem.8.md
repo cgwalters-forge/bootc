@@ -126,7 +126,7 @@ is currently expected to be empty by default.
 
 **--composefs-backend**
 
-    If true, composefs backend is used, else ostree backend is used
+    Use the composefs backend instead of ostree (implied when the image contains a UKI)
 
     Default: false
 
@@ -138,7 +138,7 @@ is currently expected to be empty by default.
 
 **--uki-addon**=*UKI_ADDON*
 
-    Name of the UKI addons to install without the ".efi.addon" suffix. This option can be provided multiple times if multiple addons are to be installed
+    Name of the UKI addons to install without the ".efi.addon" suffix (experimental). This option can be provided multiple times if multiple addons are to be installed
 
 <!-- END GENERATED OPTIONS -->
 
