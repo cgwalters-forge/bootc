@@ -16,3 +16,16 @@ footers = [
 
 [output.html]
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.redirect]
+"/experimental-composefs.html" = "composefs.html"
+"/experimental-composefs.html#storage-and-repository-structure" = "filesystem-sysroot.html#composefs-backend-storage"
+"/experimental-composefs.html#how-sealed-images-work" = "building/sealed-images.html#how-sealed-images-work"
+"/experimental-composefs.html#building-sealed-images" = "building/sealed-images.html#building-sealed-images"
+"/experimental-composefs.html#prerequisites" = "building/sealed-images.html#prerequisites"
+"/experimental-composefs.html#using-without-secure-boot" = "building/sealed-images.html#using-without-secure-boot"
+"/experimental-composefs.html#the-bootc-container-ukify-command" = "building/sealed-images.html#the-bootc-container-ukify-command"
+"/experimental-composefs.html#the-bootc-container-compute-composefs-digest-command" = "building/sealed-images.html#the-bootc-container-compute-composefs-digest-command"
+"/experimental-composefs.html#external-signing-workflow" = "building/sealed-images.html#external-signing-workflow"
+"/experimental-composefs.html#bootloader-support" = "bootloaders.html#composefs-backend"
+"/experimental-composefs.html#installation" = "bootc-install.html#composefs-backend"

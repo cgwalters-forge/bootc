@@ -125,6 +125,10 @@ unconfigured image does not have a default password or SSH key, etc.
 
 For more information, see [Image building and configuration guidance](building/guidance.md).
 
+## composefs backend
+
+There is a `--composefs-backend` option for `bootc install` to explicitly select a composefs backend apart from sealed images; this is not as heavily tested yet.
+
 ## More advanced installation with `to-filesystem`
 
 The basic `bootc install to-disk` logic is really a pretty small (but opinionated) wrapper
