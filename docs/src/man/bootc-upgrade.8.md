@@ -26,6 +26,8 @@ if the system has changed.
 
 The `--apply` option currently always reboots the system. In the future, this command may detect cases where no kernel changes are queued and perform a userspace-only restart instead.
 
+The reboot is refused, and the command fails with the update left staged, if a process holds a `block` mode shutdown inhibitor lock (see `systemd-inhibit --list`).
+
 However, in the future this is likely to change such that reboots outside of a `bootc upgrade --apply`
 do *not* automatically apply the update in addition.
 
