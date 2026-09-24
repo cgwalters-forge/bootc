@@ -1,0 +1,35 @@
+# This file is canonically maintained in <https://github.com/bootc-dev/infra/tree/main/common>
+#
+# The /signoff and /rebase-signoff pull request commands, which let a
+# maintainer add their DCO Signed-off-by to a PR's commits. The logic lives
+# in bootc-dev/actions; see https://github.com/bootc-dev/actions#pr-signoff
+name: PR signoff command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  signoff:
+    # GitHub evaluates this before assigning a runner: any other comment
+    # creates a skipped run, which uses no runner time.
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' &&
+      (startsWith(github.event.comment.body, '/signoff') ||
+       startsWith(github.event.comment.body, '/rebase-signoff'))
+    # Only used where the App below isn't configured, for same-repository
+    # PRs; the job runs no code from the PR.
+    permissions:
+      contents: write
+      pull-requests: write
+    # Pinned, since this hands the App's private key to the called
+    # workflow; bump it here and sync-common carries it everywhere.
+    uses: bootc-dev/actions/.github/workflows/pr-signoff.yml@f40beab364c7c5c1eed5cdf120fbc245f2176513 # main
+    with:
+      app-client-id: ${{ vars.GH_AW_APP_CLIENT_ID }}
+      workflows-permission: true
+    secrets:
+      app-private-key: ${{ secrets.GH_AW_APP_PRIVATE_KEY }}
