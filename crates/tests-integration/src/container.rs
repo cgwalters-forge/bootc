@@ -121,10 +121,13 @@ pub(crate) fn test_bootc_install_config() -> Result<()> {
         serde_json::from_str(&config).context("Parsing install config")?;
     // check that it parses okay, but also ensure kargs is not available here (only via --all)
     assert!(config.get("kargs").is_none());
-    Ok(())
+    // This must run sequentially after the above, not as a separate parallel
+    // test: it writes a fragment into /run/bootc/install that would otherwise
+    // race with the config scan above.
+    test_bootc_install_config_all()
 }
 
-pub(crate) fn test_bootc_install_config_all() -> Result<()> {
+fn test_bootc_install_config_all() -> Result<()> {
     #[derive(Deserialize)]
     #[serde(rename_all = "kebab-case")]
     struct TestOstreeConfig {
@@ -531,7 +534,6 @@ pub(crate) fn run(testargs: libtest_mimic::Arguments) -> Result<()> {
         new_test("variant-base-crosscheck", test_variant_base_crosscheck),
         new_test("bootc upgrade", test_bootc_upgrade),
         new_test("install config", test_bootc_install_config),
-        new_test("printconfig --all", test_bootc_install_config_all),
         new_test("status", test_bootc_status),
         new_test("container inspect", test_bootc_container_inspect),
         new_test("system-reinstall --help", test_system_reinstall_help),
