@@ -120,6 +120,9 @@ pub(crate) struct UpgradeOpts {
     /// Restart or reboot into the new target image.
     ///
     /// Use --soft-reboot to request a userspace-only restart when supported.
+    ///
+    /// The reboot is refused if a process holds a `block` mode shutdown
+    /// inhibitor lock (see `systemd-inhibit --list`).
     #[clap(long, conflicts_with = "check")]
     pub(crate) apply: bool,
 
@@ -154,6 +157,9 @@ pub(crate) struct SwitchOpts {
     /// Restart or reboot into the new target image.
     ///
     /// Use --soft-reboot to request a userspace-only restart when supported.
+    ///
+    /// The reboot is refused if a process holds a `block` mode shutdown
+    /// inhibitor lock (see `systemd-inhibit --list`).
     #[clap(long)]
     pub(crate) apply: bool,
 
@@ -235,6 +241,9 @@ pub(crate) struct RollbackOpts {
     /// Currently, this option always reboots.  In the future this command
     /// will detect the case where no kernel changes are queued, and perform
     /// a userspace-only restart.
+    ///
+    /// The reboot is refused if a process holds a `block` mode shutdown
+    /// inhibitor lock (see `systemd-inhibit --list`).
     #[clap(long)]
     pub(crate) apply: bool,
 
