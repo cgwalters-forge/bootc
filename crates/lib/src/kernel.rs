@@ -132,6 +132,43 @@ pub(crate) fn find_kernel(root: &Dir) -> Result<Option<KernelInternal>> {
     Ok(None)
 }
 
+/// The FIPS HMAC of `vmlinuz`, shipped next to it in `/usr/lib/modules/<kver>`.
+///
+/// ostree and kernel-install copy this next to the kernel when installing it,
+/// so it must travel with the kernel.
+pub(crate) const VMLINUZ_HMAC: &str = ".vmlinuz.hmac";
+
+/// Move the kernel out of `root` into `output/<kver>/`.
+///
+/// The kernel is written as `vmlinuz` and the initramfs as `initramfs.img`,
+/// along with the FIPS HMAC file ([`VMLINUZ_HMAC`]) if the kernel has one.
+/// UKIs are not supported. Returns the kernel version.
+pub(crate) fn split_kernel(root: &Dir, output: &Dir) -> Result<String> {
+    let kernel = find_kernel(root)?.ok_or_else(|| anyhow::anyhow!("No kernel found in rootfs"))?;
+    let KernelType::Vmlinuz { path, initramfs } = &kernel.k_type else {
+        anyhow::bail!("UKIs are not supported");
+    };
+    let kver = kernel.kernel.version;
+
+    output
+        .create_dir_all(&kver)
+        .with_context(|| format!("Creating {kver} in output directory"))?;
+    let dest = output.open_dir(&kver)?;
+
+    root.rename(path, &dest, "vmlinuz")
+        .with_context(|| format!("Moving {path}"))?;
+    root.rename(initramfs, &dest, "initramfs.img")
+        .with_context(|| format!("Moving {initramfs}"))?;
+
+    let hmac = path.with_file_name(VMLINUZ_HMAC);
+    match root.rename(&hmac, &dest, VMLINUZ_HMAC) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        r => r.with_context(|| format!("Moving {hmac}"))?,
+    }
+
+    Ok(kver)
+}
+
 /// Returns the path to the first UKI found in the container root, if any.
 ///
 /// Looks in `/boot/EFI/Linux/*.efi`. If multiple UKIs are present, returns
@@ -240,6 +277,51 @@ mod tests {
         // UKI should take precedence
         assert_eq!(kernel_internal.kernel.version, "fedora-6.12.0");
         assert!(kernel_internal.kernel.unified);
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_kernel() -> Result<()> {
+        const KVER: &str = "6.12.0-100.fc41.x86_64";
+        let moddir = format!("usr/lib/modules/{KVER}");
+        // The kernel's FIPS HMAC is optional; it must move with the kernel if present.
+        for with_hmac in [true, false] {
+            let root = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+            let output = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+            root.create_dir_all(&moddir)?;
+            root.atomic_write(format!("{moddir}/vmlinuz"), b"kernel")?;
+            root.atomic_write(format!("{moddir}/initramfs.img"), b"initramfs")?;
+            root.atomic_write(format!("{moddir}/modules.dep"), b"")?;
+            if with_hmac {
+                root.atomic_write(format!("{moddir}/{VMLINUZ_HMAC}"), b"hmac")?;
+            }
+
+            assert_eq!(split_kernel(&root, &output)?, KVER);
+
+            // Only the kernel artifacts move; the modules stay.
+            let remaining: Vec<_> = root
+                .read_dir(&moddir)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            assert_eq!(remaining, ["modules.dep"]);
+
+            let dest = output.open_dir(KVER)?;
+            assert_eq!(dest.read("vmlinuz")?, b"kernel");
+            assert_eq!(dest.read("initramfs.img")?, b"initramfs");
+            assert_eq!(dest.try_exists(VMLINUZ_HMAC)?, with_hmac);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_kernel_uki() -> Result<()> {
+        let root = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        let output = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        root.create_dir_all("boot/EFI/Linux")?;
+        root.atomic_write("boot/EFI/Linux/fedora-6.12.0.efi", &create_minimal_pe())?;
+        assert!(split_kernel(&root, &output).is_err());
+        // An empty rootfs has no kernel at all
+        assert!(split_kernel(&output, &root).is_err());
         Ok(())
     }
 
