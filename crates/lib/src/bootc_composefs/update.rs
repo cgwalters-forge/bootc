@@ -13,6 +13,7 @@ use fn_error_context::context;
 use ocidir::cap_std::ambient_authority;
 use ostree_ext::container::ManifestDiff;
 
+use crate::bootc_composefs::boot_counting::boot_tries_for_deployment;
 use crate::bootc_composefs::finalize::get_etc_diff;
 use crate::bootc_composefs::gc::GCOpts;
 use crate::spec::BootloaderKind;
@@ -330,6 +331,13 @@ pub(crate) async fn do_upgrade(
 
     let boot_type = BootType::from(entry);
 
+    let host_root = Dir::open_ambient_dir("/", ambient_authority()).context("Opening /")?;
+    let boot_tries = boot_tries_for_deployment(
+        &host.require_composefs_booted()?.bootloader,
+        &host_root,
+        &mounted_fs,
+    )?;
+
     let (provisional_deploy_id, provisional_format) = (id.clone(), repo.erofs_version());
 
     let (boot_digest, deploy_id) = match boot_type {
@@ -341,6 +349,7 @@ pub(crate) async fn do_upgrade(
                 provisional_format,
                 entry,
                 &mounted_fs,
+                boot_tries,
             )?,
             provisional_deploy_id,
         ),
@@ -352,6 +361,7 @@ pub(crate) async fn do_upgrade(
                 &provisional_deploy_id,
                 &boot_ids,
                 entries,
+                boot_tries,
             ),
             &repo,
             &oci_fs,
