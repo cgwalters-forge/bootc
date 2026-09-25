@@ -206,3 +206,8 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-52-install-composefs-config:
+  summary: Test selecting the composefs backend via the install config
+  duration: 30m
+  test: nu booted/test-52-install-composefs-config.nu

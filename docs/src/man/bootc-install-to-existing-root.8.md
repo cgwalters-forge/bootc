@@ -242,13 +242,13 @@ of migrating the fstab entries. See the "Injecting kernel arguments" section abo
 
 **--allow-missing-verity**
 
-    Make fs-verity validation optional in case the filesystem doesn't support it
+    Make fs-verity validation optional in case the filesystem doesn't support it (composefs backend only)
 
     Default: false
 
 **--uki-addon**=*UKI_ADDON*
 
-    Name of the UKI addons to install without the ".efi.addon" suffix. This option can be provided multiple times if multiple addons are to be installed
+    Name of the UKI addons to install without the ".efi.addon" suffix. This option can be provided multiple times if multiple addons are to be installed (composefs backend only)
 
 <!-- END GENERATED OPTIONS -->
 

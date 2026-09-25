@@ -399,19 +399,24 @@ pub(crate) struct InstallConfigOpts {
 
 #[derive(Debug, Default, Clone, clap::Parser, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstallComposefsOpts {
-    /// If true, composefs backend is used, else ostree backend is used
+    /// If true, composefs backend is used, else ostree backend is used.
+    ///
+    /// The image can also select it with `composefs-backend = true` in its
+    /// install configuration, and images with a UKI always use it.
     #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) composefs_backend: bool,
 
     /// Make fs-verity validation optional in case the filesystem doesn't support it
-    #[clap(long, default_value_t, requires = "composefs_backend")]
+    /// (composefs backend only)
+    #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) allow_missing_verity: bool,
 
     /// Name of the UKI addons to install without the ".efi.addon" suffix.
-    /// This option can be provided multiple times if multiple addons are to be installed.
-    #[clap(long, requires = "composefs_backend")]
+    /// This option can be provided multiple times if multiple addons are to be installed
+    /// (composefs backend only).
+    #[clap(long)]
     #[serde(default)]
     pub(crate) uki_addon: Option<Vec<String>>,
 }
@@ -1602,6 +1607,28 @@ async fn verify_target_fetch(
     Ok(())
 }
 
+/// Decide whether to install with the composefs backend. The CLI flag
+/// `--composefs-backend` wins, then `composefs-backend` from the install
+/// configuration. An image with a UKI can only be installed with composefs,
+/// so it selects the backend automatically, and explicitly disabling it in
+/// the install configuration is an error.
+fn resolve_composefs_backend(
+    cli: bool,
+    config: Option<bool>,
+    composefs_required: bool,
+) -> Result<bool> {
+    if cli {
+        return Ok(true);
+    }
+    match config {
+        Some(false) if composefs_required => anyhow::bail!(
+            "The install configuration sets composefs-backend = false, but this image has a UKI, which requires the composefs backend"
+        ),
+        Some(v) => Ok(v || composefs_required),
+        None => Ok(composefs_required),
+    }
+}
+
 /// Preparation for an install; validates and prepares some (thereafter immutable) global state.
 async fn prepare_install(
     mut config_opts: InstallConfigOpts,
@@ -1719,8 +1746,20 @@ async fn prepare_install(
 
     tracing::debug!("Composefs required: {composefs_required}");
 
-    if composefs_required {
-        composefs_options.composefs_backend = true;
+    composefs_options.composefs_backend = resolve_composefs_backend(
+        composefs_options.composefs_backend,
+        install_config.as_ref().and_then(|c| c.composefs_backend),
+        composefs_required,
+    )?;
+    if !composefs_options.composefs_backend {
+        anyhow::ensure!(
+            !composefs_options.allow_missing_verity,
+            "--allow-missing-verity requires the composefs backend"
+        );
+        anyhow::ensure!(
+            composefs_options.uki_addon.is_none(),
+            "--uki-addon requires the composefs backend"
+        );
     }
 
     if composefs_options.composefs_backend
@@ -3054,6 +3093,33 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(c.block_opts.device, "/dev/vda");
+    }
+
+    #[test]
+    fn test_resolve_composefs_backend() {
+        // (cli, config, composefs_required (UKI)) => backend
+        let cases = [
+            ((false, None, false), false),
+            ((true, None, false), true),
+            ((false, Some(true), false), true),
+            ((false, Some(false), false), false),
+            // The CLI flag wins over the config
+            ((true, Some(false), false), true),
+            // A UKI always selects composefs
+            ((false, None, true), true),
+            ((false, Some(true), true), true),
+            ((true, Some(false), true), true),
+        ];
+        for ((cli, config, uki), expected) in cases {
+            assert_eq!(
+                resolve_composefs_backend(cli, config, uki).unwrap(),
+                expected,
+                "cli={cli} config={config:?} uki={uki}"
+            );
+        }
+        // ...and contradicts an explicit opt-out in the config
+        let err = resolve_composefs_backend(false, Some(false), true).unwrap_err();
+        assert!(err.to_string().contains("requires the composefs backend"));
     }
 
     #[test]

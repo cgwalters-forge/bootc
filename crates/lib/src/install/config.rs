@@ -132,6 +132,9 @@ pub(crate) struct InstallConfiguration {
     /// Enforce that the containers-storage stack has a non-default
     /// (i.e. not `insecureAcceptAnything`) container image signature policy.
     pub(crate) enforce_container_sigpolicy: Option<bool>,
+    /// Install using the composefs backend instead of ostree.
+    /// Equivalent to the `--composefs-backend` CLI flag.
+    pub(crate) composefs_backend: Option<bool>,
 }
 
 fn merge_basic<T>(s: &mut Option<T>, o: Option<T>, _env: &EnvProperties) {
@@ -226,6 +229,7 @@ impl Mergeable for InstallConfiguration {
                 other.enforce_container_sigpolicy,
                 env,
             );
+            merge_basic(&mut self.composefs_backend, other.composefs_backend, env);
             if let Some(other_kargs) = other.kargs {
                 self.kargs
                     .get_or_insert_with(Default::default)
@@ -990,4 +994,51 @@ root-fs-type = "xfs"
     };
     install.merge(other, &env);
     assert_eq!(install.enforce_container_sigpolicy.unwrap(), true);
+}
+
+#[test]
+fn test_parse_composefs_backend() {
+    let env = EnvProperties {
+        sys_arch: "x86_64".to_string(),
+    };
+
+    for (input, expected) in [
+        ("composefs-backend = true", Some(true)),
+        ("composefs-backend = false", Some(false)),
+        (r#"root-fs-type = "xfs""#, None),
+    ] {
+        let c: InstallConfigurationToplevel =
+            toml::from_str(&format!("[install]\n{input}\n")).unwrap();
+        assert_eq!(c.install.unwrap().composefs_backend, expected, "{input}");
+    }
+
+    // A later drop-in overrides an earlier one, in either direction, and
+    // one that doesn't set the key leaves it alone.
+    for (base, other, expected) in [
+        (Some(false), Some(true), Some(true)),
+        (Some(true), Some(false), Some(false)),
+        (Some(true), None, Some(true)),
+        (None, None, None),
+    ] {
+        let mut install = InstallConfiguration {
+            composefs_backend: base,
+            ..Default::default()
+        };
+        install.merge(
+            InstallConfiguration {
+                composefs_backend: other,
+                ..Default::default()
+            },
+            &env,
+        );
+        assert_eq!(install.composefs_backend, expected, "{base:?} + {other:?}");
+    }
+
+    // Tools like bootc-image-builder read `bootc install print-configuration`
+    let install = InstallConfiguration {
+        composefs_backend: Some(true),
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&install).unwrap();
+    assert_eq!(v["composefs-backend"], serde_json::Value::Bool(true));
 }

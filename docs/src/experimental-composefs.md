@@ -276,6 +276,11 @@ Composefs installs using a traditional `vmlinuz`/`initramfs.img` layout instead 
 
 There is a `--composefs-backend` option for `bootc install` to explicitly select a composefs backend apart from sealed images; this is not as heavily tested yet.
 
+An image can also select the composefs backend itself, by setting `composefs-backend = true` in its
+[install configuration](man/bootc-install-config.5.md) (e.g. `/usr/lib/bootc/install/50-composefs.toml`).
+`bootc install` run from that image then uses composefs without the flag, and tools that
+wrap it (such as bootc-image-builder) can see the choice in `bootc install print-configuration`.
+
 ## Known issues
 
 The composefs backend is experimental; on-disk formats are subject to change.

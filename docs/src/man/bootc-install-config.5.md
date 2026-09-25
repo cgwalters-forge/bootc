@@ -45,6 +45,14 @@ The `install` section supports these subfields:
    When `true`, image pulls will be rejected if the policy file specifies
    `insecureAcceptAnything` as the default. Defaults to `false`.
    This is equivalent to the `--enforce-container-sigpolicy` CLI flag.
+- `composefs-backend`: A boolean; when `true`, the system is installed with the
+   (experimental) composefs backend instead of ostree.  This lets an image that is
+   meant to be deployed with composefs say so itself, so that `bootc install`
+   selects the backend without an extra flag; tools that wrap it can read the
+   value from `bootc install print-configuration`.  Defaults to `false`.
+   This is equivalent to the `--composefs-backend` CLI flag, which always wins when
+   passed.  Images with a UKI always use the composefs backend, and setting this
+   to `false` for such an image is an error.
 
 # filesystem
 
@@ -89,6 +97,17 @@ enforce-container-sigpolicy = true
 
 [install.ostree]
 bls-append-except-default = 'grub_users=""'
+```
+
+Install with the composefs backend, using systemd-boot:
+
+```toml
+[install]
+composefs-backend = true
+bootloader = "systemd"
+
+[install.filesystem.root]
+type = "ext4"
 ```
 
 Enable DPS auto-discovery for root (requires a BLI-capable bootloader):
