@@ -4,6 +4,7 @@ use indoc::indoc;
 use scopeguard::defer;
 use serde::Deserialize;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
@@ -114,7 +115,15 @@ pub(crate) fn test_bootc_upgrade() -> Result<()> {
     Ok(())
 }
 
+/// Serializes the tests that read the install config against the one that
+/// adds a fragment to /run/bootc/install, since libtest runs them concurrently
+/// and the other readers would otherwise see its temporary config.
+static INSTALL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
 pub(crate) fn test_bootc_install_config() -> Result<()> {
+    let _guard = INSTALL_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let sh = &xshell::Shell::new()?;
     let config = cmd!(sh, "bootc install print-configuration").read()?;
     let config: serde_json::Value =
@@ -137,6 +146,9 @@ pub(crate) fn test_bootc_install_config_all() -> Result<()> {
         ostree: Option<TestOstreeConfig>,
     }
 
+    let _guard = INSTALL_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let config_d = std::path::Path::new("/run/bootc/install/");
     let test_toml_path = config_d.join("10-test.toml");
     std::fs::create_dir_all(&config_d)?;
