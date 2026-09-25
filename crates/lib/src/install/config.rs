@@ -287,6 +287,20 @@ impl InstallConfiguration {
     }
 }
 
+/// Read a configuration fragment found by a directory scan, returning `None`
+/// if it was removed since the scan: `/run` and `/etc` are writable, so a
+/// fragment can vanish while we're loading, and that shouldn't be fatal.
+fn read_fragment(path: &std::path::Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(buf) => Ok(Some(buf)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("Skipping vanished config fragment {path:?}");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("Reading {path:?}")),
+    }
+}
+
 #[context("Loading configuration")]
 /// Load the install configuration, merging all found configuration files.
 pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
@@ -297,7 +311,9 @@ pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
     let fragments = liboverdrop::scan(SYSTEMD_CONVENTIONAL_BASES, "bootc/install", &["toml"], true);
     let mut config: Option<InstallConfiguration> = None;
     for (_name, path) in fragments {
-        let buf = std::fs::read_to_string(&path)?;
+        let Some(buf) = read_fragment(&path)? else {
+            continue;
+        };
         let mut unused = std::collections::HashSet::new();
         let de = toml::Deserializer::parse(&buf).with_context(|| format!("Parsing {path:?}"))?;
         let mut c: InstallConfigurationToplevel = serde_ignored::deserialize(de, |path| {
@@ -336,6 +352,19 @@ pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_fragment() -> Result<()> {
+        let td = tempfile::tempdir()?;
+        let present = td.path().join("10-present.toml");
+        std::fs::write(&present, "[install]\n")?;
+        assert_eq!(read_fragment(&present)?.as_deref(), Some("[install]\n"));
+        assert_eq!(read_fragment(&td.path().join("20-vanished.toml"))?, None);
+        // Errors other than ENOENT are still fatal, and name the path
+        let err = read_fragment(td.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("Reading"), "{err:#}");
+        Ok(())
+    }
 
     #[test]
     /// Verify that we can parse our default config file
