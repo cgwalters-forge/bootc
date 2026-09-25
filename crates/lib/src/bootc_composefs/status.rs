@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     bootc_composefs::{
         boot::BootType,
+        boot_counting::entry_is_bad,
         selinux::are_selinux_policies_compatible,
         state::{get_composefs_usr_overlay_status, read_origin},
         utils::{compute_store_boot_digest_for_uki, get_uki_cmdline},
@@ -328,8 +329,11 @@ fn get_sorted_type1_boot_entries_helper(
     // Sort based on bootloader type
     configs_with_filenames.sort_by(|a, b| {
         let ord = match bootloader {
-            // For systemd-boot sort by sort-key
-            Bootloader::Systemd => a.config.cmp(&b.config),
+            // For systemd-boot sort by sort-key, except that like systemd-boot
+            // we put entries without boot attempts left last
+            Bootloader::Systemd => entry_is_bad(&a.filename)
+                .cmp(&entry_is_bad(&b.filename))
+                .then_with(|| a.config.cmp(&b.config)),
             // For grub and grub-cc, sort by filename in descending order
             // See: https://github.com/bootc-dev/bootc/issues/2221
             Bootloader::Grub | Bootloader::GrubCC => b.filename.cmp(&a.filename),
@@ -1359,6 +1363,26 @@ mod tests {
                 .unwrap();
         assert_eq!(result[0].sort_key.as_ref().unwrap(), "2");
         assert_eq!(result[1].sort_key.as_ref().unwrap(), "1");
+
+        // Like systemd-boot, an entry that ran out of boot attempts sorts last
+        // whatever its sort-key, while one with attempts left sorts as usual.
+        for (name, expected) in [
+            ("entry1+0-3.conf", ["2", "1"]),
+            ("entry1+1-2.conf", ["1", "2"]),
+        ] {
+            tempdir.remove_all_optional("loader/entries")?;
+            tempdir.create_dir_all("loader/entries")?;
+            tempdir.atomic_write(format!("loader/entries/{name}"), entry1)?;
+            tempdir.atomic_write("loader/entries/entry2.conf", entry2)?;
+
+            let result =
+                get_sorted_type1_boot_entries_helper(&tempdir, true, false, Bootloader::Systemd)?;
+            let keys: Vec<_> = result
+                .iter()
+                .map(|c| c.sort_key.as_deref().unwrap())
+                .collect();
+            assert_eq!(keys, expected, "{name}");
+        }
 
         Ok(())
     }
