@@ -228,6 +228,11 @@ const LOST_AND_FOUND: &str = "lost+found";
 const OSTREE_COMPOSEFS_SUPER: &str = ".ostree.cfs";
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
+/// The ostree repository, relative to the physical root. The composefs backend
+/// creates a stub `ostree/` directory, but never this.
+const OSTREE_REPO: &str = "ostree/repo";
+/// Tracker for installing the composefs backend onto an existing ostree system
+const OSTREE_TO_COMPOSEFS_ISSUE: &str = "https://github.com/bootc-dev/bootc/issues/2079";
 /// The mount path for uefi
 pub(crate) const EFIVARFS: &str = "/sys/firmware/efi/efivars";
 pub(crate) const ARCH_USES_EFI: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
@@ -937,7 +942,7 @@ async fn initialize_ostree_root(state: &State, root_setup: &RootSetup) -> Result
 
     let stateroot = state.stateroot();
 
-    let has_ostree = rootfs_dir.try_exists("ostree/repo")?;
+    let has_ostree = rootfs_dir.try_exists(OSTREE_REPO)?;
     if !has_ostree {
         Task::new("Initializing ostree layout", "ostree")
             .args(["admin", "init-fs", "--modern", "."])
@@ -2635,6 +2640,12 @@ pub(crate) async fn install_to_filesystem(
     // Gather data about the root filesystem
     let inspect = bootc_mount::inspect_filesystem(&fsopts.root_path)?;
 
+    // Only a real ostree system has a repository; a composefs system has just a stub
+    // ostree/ dir. With --replace=wipe the repository is removed anyway.
+    let target_has_ostree_repo =
+        !matches!(fsopts.replace, Some(ReplaceMode::Wipe)) && rootfs_fd.try_exists(OSTREE_REPO)?;
+    let composefs_requested = opts.composefs_opts.composefs_backend;
+
     // Gather global state, destructuring the provided options.
     // IMPORTANT: We might re-execute the current process in this function (for SELinux among other things)
     // IMPORTANT: and hence anything that is done before MUST BE IDEMPOTENT.
@@ -2648,6 +2659,13 @@ pub(crate) async fn install_to_filesystem(
         Some(inspect.fstype.as_str().try_into()?),
     )
     .await?;
+
+    // This must happen before we touch /boot below.
+    ensure_composefs_target_not_ostree(
+        target_has_ostree_repo,
+        composefs_requested,
+        state.composefs_options.composefs_backend,
+    )?;
 
     // Check to see if this happens to be the real host root
     if !fsopts.acknowledge_destructive {
@@ -2817,6 +2835,37 @@ pub(crate) async fn install_to_filesystem(
     installation_complete();
 
     Ok(())
+}
+
+/// Installing the composefs backend onto a root that holds an ostree system is not
+/// implemented yet. Without this check it would wipe the ostree kernels from /boot and
+/// then fail or leave a half-configured system behind, so reject it before any changes.
+/// `composefs_requested` is whether `--composefs-backend` was passed, while
+/// `composefs_backend` also covers images (sealed UKIs) that require composefs.
+fn ensure_composefs_target_not_ostree(
+    target_has_ostree_repo: bool,
+    composefs_requested: bool,
+    composefs_backend: bool,
+) -> Result<()> {
+    if !(target_has_ostree_repo && composefs_backend) {
+        return Ok(());
+    }
+    let (what, alternative) = if composefs_requested {
+        (
+            "Installing with --composefs-backend",
+            "Omit --composefs-backend to install with the ostree backend, or install onto a \
+             fresh disk (e.g. `bootc install to-disk --composefs-backend`) for the composefs backend.",
+        )
+    } else {
+        (
+            "This image requires the composefs backend, and installing it",
+            "Install this image onto a fresh disk (e.g. `bootc install to-disk`) instead.",
+        )
+    };
+    anyhow::bail!(
+        "{what} onto an existing ostree-based system is not supported yet; no changes were made. \
+         {alternative} See {OSTREE_TO_COMPOSEFS_ISSUE}"
+    )
 }
 
 pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) -> Result<()> {
@@ -3075,6 +3124,39 @@ mod tests {
             let original = original.parse().unwrap();
             let fetched = composefs_fetch_reference(&original, config_id);
             assert_eq!(fetched.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_ensure_composefs_target_not_ostree() {
+        // (target has ostree repo, --composefs-backend, composefs effective, expected error)
+        let cases = [
+            (false, false, false, None),
+            (false, true, true, None),
+            (false, false, true, None),
+            (true, false, false, None),
+            (true, true, true, Some("Omit --composefs-backend")),
+            (
+                true,
+                false,
+                true,
+                Some("This image requires the composefs backend"),
+            ),
+        ];
+        for (has_repo, requested, effective, expected) in cases {
+            let r = ensure_composefs_target_not_ostree(has_repo, requested, effective);
+            match (r, expected) {
+                (Ok(()), None) => {}
+                (Err(e), Some(expected)) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains(expected), "{msg}");
+                    assert!(msg.contains("no changes were made"), "{msg}");
+                    assert!(msg.contains(OSTREE_TO_COMPOSEFS_ISSUE), "{msg}");
+                }
+                (r, expected) => panic!(
+                    "case {has_repo} {requested} {effective}: got {r:?}, expected {expected:?}"
+                ),
+            }
         }
     }
 
