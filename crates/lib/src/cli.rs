@@ -1878,6 +1878,7 @@ async fn edit_composefs(
         new_spec.image.clone(),
         do_upgrade_opts,
         false,
+        "edit",
     )
     .await
 }

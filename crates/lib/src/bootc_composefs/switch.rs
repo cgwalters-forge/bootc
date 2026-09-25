@@ -50,6 +50,7 @@ pub(crate) async fn switch_composefs(
         target,
         do_upgrade_opts,
         opts.unified_storage_exp,
+        "switch",
     )
     .await
 }
@@ -58,6 +59,7 @@ pub(crate) async fn switch_composefs(
 ///
 /// `unified_storage_exp` forces the use of unified storage; otherwise it is
 /// used when either the booted or the target image is already there.
+/// `operation` names the user-facing command in the journal.
 pub(crate) async fn switch_composefs_to(
     storage: &Storage,
     booted_cfs: &BootedComposefs,
@@ -65,6 +67,7 @@ pub(crate) async fn switch_composefs_to(
     target: ImageReference,
     mut do_upgrade_opts: DoUpgradeOpts,
     unified_storage_exp: bool,
+    operation: &str,
 ) -> Result<()> {
     let new_spec = {
         let mut new_spec = host.spec.clone();
@@ -88,11 +91,11 @@ pub(crate) async fn switch_composefs_to(
 
     tracing::info!(
         message_id = COMPOSEFS_SWITCH_JOURNAL_ID,
-        bootc.operation = "switch",
+        bootc.operation = operation,
         bootc.target_image = target_imgref.to_string(),
         bootc.apply_mode = do_upgrade_opts.apply,
         bootc.download_only = do_upgrade_opts.download_only,
-        "Starting composefs switch operation",
+        "Starting composefs {operation} operation",
     );
 
     let repo = &*booted_cfs.repo;
