@@ -64,6 +64,7 @@
 use std::cell::Cell;
 use std::fs::create_dir_all;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -98,6 +99,7 @@ use rustix::{mount::MountFlags, path::Arg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bootc_composefs::boot_counting::with_boot_tries;
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
 use crate::bootc_composefs::status::build_composefs_karg;
 use crate::bootc_kargs::compute_new_kargs;
@@ -783,6 +785,7 @@ pub(crate) fn setup_composefs_bls_boot(
     format_version: FormatVersion,
     entry: &ComposefsBootEntry<Sha512HashValue>,
     mounted_erofs: &Dir,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<String> {
     let id_hex = id.to_hex();
 
@@ -1043,7 +1046,10 @@ pub(crate) fn setup_composefs_bls_boot(
         .with_context(|| format!("Opening {config_path:?}"))?;
 
     loader_entries_dir.atomic_write(
-        type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+        with_boot_tries(
+            type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+            boot_tries,
+        ),
         bls_config.to_string().as_bytes(),
     )?;
 
@@ -1708,18 +1714,17 @@ fn write_grub_uki_menuentry(
 fn write_systemd_uki_config(
     esp_dir: &Dir,
     setup_type: &BootSetupType,
-    boot_label: String,
-    version: Option<String>,
-    os_id: Option<String>,
-    id: &Sha512HashValue,
+    uki_info: &UKIInfo,
     bootloader: &Bootloader,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<()> {
-    let os_id = os_id.as_deref().unwrap_or("bootc");
+    let id = &uki_info.composefs_digest;
+    let os_id = uki_info.os_id.as_deref().unwrap_or("bootc");
     let primary_sort_key = primary_sort_key(os_id);
 
     let mut bls_conf = BLSConfig::default();
     bls_conf
-        .with_title(boot_label)
+        .with_title(uki_info.boot_label.clone())
         .with_cfg(BLSConfigType::EFI {
             key: EFIKey::for_bootloader(
                 format!("/{BOOTC_UKI_DIR}/{}", get_uki_name(&id.to_hex())).into(),
@@ -1727,7 +1732,7 @@ fn write_systemd_uki_config(
             ),
         })
         .with_sort_key(primary_sort_key.clone())
-        .with_version(version.unwrap_or_else(|| id.to_hex()));
+        .with_version(uki_info.version.clone().unwrap_or_else(|| id.to_hex()));
 
     let (entries_dir, booted_bls) = match setup_type {
         BootSetupType::Setup(..) => {
@@ -1752,7 +1757,10 @@ fn write_systemd_uki_config(
 
     entries_dir
         .atomic_write(
-            type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+            with_boot_tries(
+                type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+                boot_tries,
+            ),
             bls_conf.to_string().as_bytes(),
         )
         .context("Writing conf file")?;
@@ -1786,6 +1794,7 @@ pub(crate) fn setup_composefs_uki_boot(
     id: &Sha512HashValue,
     boot_ids: &ExpectedBootImageIds,
     entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<(String, Sha512HashValue)> {
     let (esp_device, bootloader, missing_fsverity_allowed, uki_addons) = match setup_type {
         BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
@@ -1882,31 +1891,24 @@ pub(crate) fn setup_composefs_uki_boot(
     let uki_info =
         uki_info.ok_or_else(|| anyhow::anyhow!("Failed to get version and boot label from UKI"))?;
 
-    let UKIInfo {
-        boot_label,
-        version,
-        os_id,
-        boot_digest,
-        composefs_digest: deploy_id,
-    } = uki_info;
-
     match bootloader.kind()? {
-        BootloaderKind::GRUBClassic => {
-            write_grub_uki_menuentry(&setup_type, boot_label, &deploy_id, &esp_device)?
-        }
+        BootloaderKind::GRUBClassic => write_grub_uki_menuentry(
+            &setup_type,
+            uki_info.boot_label.clone(),
+            &uki_info.composefs_digest,
+            &esp_device,
+        )?,
 
         BootloaderKind::BLSCompatible => write_systemd_uki_config(
             &esp_mount.fd,
             &setup_type,
-            boot_label,
-            version,
-            os_id,
-            &deploy_id,
+            &uki_info,
             &bootloader,
+            boot_tries,
         )?,
     };
 
-    Ok((boot_digest, deploy_id))
+    Ok((uki_info.boot_digest, uki_info.composefs_digest))
 }
 
 /// A composefs image attached to a temporary directory with the ESP and a
@@ -2244,6 +2246,8 @@ pub(crate) async fn setup_composefs_boot(
                 provisional_format,
                 entry,
                 mounted_root.dir(),
+                // A fresh install has nothing to fall back to
+                None,
             )?,
             provisional_deploy_id,
         ),
@@ -2254,6 +2258,7 @@ pub(crate) async fn setup_composefs_boot(
                 &provisional_deploy_id,
                 &boot_ids,
                 entries,
+                None,
             ),
             &repo,
             &fs,
