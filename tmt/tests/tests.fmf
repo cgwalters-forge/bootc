@@ -206,3 +206,12 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-50-edit:
+  summary: Test bootc edit for image changes and rollback
+  duration: 30m
+  adjust:
+  - when: distro == centos-9 and boot_type == uki and seal_state == sealed
+    enabled: false
+    because: CentOS 9 cannot consume the signed host upgrade because shared storage is unavailable and its guest-local UKI builder produces unsigned images
+  test: nu booted/test-edit.nu
