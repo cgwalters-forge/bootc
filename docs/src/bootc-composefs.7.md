@@ -167,7 +167,7 @@ are some of the more prominent known issues.
 
 - [Unified storage](https://github.com/bootc-dev/bootc/issues/20)
 - [Sealed image build UX](https://github.com/bootc-dev/bootc/issues/1498): Streamlined tooling for building sealed images
-- In place transitions:
+- [In place transitions](https://github.com/bootc-dev/bootc/issues/2079) from ostree: `bootc install to-existing-root --composefs-backend` on an ostree host is currently rejected before making any changes.
   - First: support [factory reset](https://github.com/bootc-dev/bootc/issues/404) from ostree to composefs
   - Next: Support copying /etc and /var
 
