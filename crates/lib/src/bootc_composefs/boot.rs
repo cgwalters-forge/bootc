@@ -478,13 +478,18 @@ pub(crate) const SORTKEY_PRIORITY_SECONDARY: &str = "1";
 ///
 /// The underscore replacement prevents Grub from mis-parsing os_id values
 /// containing hyphens (e.g., "fedora-coreos" → "fedora_coreos").
+///
+/// A `+` in the version is replaced with an underscore too, as the Boot Loader
+/// Specification reserves `+` for boot counting: systemd-boot would take
+/// `…-1.2.3+42-1.conf` as an entry with 42 boot attempts left.
 pub fn type1_entry_conf_file_name(
     os_id: &str,
     version: impl std::fmt::Display,
     priority: &str,
 ) -> String {
     let os_id_safe = os_id.replace('-', "_");
-    format!("bootc_{os_id_safe}-{version}-{priority}.conf")
+    let version_safe = version.to_string().replace('+', "_");
+    format!("bootc_{os_id_safe}-{version_safe}-{priority}.conf")
 }
 
 /// Generate sort key for the primary (new/upgraded) boot entry.
@@ -2360,6 +2365,10 @@ mod tests {
         // Test rhel example
         let filename = type1_entry_conf_file_name("rhel", "9.3.0", FILENAME_PRIORITY_SECONDARY);
         assert_eq!(filename, "bootc_rhel-9.3.0-0.conf");
+
+        // '+' is reserved for boot counting
+        let filename = type1_entry_conf_file_name("fedora", "1.2.3+42", FILENAME_PRIORITY_PRIMARY);
+        assert_eq!(filename, "bootc_fedora-1.2.3_42-1.conf");
     }
 
     #[test]
