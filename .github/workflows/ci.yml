@@ -54,6 +54,7 @@ jobs:
     outputs:
       package_os_matrix: ${{ steps.matrix.outputs.package_os_matrix }}
       integration_os_matrix: ${{ steps.matrix.outputs.integration_os_matrix }}
+      integration_include: ${{ steps.matrix.outputs.integration_include }}
       upgrade_os_matrix: ${{ steps.matrix.outputs.upgrade_os_matrix }}
       run_heavy: ${{ steps.matrix.outputs.run_heavy }}
       merge_queue_enabled: ${{ steps.merge-queue.outputs.enabled }}
@@ -122,18 +123,24 @@ jobs:
             # Full suite: all OSes
             echo 'package_os_matrix=["fedora-44","fedora-45","fedora-46","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'integration_os_matrix=["fedora-44","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
+            # Extra legs outside the test-integration axes: composefs on btrfs
+            # (sealed UKI, so fs-verity on btrfs is exercised). Fedora only,
+            # since CentOS kernels lack btrfs.
+            echo 'integration_include=[{"test_os":"fedora-44","variant":"composefs","filesystem":"btrfs","bootloader":"systemd","boot_type":"uki","seal_state":"sealed"}]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=["fedora-44","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
           elif [[ "$DOCS_ONLY" != "true" ]] && echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null; then
             # Tier-1 only: centos-10
             echo 'package_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'integration_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'integration_include=[]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
           else
             # Plain PR or docs-only: skip heavy jobs entirely
             echo 'package_os_matrix=[]' >> "$GITHUB_OUTPUT"
             echo 'integration_os_matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'integration_include=[]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=[]' >> "$GITHUB_OUTPUT"
             echo 'run_heavy=false' >> "$GITHUB_OUTPUT"
           fi
@@ -302,6 +309,7 @@ jobs:
         bootloader: ["grub", "grub-cc", "systemd"]
         boot_type: ["bls", "uki"]
         seal_state: ["sealed", "unsealed"]
+        include: ${{ fromJson(needs.compute-ci-level.outputs.integration_include) }}
 
         exclude:
           # centos-9 composefs: only sealed UKI is supported (V1 EROFS).
