@@ -251,6 +251,8 @@ EORUN
 
 # This image signs systemd-boot using our key, and writes the resulting binary into /out
 FROM tools as sdboot-signed
+# Only here to key the layer cache on the signing certificate; see the Justfile.
+ARG secureboot_cert_sha256
 # The secureboot key and cert are passed via Justfile
 # We write the signed binary into /out
 # Note: /out already contains systemd-boot-unsigned RPM from initialize-sealing-tools
@@ -350,6 +352,8 @@ EORUN
 # This computes the composefs digest from base-penultimate and creates a signed UKI
 # We need our newly-built bootc for the compute-composefs-digest command
 FROM tools as sealed-uki
+# Only here to key the layer cache on the signing certificate; see the Justfile.
+ARG secureboot_cert_sha256
 ARG variant
 ARG filesystem
 ARG seal_state

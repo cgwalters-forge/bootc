@@ -79,9 +79,15 @@ base_buildargs := generic_buildargs + " " + _extra_src_args \
                   + " --build-arg=filesystem=" + filesystem \
                   + " --build-arg=erofs_version=" + erofs_version \
                   + " --build-arg=baseconfigs=" + baseconfigs
+# Build secrets aren't part of the layer cache key, so a signing step could
+# be reused from a build with different keys (e.g. after target/ was wiped,
+# or from another checkout sharing the container storage). Passing the
+# certificate's checksum as a build arg to the signing stages keys them on it.
+_secureboot_buildarg := "--build-arg=secureboot_cert_sha256=$(sha256sum < target/test-secureboot/db.crt | head -c 64)"
 buildargs := base_buildargs \
              + " --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse" \
-             + " --secret=id=secureboot_key,src=target/test-secureboot/db.key --secret=id=secureboot_cert,src=target/test-secureboot/db.crt"
+             + " --secret=id=secureboot_key,src=target/test-secureboot/db.key --secret=id=secureboot_cert,src=target/test-secureboot/db.crt" \
+             + " " + _secureboot_buildarg
 
 # ============================================================================
 # Core workflows - the main targets most developers will use
@@ -517,6 +523,7 @@ _build-upgrade-image:
         --build-arg "erofs_version={{erofs_version}}" \
         --secret=id=secureboot_key,src=target/test-secureboot/db.key \
         --secret=id=secureboot_cert,src=target/test-secureboot/db.crt \
+        {{_secureboot_buildarg}} \
         "${extra_args[@]}" \
         -t {{upgrade_img}} \
         -f tmt/tests/Dockerfile.upgrade \

@@ -44,6 +44,8 @@ RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
 # container ukify command it provides is needed for seal-uki.
 FROM tools AS sealed-upgrade-uki
 ARG boot_type seal_state filesystem erofs_version
+# Only here to key the layer cache on the signing certificate; see the Justfile.
+ARG secureboot_cert_sha256
 RUN --network=none --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     --mount=type=secret,id=secureboot_key \
     --mount=type=secret,id=secureboot_cert \
