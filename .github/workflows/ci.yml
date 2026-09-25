@@ -500,6 +500,69 @@ jobs:
           name: "tmt-log-${{ matrix.test_os }}-${{ matrix.variant }}-upgrade-${{ env.ARCH }}"
           path: /var/tmp/tmt
 
+  # Upgrade a composefs UKI system installed by bootc 1.16.0 through the
+  # dual-format UKI bridge (test-49-composefs-1-16-bridge). Fedora 44 only,
+  # as the pinned 1.16.0 build comes from Fedora's Koji.
+  test-composefs-bridge:
+    if: needs.compute-ci-level.outputs.run_heavy == 'true' && contains(fromJson(needs.compute-ci-level.outputs.package_os_matrix), 'fedora-44')
+    needs: [compute-ci-level, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        seal_state: [sealed, unsealed]
+
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: true
+      - name: Install tmt
+        uses: ./.github/actions/install-tmt
+
+      - name: Setup env
+        run: |
+          BASE="$(just pullspec-for-os base fedora-44)"
+          BUILDROOT_BASE="$(just pullspec-for-os buildroot-base fedora-44)"
+          printf 'BOOTC_base=%s\n' "$BASE" >> "$GITHUB_ENV"
+          printf 'BOOTC_buildroot_base=%s\n' "$BUILDROOT_BASE" >> "$GITHUB_ENV"
+          # Match the build in test-composefs-bridge so build-fetch warms its cache
+          echo "BOOTC_variant=composefs" >> "$GITHUB_ENV"
+          echo "BOOTC_bootloader=systemd" >> "$GITHUB_ENV"
+          echo "BOOTC_boot_type=uki" >> "$GITHUB_ENV"
+          echo "BOOTC_seal_state=${{ matrix.seal_state }}" >> "$GITHUB_ENV"
+          echo "BOOTC_SKIP_PACKAGE=1" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: packages-fedora-44
+          path: target/packages/
+
+      - name: Fetch external dependencies (with retry)
+        run: just build-fetch
+
+      - name: Run bridge test
+        run: just test-composefs-bridge ${{ matrix.seal_state }}
+
+      - name: Disk usage summary
+        if: always()
+        run: |
+          echo "### Disk usage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          df -h >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive TMT logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: "tmt-log-fedora-44-composefs-bridge-${{ matrix.seal_state }}-${{ env.ARCH }}"
+          path: /var/tmp/tmt
+
   # Test readonly behaviour with baseconfigs (transient mounts) baked into the image.
   # Composefs-only: setup-root-conf.toml is a composefs concept; ostree uses a
   # different config format (prepare-root.conf) and is not covered here.
@@ -668,7 +731,7 @@ jobs:
   # rather than being skipped along with it.
   required-checks-heavy:
     if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.compute-ci-level.outputs.merge_queue_enabled != 'true')) }}
-    needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-baseconfigs, test-container-export]
+    needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-composefs-bridge, test-baseconfigs, test-container-export]
     # Cheap aggregation (jq only) — no need for a full VM.
     runs-on: ubuntu-slim
     steps:
