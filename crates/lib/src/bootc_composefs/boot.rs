@@ -64,6 +64,7 @@
 use std::cell::Cell;
 use std::fs::create_dir_all;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -98,6 +99,7 @@ use rustix::{mount::MountFlags, path::Arg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bootc_composefs::boot_counting::with_boot_tries;
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
 use crate::bootc_composefs::status::build_composefs_karg;
 use crate::bootc_kargs::compute_new_kargs;
@@ -746,6 +748,7 @@ pub(crate) fn setup_composefs_bls_boot(
     format_version: FormatVersion,
     entry: &ComposefsBootEntry<Sha512HashValue>,
     mounted_erofs: &Dir,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<String> {
     let id_hex = id.to_hex();
 
@@ -1016,7 +1019,10 @@ pub(crate) fn setup_composefs_bls_boot(
         .with_context(|| format!("Opening {config_path:?}"))?;
 
     loader_entries_dir.atomic_write(
-        type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+        with_boot_tries(
+            type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+            boot_tries,
+        ),
         bls_config.to_string().as_bytes(),
     )?;
 
@@ -1687,6 +1693,7 @@ fn write_systemd_uki_config(
     os_id: Option<String>,
     id: &Sha512HashValue,
     bootloader: &Bootloader,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<()> {
     let os_id = os_id.as_deref().unwrap_or("bootc");
     let primary_sort_key = primary_sort_key(os_id);
@@ -1726,7 +1733,10 @@ fn write_systemd_uki_config(
 
     entries_dir
         .atomic_write(
-            type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+            with_boot_tries(
+                type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+                boot_tries,
+            ),
             bls_conf.to_string().as_bytes(),
         )
         .context("Writing conf file")?;
@@ -1760,6 +1770,7 @@ pub(crate) fn setup_composefs_uki_boot(
     id: &Sha512HashValue,
     boot_ids: &ExpectedBootImageIds,
     entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<(String, Sha512HashValue)> {
     let (root_path, esp_device, bootloader, missing_fsverity_allowed, uki_addons) = match setup_type
     {
@@ -1882,6 +1893,7 @@ pub(crate) fn setup_composefs_uki_boot(
             os_id,
             &deploy_id,
             &bootloader,
+            boot_tries,
         )?,
     };
 
@@ -2223,6 +2235,8 @@ pub(crate) async fn setup_composefs_boot(
                 provisional_format,
                 entry,
                 mounted_root.dir(),
+                // A fresh install has nothing to fall back to
+                None,
             )?,
             provisional_deploy_id,
         ),
@@ -2233,6 +2247,7 @@ pub(crate) async fn setup_composefs_boot(
                 &provisional_deploy_id,
                 &boot_ids,
                 entries,
+                None,
             ),
             &repo,
             &fs,
