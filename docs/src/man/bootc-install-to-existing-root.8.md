@@ -16,6 +16,12 @@ host root filesystem\'s `/boot` partition will be wiped, but the
 content of the existing root will otherwise be retained, and will need
 to be cleaned up if desired when rebooted into the new root.
 
+The composefs backend (`--composefs-backend`, or an image that requires
+it) cannot yet be installed onto a host running the ostree backend; bootc
+rejects this before making any changes. Migrating an existing ostree
+system to composefs is tracked in
+[#2079](https://github.com/bootc-dev/bootc/issues/2079).
+
 ## Managing configuration: before and after reboot
 
 When using `to-existing-root`, there are two distinct scenarios for managing
