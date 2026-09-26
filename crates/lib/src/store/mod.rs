@@ -97,7 +97,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bootc_mount::tempmount::TempMount;
 use bootc_mount::{Filesystem, run_findmnt};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::{
     Dir, DirBuilder, DirBuilderExt as _, Permissions, PermissionsExt as _,
@@ -371,28 +371,93 @@ fn sysroot_is_read_only(d: &Dir) -> Result<bool> {
     Ok(false)
 }
 
+/// Path of the boot directory on the physical root, used by GRUB unless
+/// there's a separate boot partition
+const PHYSICAL_ROOT_BOOT_PATH: &str = "/sysroot/boot";
+/// Where a separate boot partition is mounted in the booted root
+const BOOT_MOUNT_PATH: &str = "/boot";
+
+/// Where GRUB's configuration and the BLS entries live on a booted composefs
+/// system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrubBootLocation {
+    /// `boot` on the physical root, i.e. `/sysroot/boot`
+    PhysicalRoot,
+    /// A separate boot partition, mounted on `/boot`. It isn't mounted on
+    /// `/sysroot/boot`, which is just an empty directory then.
+    BootMount,
+}
+
+impl GrubBootLocation {
+    /// Decide from the partition type and filesystem type of the filesystem
+    /// mounted on `/boot`, and whether it has a GRUB directory.
+    fn classify(parttype: Option<&str>, fstype: &str, has_grub_dir: bool) -> Self {
+        use crate::discoverable_partition_specification as dps;
+
+        // The ESP mounted on /boot: GRUB's configuration is in /sysroot/boot
+        let is_esp = match parttype {
+            Some(p) if p.eq_ignore_ascii_case(dps::ESP) => true,
+            Some(p) if p.eq_ignore_ascii_case(dps::XBOOTLDR) => false,
+            // No (or another) DPS type, so go by the filesystem
+            _ => fstype == "vfat",
+        };
+        // Otherwise it's a boot partition (XBOOTLDR or not), which should
+        // have GRUB's configuration, but check just in case
+        if !is_esp && has_grub_dir {
+            Self::BootMount
+        } else {
+            Self::PhysicalRoot
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::PhysicalRoot => PHYSICAL_ROOT_BOOT_PATH,
+            Self::BootMount => BOOT_MOUNT_PATH,
+        }
+    }
+}
+
+/// Find the directory holding GRUB's configuration and the BLS entries on a
+/// booted system, returning it and its absolute path.
+///
+/// This is `/sysroot/boot`, unless there's a separate boot partition, which
+/// is mounted on `/boot` (see the `systemd.mount-extra` karg added at install
+/// time). Everything that reads or writes GRUB's boot entries must go through
+/// this, via [`Storage::require_boot_dir`] or
+/// [`Storage::require_grub_boot_path`].
 #[context("Finding boot for Grub")]
-fn get_boot_dir_for_grub(physical_root: &Dir) -> Result<Dir> {
+fn get_boot_dir_for_grub(physical_root: &Dir) -> Result<(Dir, Utf8PathBuf)> {
     // We have this so systemd's boot.automount shouldn't expire until
     // this function finishes execution as we have a handle to /boot
-    let boot =
-        Dir::open_ambient_dir("/boot", ambient_authority()).context("Failed to open /boot")?;
+    let boot = Dir::open_ambient_dir(BOOT_MOUNT_PATH, ambient_authority())
+        .with_context(|| format!("Opening {BOOT_MOUNT_PATH}"))?;
+
+    let open = |location: GrubBootLocation| -> Result<(Dir, Utf8PathBuf)> {
+        let dir = match location {
+            GrubBootLocation::PhysicalRoot => physical_root
+                .open_dir(crate::install::BOOT)
+                .context("Opening boot in physical root")?,
+            // Remount /boot if mounted RO
+            GrubBootLocation::BootMount => open_dir_remount_rw(&boot, ".".into())?,
+        };
+        Ok((dir, location.path().into()))
+    };
 
     let is_boot_mntpnt = boot
         .is_mountpoint(".")
-        .context("Checking if /boot is a mountpoint")?;
+        .with_context(|| format!("Checking if {BOOT_MOUNT_PATH} is a mountpoint"))?;
 
     // /boot is not a mount point for bootloader Grub, so we have to
     // have stuff in /sysroot/boot
     if !matches!(is_boot_mntpnt, Some(true)) {
-        return physical_root
-            .open_dir("boot")
-            .context("Opening boot in physical root");
+        return open(GrubBootLocation::PhysicalRoot);
     }
 
     // /boot is a mountpoint
-    // Figure out if it's the ESP or XBOOTLDR
-    let mnt_res = run_findmnt(&[], None, Some("/boot")).context("Finding /boot mount info")?;
+    // Figure out if it's the ESP or a boot partition
+    let mnt_res = run_findmnt(&[], None, Some(BOOT_MOUNT_PATH))
+        .with_context(|| format!("Finding {BOOT_MOUNT_PATH} mount info"))?;
 
     let mut boot_mount_details: Option<Filesystem> = None;
 
@@ -417,45 +482,13 @@ fn get_boot_dir_for_grub(physical_root: &Dir) -> Result<Dir> {
     let boot_mount_details = boot_mount_details
         .ok_or_else(|| anyhow::anyhow!("Failed to get mount details for /boot"))?;
 
-    let boot_fs = boot_mount_details.fstype;
+    let boot_dev_info = bootc_blockdev::list_dev(&Utf8PathBuf::from(&boot_mount_details.source))?;
 
-    let boot_dev_info = bootc_blockdev::list_dev(&Utf8PathBuf::from(boot_mount_details.source))?;
-
-    let boot_is_esp = || {
-        // /boot is ESP so we have grub configs in /sysroot/boot
-        return physical_root
-            .open_dir("boot")
-            .context("Opening boot in physical root");
-    };
-
-    let boot_is_xbootldr = || {
-        // XBOOTLDR, so grub configs should hopefully be here
-        // but check just in case
-        if boot.is_dir("grub2") {
-            // Remount /boot if mounted RO
-            return open_dir_remount_rw(&boot, ".".into());
-        }
-
-        return physical_root
-            .open_dir("boot")
-            .context("Opening boot in physical root");
-    };
-
-    let return_boot_by_fs = || match boot_fs.as_ref() {
-        "vfat" => boot_is_esp(),
-        _ => boot_is_xbootldr(),
-    };
-
-    use crate::discoverable_partition_specification as dps;
-
-    match boot_dev_info.parttype {
-        Some(parttype) => match parttype.as_str() {
-            dps::ESP => boot_is_esp(),
-            dps::XBOOTLDR => boot_is_xbootldr(),
-            _ => return_boot_by_fs(),
-        },
-        None => return_boot_by_fs(),
-    }
+    open(GrubBootLocation::classify(
+        boot_dev_info.parttype.as_deref(),
+        &boot_mount_details.fstype,
+        boot.is_dir("grub2"),
+    ))
 }
 
 impl BootedStorage {
@@ -486,12 +519,15 @@ impl BootedStorage {
                     EspAccess::ReadWrite => mount_esp_writable(&esp_path)?,
                 };
 
-                let boot_dir = match get_bootloader()?.kind()? {
+                let (boot_dir, grub_boot_path) = match get_bootloader()?.kind()? {
                     // We can have a separate /boot and not /sysroot/boot
-                    BootloaderKind::GRUBClassic => get_boot_dir_for_grub(&physical_root)?,
+                    BootloaderKind::GRUBClassic => {
+                        let (dir, path) = get_boot_dir_for_grub(&physical_root)?;
+                        (dir, Some(path))
+                    }
                     // NOTE: Handle XBOOTLDR partitions here if and when we use it
                     BootloaderKind::BLSCompatible => {
-                        esp_mount.fd.try_clone().context("Cloning fd")?
+                        (esp_mount.fd.try_clone().context("Cloning fd")?, None)
                     }
                 };
 
@@ -501,6 +537,7 @@ impl BootedStorage {
                     is_ro,
                     run,
                     boot_dir: Some(boot_dir),
+                    grub_boot_path,
                     esp: Some(esp_mount),
                     ostree: Default::default(),
                     composefs: OnceCell::from(composefs.clone()),
@@ -546,6 +583,7 @@ impl BootedStorage {
                     is_ro,
                     run,
                     boot_dir: None,
+                    grub_boot_path: None,
                     esp: None,
                     ostree: OnceCell::from(sysroot),
                     composefs: Default::default(),
@@ -599,9 +637,13 @@ pub(crate) struct Storage {
     pub(crate) is_ro: bool,
 
     /// The 'boot' directory, useful and `Some` only for composefs systems
-    /// For grub booted systems, this points to `/sysroot/boot`
+    /// For grub booted systems, this points to `/sysroot/boot`, or to `/boot`
+    /// if that's a separate boot partition
     /// For systemd booted systems, this points to the ESP
     pub boot_dir: Option<Dir>,
+
+    /// The absolute path of `boot_dir` on composefs systems booted with grub
+    grub_boot_path: Option<Utf8PathBuf>,
 
     /// The ESP mounted at a tmp location
     pub esp: Option<TempMount>,
@@ -667,6 +709,7 @@ impl Storage {
             is_ro: false,
             run,
             boot_dir: None,
+            grub_boot_path: None,
             esp: None,
             ostree: ostree_cell,
             composefs: Default::default(),
@@ -691,6 +734,15 @@ impl Storage {
             .ok_or_else(|| anyhow::anyhow!("Boot dir not found"))
     }
 
+    /// Returns the absolute path of `boot_dir` on a composefs system booted
+    /// with grub, for code that works with paths rather than directory fds:
+    /// `/boot` if it's a separate boot partition, `/sysroot/boot` otherwise
+    pub(crate) fn require_grub_boot_path(&self) -> Result<&Utf8Path> {
+        self.grub_boot_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Grub boot path not found"))
+    }
+
     /// Returns the mounted `esp` if it exists
     pub(crate) fn require_esp(&self) -> Result<&TempMount> {
         self.esp
@@ -699,7 +751,7 @@ impl Storage {
     }
 
     /// Returns the Directory where the Type1 boot binaries are stored
-    /// `/sysroot/boot` for Grub, and ESP/EFI/Linux for systemd-boot
+    /// The grub boot directory (see `require_boot_dir`) for Grub, and ESP/EFI/Linux for systemd-boot
     pub(crate) fn bls_boot_binaries_dir(&self) -> Result<Dir> {
         let boot_dir = self.require_boot_dir()?;
 
@@ -924,5 +976,42 @@ mod tests {
         assert_eq!(mode & PERMS, COMPOSEFS_MODE);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_grub_boot_location_classify() {
+        use crate::discoverable_partition_specification as dps;
+        use GrubBootLocation::*;
+
+        const LINUX_DATA: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
+        let upper_xbootldr = dps::XBOOTLDR.to_ascii_uppercase();
+
+        // (parttype, fstype, has grub dir, expected)
+        let cases = [
+            // The ESP on /boot never holds GRUB's configuration
+            (Some(dps::ESP), "vfat", true, PhysicalRoot),
+            (Some(dps::ESP), "vfat", false, PhysicalRoot),
+            // XBOOTLDR, whatever its filesystem, if it has GRUB's configuration
+            (Some(dps::XBOOTLDR), "ext4", true, BootMount),
+            (Some(dps::XBOOTLDR), "vfat", true, BootMount),
+            (Some(dps::XBOOTLDR), "ext4", false, PhysicalRoot),
+            (Some(upper_xbootldr.as_str()), "xfs", true, BootMount),
+            // No DPS type: go by the filesystem
+            (Some(LINUX_DATA), "ext4", true, BootMount),
+            (Some(LINUX_DATA), "vfat", true, PhysicalRoot),
+            (None, "xfs", true, BootMount),
+            (None, "btrfs", false, PhysicalRoot),
+            (None, "vfat", true, PhysicalRoot),
+        ];
+        for (parttype, fstype, has_grub_dir, expected) in cases {
+            assert_eq!(
+                GrubBootLocation::classify(parttype, fstype, has_grub_dir),
+                expected,
+                "{parttype:?} {fstype} grub dir: {has_grub_dir}"
+            );
+        }
+
+        assert_eq!(PhysicalRoot.path(), "/sysroot/boot");
+        assert_eq!(BootMount.path(), "/boot");
     }
 }
