@@ -97,8 +97,10 @@ moves the system to V1. bootc 1.16.4 and later already understand
 
 The 1.16.0 path is covered by the `test-49-composefs-1-16-bridge` TMT test for
 both sealed and `--allow-missing-verity` UKIs, including rollback and garbage
-collection. Upgrades from other releases, and from BLS (non-UKI) composefs
-installs, are not yet tested.
+collection. Upgrades from other releases are not yet tested. For BLS
+(non-UKI) installs, `test-56-composefs-legacy-initramfs` covers a current
+bootc switching to an image whose initramfs has the bootc 1.16 unit
+condition; upgrades by a 1.16 client are not yet tested.
 
 ## Storage and repository structure
 
