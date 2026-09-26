@@ -63,7 +63,7 @@
 //! deployment is created via `ostree admin deploy`, and bootloader entries are
 //! managed via BLS (Boot Loader Specification) files.
 //!
-//! ### Composefs Backend (Experimental)
+//! ### Composefs Backend
 //!
 //! Alternative backend using composefs overlayfs for the root filesystem. Provides
 //! stronger integrity guarantees via fs-verity and supports UKI (Unified Kernel
@@ -224,8 +224,6 @@ const ALONGSIDE_ROOT_MOUNT: &str = "/target";
 pub(crate) const DESTRUCTIVE_CLEANUP: &str = "etc/bootc-destructive-cleanup";
 /// This is an ext4 special directory we need to ignore.
 const LOST_AND_FOUND: &str = "lost+found";
-/// The filename of the composefs EROFS superblock; TODO move this into ostree
-const OSTREE_COMPOSEFS_SUPER: &str = ".ostree.cfs";
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
 /// The mount path for uefi
@@ -399,7 +397,7 @@ pub(crate) struct InstallConfigOpts {
 
 #[derive(Debug, Default, Clone, clap::Parser, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstallComposefsOpts {
-    /// If true, composefs backend is used, else ostree backend is used
+    /// Use the composefs backend instead of ostree (implied when the image contains a UKI)
     #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) composefs_backend: bool,
@@ -409,7 +407,7 @@ pub(crate) struct InstallComposefsOpts {
     #[serde(default)]
     pub(crate) allow_missing_verity: bool,
 
-    /// Name of the UKI addons to install without the ".efi.addon" suffix.
+    /// Name of the UKI addons to install without the ".efi.addon" suffix (experimental).
     /// This option can be provided multiple times if multiple addons are to be installed.
     #[clap(long, requires = "composefs_backend")]
     #[serde(default)]
@@ -1277,11 +1275,14 @@ async fn install_container(
             .with_context(|| format!("Recursive SELinux relabeling of {d}"))?;
         }
 
-        if let Some(cfs_super) = root.open_optional(OSTREE_COMPOSEFS_SUPER)? {
+        if let Some(cfs_super) = root.open_optional(ostree_prepareroot::COMPOSEFS_IMAGE)? {
             let label = crate::lsm::require_label(policy, "/usr".into(), 0o644)?;
             crate::lsm::set_security_selinux(cfs_super.as_fd(), label.as_bytes())?;
         } else {
-            tracing::warn!("Missing {OSTREE_COMPOSEFS_SUPER}; composefs is not enabled?");
+            tracing::warn!(
+                "Missing {}; composefs is not enabled?",
+                ostree_prepareroot::COMPOSEFS_IMAGE
+            );
         }
     }
 

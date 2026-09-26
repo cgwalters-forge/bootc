@@ -316,6 +316,8 @@ pub(crate) struct UsrOverlayOpts {
 
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InstallOpts {
+    /// Mount an installed deployment into a caller-owned directory.
+    Mount(crate::mount::MountOpts),
     /// Install to the target block device.
     ///
     /// This command must be invoked inside of the container, which will be
@@ -425,7 +427,10 @@ pub(crate) enum ContainerOpts {
         no_truncate: bool,
     },
     /// Output the bootable composefs digest for a directory.
-    #[clap(hide = true)]
+    ///
+    /// This is the digest that `bootc container ukify` embeds in the kernel
+    /// command line of a UKI. It is useful for scripting and debugging outside
+    /// of that flow.
     ComputeComposefsDigest {
         /// Path to the filesystem root
         #[clap(default_value = "/target")]
@@ -466,7 +471,7 @@ pub(crate) enum ContainerOpts {
     /// by kernel version
     ///
     /// Example:
-    ///   bootc container split-kernel-rootfs --rootfs /target-rootfs --output /out
+    ///   bootc container split-kernel-and-rootfs --rootfs /target-rootfs --output /out
     SplitKernelAndRootfs {
         /// Operate on the provided rootfs
         #[clap(long, default_value = "/")]
@@ -748,7 +753,7 @@ pub(crate) enum SelinuxOpts {
     },
 }
 
-fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBuf, String> {
+pub(crate) fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBuf, String> {
     let path = Utf8PathBuf::from(value);
     if path.is_absolute() {
         Ok(path)
@@ -1079,6 +1084,7 @@ pub(crate) enum Opt {
     #[clap(subcommand)]
     #[clap(hide = true)]
     Internals(InternalsOpts),
+    #[clap(hide = true)]
     ComposefsFinalizeStaged(ComposefsFinalizeStagedOpts),
     /// Diff current /etc configuration versus default
     #[clap(hide = true)]
@@ -1093,9 +1099,7 @@ pub(crate) enum Opt {
         shell: clap_complete::aot::Shell,
     },
     #[clap(hide = true)]
-    DeleteDeployment {
-        depl_id: String,
-    },
+    DeleteDeployment { depl_id: String },
 }
 
 /// Ensure we've entered a mount namespace, so that we can remount
@@ -2383,6 +2387,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             }
         },
         Opt::Install(opts) => match opts {
+            InstallOpts::Mount(opts) => crate::mount::mount(opts).await,
             #[cfg(feature = "install-to-disk")]
             InstallOpts::ToDisk(opts) => crate::install::install_to_disk(opts).await,
             InstallOpts::ToFilesystem(opts) => {
