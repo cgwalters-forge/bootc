@@ -72,16 +72,28 @@ For a sealed deployment, sign the new UKI with a key the existing machine
 trusts. If the deployment was built with `--allow-missing-verity`, keep that
 flag. Then publish the image and run `bootc upgrade` as usual.
 
-What happens next depends on the bootc version doing the staging. A client
-that only understands `composefs=`, such as 1.16.0, stages the V2 fallback;
-the new initramfs boots it, and the next upgrade (now staged by the new bootc)
-moves the system to V1. bootc 1.16.4 and later already understand
-`composefs.digest=` and stage V1 directly.
+What happens next depends on the bootc version doing the staging, and on
+the repository it stages into:
 
-The 1.16.0 path is covered by the `test-49-composefs-1-16-bridge` TMT test for
-both sealed and `--allow-missing-verity` UKIs, including rollback and garbage
-collection. Upgrades from other releases, and from BLS (non-UKI) composefs
-installs, are not yet tested.
+- bootc 1.16.0-1.16.2 only understand `composefs=` and stage the V2
+  fallback; the new initramfs boots it, and the next upgrade (now staged by
+  the new bootc) moves the system to V1.
+- bootc 1.16.3 already reads `composefs.digest=` but still creates V2
+  images, so it refuses a UKI whose `composefs.digest=` names a V1 image
+  ("The UKI has the wrong composefs= parameter").
+- bootc 1.16.4 through 1.16.14 create V1 images and stage V1 directly, but
+  only on a repository created by 1.16.4 or later. Repositories created by
+  1.16.0-1.16.3 stay V2 (1.16.3 records V2 in `meta.json`, earlier releases
+  record no format, which reads as V2), and no 1.16 release converts them.
+  On such a system, 1.16.4 through 1.16.14 refuse a dual-format UKI the
+  same way as 1.16.3
+  ([#2334](https://github.com/bootc-dev/bootc/issues/2334)); BLS installs
+  are not affected by this check.
+
+The `test-49-composefs-1-16-bridge` TMT test covers installs by 1.16.0 (sealed
+and `--allow-missing-verity` UKIs) and by 1.16.4 (sealed UKI and BLS),
+including rollback and garbage collection. 1.16.3, and 1.16.4-1.16.14
+staging on a system installed by 1.16.0-1.16.3, are not tested.
 
 ## Storage and repository structure
 
