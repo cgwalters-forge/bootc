@@ -62,7 +62,7 @@ fn delete_type1_conf_file(
                     continue;
                 }
 
-                // Boot dir in case of EFI will be the ESP
+                // Boot dir in case of EFI will be the ESP, or XBOOTLDR
                 tracing::debug!("Deleting EFI .conf file: {}", file_name);
                 entry.remove_file().context("Removing .conf file")?;
 
