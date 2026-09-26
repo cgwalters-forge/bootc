@@ -497,6 +497,95 @@ fn check_kernel(root: &Dir, _config: &LintExecutionConfig) -> LintResult {
     lint_ok()
 }
 
+/// Kernel modules directory; each kernel may ship its build configuration
+/// as `$kver/config` in here.
+const KERNEL_MODULES_DIR: &str = "usr/lib/modules";
+/// Kernel build configuration options that are required for composefs,
+/// which mounts an EROFS metadata image (whose overlayfs metadata is stored
+/// in xattrs) as the lower layer of an overlayfs.
+const COMPOSEFS_KCONFIG_REQUIRED: &[&str] = &[
+    "CONFIG_EROFS_FS",
+    "CONFIG_EROFS_FS_XATTR",
+    "CONFIG_OVERLAY_FS",
+];
+/// EROFS images are mounted directly from a file on newer kernels, and via
+/// a loop device otherwise; at least one of these options is required.
+const COMPOSEFS_KCONFIG_ANY_OF: &[&str] =
+    &["CONFIG_EROFS_FS_BACKED_BY_FILE", "CONFIG_BLK_DEV_LOOP"];
+
+#[distributed_slice(LINTS)]
+static LINT_KERNEL_COMPOSEFS: Lint = Lint::new_warning(
+    "kernel-composefs",
+    indoc! { r#"
+Check that the kernel build configuration (/usr/lib/modules/$kver/config,
+if present) enables the features required by composefs: EROFS and overlayfs
+(built-in or as a module) with EROFS xattr support, plus file-backed EROFS
+mounts or loop devices.
+"# },
+    check_kernel_composefs,
+);
+
+/// Parse the contents of a kernel `.config` file, returning the options that
+/// are enabled either as built-in (`=y`) or as a module (`=m`).
+fn kconfig_enabled(config: &str) -> BTreeSet<&str> {
+    config
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(_, v)| matches!(*v, "y" | "m"))
+        .map(|(k, _)| k.trim())
+        .collect()
+}
+
+/// Return the composefs-related kernel options which are missing from the
+/// given kernel configuration, formatted for display.
+fn kconfig_missing_for_composefs(config: &str) -> Vec<String> {
+    let enabled = kconfig_enabled(config);
+    let mut missing: Vec<String> = COMPOSEFS_KCONFIG_REQUIRED
+        .iter()
+        .filter(|k| !enabled.contains(*k))
+        .map(|k| (*k).to_owned())
+        .collect();
+    if !COMPOSEFS_KCONFIG_ANY_OF.iter().any(|k| enabled.contains(k)) {
+        missing.push(format!("one of {}", COMPOSEFS_KCONFIG_ANY_OF.join(", ")));
+    }
+    missing
+}
+
+fn check_kernel_composefs(root: &Dir, _config: &LintExecutionConfig) -> LintResult {
+    let Some(modules) = root.open_dir_optional(KERNEL_MODULES_DIR)? else {
+        return lint_ok();
+    };
+    let mut errs = Vec::new();
+    for entry in modules.entries_utf8()? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // Leave reporting non-UTF-8 names to the utf8 lint
+        let Ok(kver) = entry.file_name() else {
+            continue;
+        };
+        let path = Utf8Path::new(&kver).join("config");
+        // Not every distribution ships the kernel configuration; we can
+        // only check it when it's there.
+        let Some(config) = modules.read_to_string_optional(&path)? else {
+            continue;
+        };
+        let missing = kconfig_missing_for_composefs(&config);
+        if !missing.is_empty() {
+            errs.push(format!(
+                "/{KERNEL_MODULES_DIR}/{path}: Missing kernel options required for composefs: {}",
+                missing.join("; ")
+            ));
+        }
+    }
+    if errs.is_empty() {
+        lint_ok()
+    } else {
+        lint_err(errs.join("\n"))
+    }
+}
+
 // This one can be lifted in the future, see https://github.com/bootc-dev/bootc/issues/975
 #[distributed_slice(LINTS)]
 static LINT_UTF8: Lint = Lint {
@@ -1084,6 +1173,88 @@ mod tests {
         root.remove_dir_all("usr/lib/modules/5.7.2")?;
         // Now we should pass again
         check_kernel(root, config).unwrap().unwrap();
+        Ok(())
+    }
+
+    /// A kernel configuration fragment with everything composefs needs.
+    const COMPOSEFS_KCONFIG: &str = indoc! { "
+        # Automatically generated file; DO NOT EDIT.
+        CONFIG_BLK_DEV_LOOP=y
+        CONFIG_EROFS_FS=m
+        CONFIG_EROFS_FS_XATTR=y
+        CONFIG_OVERLAY_FS=m
+    " };
+
+    #[test]
+    fn test_kconfig_missing_for_composefs() {
+        const ANY_OF: &str = "one of CONFIG_EROFS_FS_BACKED_BY_FILE, CONFIG_BLK_DEV_LOOP";
+        let without = |opt: &str| COMPOSEFS_KCONFIG.replace(&format!("{opt}="), "#");
+        let cases: &[(String, &[&str])] = &[
+            (COMPOSEFS_KCONFIG.into(), &[]),
+            (
+                COMPOSEFS_KCONFIG
+                    .replace("CONFIG_BLK_DEV_LOOP=y", "CONFIG_EROFS_FS_BACKED_BY_FILE=y"),
+                &[],
+            ),
+            (
+                COMPOSEFS_KCONFIG.replace("CONFIG_EROFS_FS=m", "# CONFIG_EROFS_FS is not set"),
+                &["CONFIG_EROFS_FS"],
+            ),
+            (
+                COMPOSEFS_KCONFIG.replace("CONFIG_EROFS_FS=m", "CONFIG_EROFS_FS=n"),
+                &["CONFIG_EROFS_FS"],
+            ),
+            // Missing entirely; CONFIG_EROFS_FS_XATTR must not count as a prefix match
+            (without("CONFIG_EROFS_FS"), &["CONFIG_EROFS_FS"]),
+            (without("CONFIG_EROFS_FS_XATTR"), &["CONFIG_EROFS_FS_XATTR"]),
+            (without("CONFIG_OVERLAY_FS"), &["CONFIG_OVERLAY_FS"]),
+            (without("CONFIG_BLK_DEV_LOOP"), &[ANY_OF]),
+            (
+                String::new(),
+                &[
+                    "CONFIG_EROFS_FS",
+                    "CONFIG_EROFS_FS_XATTR",
+                    "CONFIG_OVERLAY_FS",
+                    ANY_OF,
+                ],
+            ),
+        ];
+        for (config, expected) in cases {
+            assert_eq!(
+                kconfig_missing_for_composefs(config),
+                *expected,
+                "config: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kernel_composefs() -> Result<()> {
+        let root = &passing_fixture()?;
+        let config = &LintExecutionConfig::default();
+        // No kernel config shipped; nothing to check
+        check_kernel_composefs(root, config).unwrap().unwrap();
+
+        const KCONFIG: &str = "usr/lib/modules/5.7.2/config";
+        root.write(KCONFIG, COMPOSEFS_KCONFIG)?;
+        check_kernel_composefs(root, config).unwrap().unwrap();
+
+        root.write(
+            KCONFIG,
+            COMPOSEFS_KCONFIG.replace("CONFIG_EROFS_FS=m", "# CONFIG_EROFS_FS is not set"),
+        )?;
+        let Err(e) = check_kernel_composefs(root, config).unwrap() else {
+            unreachable!("expected missing EROFS to be flagged")
+        };
+        similar_asserts::assert_eq!(
+            e.to_string(),
+            "/usr/lib/modules/5.7.2/config: Missing kernel options required for composefs: CONFIG_EROFS_FS"
+        );
+
+        // Non-UTF-8 directory names are left to the utf8 lint
+        root.create_dir(std::ffi::OsStr::from_bytes(b"usr/lib/modules/bad\xff"))?;
+        root.write(KCONFIG, COMPOSEFS_KCONFIG)?;
+        check_kernel_composefs(root, config).unwrap().unwrap();
         Ok(())
     }
 
