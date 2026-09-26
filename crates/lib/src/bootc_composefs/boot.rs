@@ -2120,6 +2120,7 @@ pub(crate) async fn setup_composefs_boot(
         crate::bootloader::install_via_zipl(
             &root_setup.device_info.require_single_root()?,
             boot_uuid,
+            &state.prog,
         )?;
     } else if matches!(
         postfetch.detected_bootloader,
@@ -2141,6 +2142,7 @@ pub(crate) async fn setup_composefs_boot(
             &state.config_opts,
             Some(chroot_target),
             Some(bind_boot_path.as_path()),
+            &state.prog,
         )?;
 
         // FIXME: Remove this hack once we have support in bootupd
@@ -2192,6 +2194,7 @@ pub(crate) async fn setup_composefs_boot(
                 &mounted_root,
                 &state.config_opts,
                 get_secureboot_keys(mounted_root.dir(), BOOTC_AUTOENROLL_PATH)?,
+                &state.prog,
             )
         })?;
     }

@@ -111,11 +111,16 @@ impl PullProgress {
         }
     }
 
-    async fn send(&self, event: Event<'_>) {
-        self.json.send(event.clone()).await;
+    fn send(&self, event: Event<'_>) {
+        self.json.send(event.clone());
         if let Event::ProgressSteps { description, .. } = &event {
             self.println(description);
         }
+    }
+
+    /// The writer for `--progress-fd` output and status messages.
+    pub(crate) fn writer(&self) -> &ProgressWriter {
+        &self.json
     }
 
     fn clear(&self) {
@@ -354,7 +359,7 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
                             steps: layers_bar.position(),
                             steps_total: config.n_layers_to_fetch as u64,
                             subtasks: subtasks.clone(),
-                        }).await;
+                        });
                     }
                 } else {
                     // If the receiver is disconnected, then we're done
@@ -389,7 +394,7 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
                         steps: layers_bar.position(),
                         steps_total: config.n_layers_to_fetch as u64,
                         subtasks: subtasks.clone().into_iter().chain([subtask.clone()]).collect(),
-                    }).await;
+                    });
                 }
             }
         }
@@ -413,25 +418,21 @@ async fn handle_layer_progress_print(mut config: LayerProgressConfig) {
     // Since the progress notifier closed, we know import has started
     // use as a heuristic to begin import progress
     // Cannot be lossy or it is dropped
-    config
-        .progress
-        .json
-        .send(Event::ProgressSteps {
-            task: "importing".into(),
+    config.progress.json.send(Event::ProgressSteps {
+        task: "importing".into(),
+        description: "Importing Image".into(),
+        id: (*config.digest).into(),
+        steps_cached: 0,
+        steps: 0,
+        steps_total: 1,
+        subtasks: [SubTaskStep {
+            subtask: "importing".into(),
             description: "Importing Image".into(),
-            id: (*config.digest).into(),
-            steps_cached: 0,
-            steps: 0,
-            steps_total: 1,
-            subtasks: [SubTaskStep {
-                subtask: "importing".into(),
-                description: "Importing Image".into(),
-                id: "importing".into(),
-                completed: false,
-            }]
-            .into(),
-        })
-        .await;
+            id: "importing".into(),
+            completed: false,
+        }]
+        .into(),
+    });
 }
 
 /// Gather all bound images in all deployments, then prune the image store,
@@ -551,6 +552,7 @@ pub(crate) async fn prepare_for_pull(
     imgref: &ImageReference,
     target_imgref: Option<&OstreeImageReference>,
     booted_deployment: Option<&ostree::Deployment>,
+    prog: &ProgressWriter,
 ) -> Result<PreparedPullResult> {
     let imgref_canonicalized = imgref.clone().canonicalize()?;
     tracing::debug!("Canonicalized image reference: {imgref_canonicalized:#}");
@@ -561,7 +563,7 @@ pub(crate) async fn prepare_for_pull(
     }
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
-            println!("No changes in {imgref:#} => {}", c.manifest_digest);
+            prog.info(format!("No changes in {imgref:#} => {}", c.manifest_digest));
             return Ok(PreparedPullResult::AlreadyPresent(Box::new((*c).into())));
         }
         PrepareResult::Ready(p) => p,
@@ -610,6 +612,7 @@ pub(crate) async fn prepare_for_pull_unified(
     target_imgref: Option<&OstreeImageReference>,
     store: &Storage,
     booted_deployment: Option<&ostree::Deployment>,
+    prog: &ProgressWriter,
 ) -> Result<PreparedPullResult> {
     // Get or initialize the bootc container storage (same as used for LBIs)
     let imgstore = store.get_ensure_imgstore()?;
@@ -658,7 +661,7 @@ pub(crate) async fn prepare_for_pull_unified(
     }
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
-            println!("No changes in {imgref:#} => {}", c.manifest_digest);
+            prog.info(format!("No changes in {imgref:#} => {}", c.manifest_digest));
             return Ok(PreparedPullResult::AlreadyPresent(Box::new((*c).into())));
         }
         PrepareResult::Ready(p) => p,
@@ -706,7 +709,16 @@ pub(crate) async fn pull_unified(
     booted_deployment: Option<&ostree::Deployment>,
 ) -> Result<Box<ImageState>> {
     let progress = PullProgress::new(quiet, prog);
-    match prepare_for_pull_unified(repo, imgref, target_imgref, store, booted_deployment).await? {
+    match prepare_for_pull_unified(
+        repo,
+        imgref,
+        target_imgref,
+        store,
+        booted_deployment,
+        progress.writer(),
+    )
+    .await?
+    {
         PreparedPullResult::AlreadyPresent(existing) => {
             // Log that the image was already present (Debug level since it's not actionable)
             const IMAGE_ALREADY_PRESENT_ID: &str = "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9";
@@ -765,24 +777,21 @@ pub(crate) async fn pull_from_prepared(
     let import = prepared_image.imp.import(prepared_image.prep).await;
     printer.await?;
     // Both the progress and the import are done, so import is done as well
-    progress
-        .json
-        .send(Event::ProgressSteps {
-            task: "importing".into(),
+    progress.json.send(Event::ProgressSteps {
+        task: "importing".into(),
+        description: "Importing Image".into(),
+        id: digest_imp.clone().as_ref().into(),
+        steps_cached: 0,
+        steps: 1,
+        steps_total: 1,
+        subtasks: [SubTaskStep {
+            subtask: "importing".into(),
             description: "Importing Image".into(),
-            id: digest_imp.clone().as_ref().into(),
-            steps_cached: 0,
-            steps: 1,
-            steps_total: 1,
-            subtasks: [SubTaskStep {
-                subtask: "importing".into(),
-                description: "Importing Image".into(),
-                id: "importing".into(),
-                completed: true,
-            }]
-            .into(),
-        })
-        .await;
+            id: "importing".into(),
+            completed: true,
+        }]
+        .into(),
+    });
     let import = import?;
     let imgref_canonicalized = imgref.clone().canonicalize()?;
     tracing::debug!("Canonicalized image reference: {imgref_canonicalized:#}");
@@ -851,17 +860,15 @@ where
                     "Container image pull failed; retrying in {} seconds ({attempt}/{PULL_MAX_RETRIES}): {error}",
                     retry_delay.as_secs()
                 );
-                progress
-                    .send(Event::ProgressSteps {
-                        task: "pulling".into(),
-                        description: description.into(),
-                        id: "pull-retry".into(),
-                        steps_cached: 0,
-                        steps: attempt.into(),
-                        steps_total: PULL_MAX_RETRIES.into(),
-                        subtasks: Vec::new(),
-                    })
-                    .await;
+                progress.send(Event::ProgressSteps {
+                    task: "pulling".into(),
+                    description: description.into(),
+                    id: "pull-retry".into(),
+                    steps_cached: 0,
+                    steps: attempt.into(),
+                    steps_total: PULL_MAX_RETRIES.into(),
+                    subtasks: Vec::new(),
+                });
                 retries += 1;
                 tokio::time::sleep(retry_delay).await;
             }
@@ -877,7 +884,15 @@ async fn pull_once(
     progress: PullProgress,
     booted_deployment: Option<&ostree::Deployment>,
 ) -> Result<Box<ImageState>> {
-    match prepare_for_pull(repo, imgref, target_imgref, booted_deployment).await? {
+    match prepare_for_pull(
+        repo,
+        imgref,
+        target_imgref,
+        booted_deployment,
+        progress.writer(),
+    )
+    .await?
+    {
         PreparedPullResult::AlreadyPresent(existing) => {
             // Log that the image was already present (Debug level since it's not actionable)
             const IMAGE_ALREADY_PRESENT_ID: &str = "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9";
@@ -945,7 +960,7 @@ pub(crate) async fn wipe_ostree(sysroot: Sysroot) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
+pub(crate) async fn cleanup(sysroot: &Storage, prog: &ProgressWriter) -> Result<()> {
     // Log the cleanup operation to systemd journal
     const CLEANUP_JOURNAL_ID: &str = "2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6";
 
@@ -959,6 +974,7 @@ pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
     // We create clones (just atomic reference bumps) here to move to the thread.
     let ostree = sysroot.get_ostree_cloned()?;
     let repo = ostree.repo();
+    let prog = prog.clone();
     let repo_prune =
         ostree_ext::tokio_util::spawn_blocking_cancellable_flatten(move |cancellable| {
             let locked_sysroot = &SysrootLock::from_assumed_locked(&ostree);
@@ -993,10 +1009,10 @@ pub(crate) async fn cleanup(sysroot: &Storage) -> Result<()> {
                 ostree_container::deploy::prune(locked_sysroot).context("Pruning images")?;
             if !pruned.is_empty() {
                 let size = glib::format_size(pruned.objsize);
-                println!(
+                prog.info(format!(
                     "Pruned images: {} (layers: {}, objsize: {})",
                     pruned.n_images, pruned.n_layers, size
-                );
+                ));
             } else {
                 tracing::debug!("Nothing to prune");
             }
@@ -1133,7 +1149,11 @@ impl MergeState {
 
 /// Pull the bound images referenced by an imported commit before staging it.
 #[context("Pulling bound images for ostree commit {commit}")]
-async fn pull_bound_images_for_commit(sysroot: &Storage, commit: &str) -> Result<()> {
+async fn pull_bound_images_for_commit(
+    sysroot: &Storage,
+    commit: &str,
+    prog: &ProgressWriter,
+) -> Result<()> {
     let repo = sysroot.get_ostree()?.repo();
     let repo_dir = Dir::reopen_dir(&repo.dfd_borrow())?;
     let repo_tmp = repo_dir
@@ -1160,7 +1180,7 @@ async fn pull_bound_images_for_commit(sysroot: &Storage, commit: &str) -> Result
     .context("Checking out imported commit")?;
     let root = td.open_dir(root_name)?;
     let bound_images = crate::boundimage::query_bound_images(&root)?;
-    crate::boundimage::pull_images(sysroot, bound_images).await
+    crate::boundimage::pull_images(sysroot, bound_images, prog).await
 }
 
 /// Stage (queue deployment of) a fetched container image.
@@ -1205,8 +1225,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1226,9 +1245,8 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
-    pull_bound_images_for_commit(sysroot, &image.ostree_commit).await?;
+    });
+    pull_bound_images_for_commit(sysroot, &image.ostree_commit, &prog).await?;
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1248,8 +1266,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
     let origin = origin_from_imageref(spec.image)?;
     crate::deploy::deploy(sysroot, from, image, &origin, lock_finalization).await?;
 
@@ -1271,20 +1288,22 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
-    crate::deploy::cleanup(sysroot).await?;
+    });
+    crate::deploy::cleanup(sysroot, &prog).await?;
 
     if !lock_finalization {
-        println!("Queued for next boot: {:#}", spec.image);
+        prog.info(format!("Queued for next boot: {:#}", spec.image));
     } else {
-        println!("Staged but not queued for next boot: {:#}", spec.image);
+        prog.info(format!(
+            "Staged but not queued for next boot: {:#}",
+            spec.image
+        ));
     }
 
     if let Some(version) = image.version.as_deref() {
-        println!("  Version: {version}");
+        prog.info(format!("  Version: {version}"));
     }
-    println!("  Digest: {}", image.manifest_digest);
+    prog.info(format!("  Digest: {}", image.manifest_digest));
 
     subtask.completed = true;
     subtasks.push(subtask.clone());
@@ -1300,8 +1319,7 @@ pub(crate) async fn stage(
             .into_iter()
             .chain([subtask.clone()])
             .collect(),
-    })
-    .await;
+    });
 
     // Unconditionally create or update /run/reboot-required to signal a reboot is needed.
     // This is monitored by kured (Kubernetes Reboot Daemon).
@@ -1324,7 +1342,7 @@ fn write_reboot_required(image: &str) -> Result<()> {
 pub(crate) const ROLLBACK_JOURNAL_ID: &str = "26f3b1eb24464d12aa5e7b544a6b5468";
 
 /// Implementation of rollback functionality
-pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
+pub(crate) async fn rollback(sysroot: &Storage, prog: &ProgressWriter) -> Result<()> {
     let ostree = sysroot.get_ostree()?;
     let (booted_ostree, deployments, host) = crate::status::get_status_require_booted(ostree)?;
 
@@ -1341,7 +1359,7 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
 
     let reverting = new_spec.boot_order == BootOrder::Default;
     if reverting {
-        println!("notice: Reverting queued rollback state");
+        prog.info("notice: Reverting queued rollback state");
     }
     let rollback_status = host
         .status
@@ -1386,9 +1404,9 @@ pub(crate) async fn rollback(sysroot: &Storage) -> Result<()> {
         .sysroot
         .write_deployments(&new_deployments, gio::Cancellable::NONE)?;
     if reverting {
-        println!("Next boot: current deployment");
+        prog.info("Next boot: current deployment");
     } else {
-        println!("Next boot: rollback deployment");
+        prog.info("Next boot: rollback deployment");
     }
 
     write_reboot_required(rollback_image.manifest_digest.as_ref())?;
@@ -1477,7 +1495,7 @@ pub(crate) fn switch_origin_inplace(root: &Dir, imgref: &ImageReference) -> Resu
 /// A workaround for <https://github.com/ostreedev/ostree/issues/3193>
 /// as generated by anaconda.
 #[context("Updating /etc/fstab for anaconda+composefs")]
-pub(crate) fn fixup_etc_fstab(root: &Dir) -> Result<()> {
+pub(crate) fn fixup_etc_fstab(root: &Dir, prog: &ProgressWriter) -> Result<()> {
     let fstab_path = "etc/fstab";
     // Read the old file
     let fd = root
@@ -1550,7 +1568,7 @@ pub(crate) fn fixup_etc_fstab(root: &Dir) -> Result<()> {
     })
     .context("Replacing /etc/fstab")?;
 
-    println!("Updated /etc/fstab to add `ro` for `/`");
+    prog.info("Updated /etc/fstab to add `ro` for `/`");
     Ok(())
 }
 
@@ -1624,8 +1642,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_retry_pull_operation_reports_progress() -> Result<()> {
         let attempts = std::cell::Cell::new(0);
+        // ProgressWriter does blocking writes and we only read the pipe
+        // afterwards on this same thread, so the output must fit in the
+        // pipe buffer.
         let (send, recv) = tokio::net::unix::pipe::pipe()?;
-        let progress = PullProgress::new(true, ProgressWriter::from(send));
+        let progress = PullProgress::new(true, ProgressWriter::try_from(send)?);
 
         retry_pull_operation(&progress, || {
             let attempt = attempts.get() + 1;
@@ -1643,7 +1664,9 @@ mod tests {
         let mut lines = BufReader::new(recv).lines();
         let start_line = lines.next_line().await?.unwrap();
         let start: Event = serde_json::from_str(&start_line)?;
-        assert!(matches!(start, Event::Start { version } if version == "0.1.0"));
+        assert!(
+            matches!(start, Event::Start { version } if version == crate::progress_jsonl::API_VERSION)
+        );
 
         let retry_line = lines.next_line().await?.unwrap();
         let retry: Event = serde_json::from_str(&retry_line)?;
@@ -1784,7 +1807,7 @@ mod tests {
         let default = "UUID=f7436547-20ac-43cb-aa2f-eac9632183f6 /boot auto ro 0 0\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1796,7 +1819,7 @@ mod tests {
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1809,7 +1832,7 @@ UUID=1eef9f42-40e3-4bd8-ae20-e9f2325f8b52 /                     xfs   ro 0 0\n\
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, default);
         Ok(())
     }
@@ -1827,7 +1850,7 @@ UUID=1eef9f42-40e3-4bd8-ae20-e9f2325f8b52 / xfs defaults,ro 0 0\n\
 UUID=6907-17CA          /boot/efi               vfat    umask=0077,shortname=winnt 0 2\n";
         tempdir.create_dir_all("etc")?;
         tempdir.atomic_write("etc/fstab", default)?;
-        fixup_etc_fstab(&tempdir).unwrap();
+        fixup_etc_fstab(&tempdir, &ProgressWriter::default()).unwrap();
         assert_eq!(tempdir.read_to_string("etc/fstab")?, modified);
         Ok(())
     }

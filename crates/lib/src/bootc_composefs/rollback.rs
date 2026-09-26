@@ -16,6 +16,7 @@ use crate::composefs_consts::{
     COMPOSEFS_STAGED_DEPLOYMENT_FNAME, COMPOSEFS_TRANSIENT_STATE_DIR, TYPE1_ENT_PATH_STAGED,
 };
 use crate::deploy::ROLLBACK_JOURNAL_ID;
+use crate::progress_jsonl::ProgressWriter;
 use crate::spec::{Bootloader, BootloaderKind, Host};
 use crate::store::{BootedComposefs, Storage};
 use crate::{
@@ -215,6 +216,7 @@ fn rollback_composefs_entries(host: &Host, boot_dir: &Dir, bootloader: Bootloade
 pub(crate) async fn composefs_rollback(
     storage: &Storage,
     booted_cfs: &BootedComposefs,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     const COMPOSEFS_ROLLBACK_JOURNAL_ID: &str = "6f5e4d3c2b1a0f9e8d7c6b5a4e3d2c1b0";
 
@@ -237,7 +239,7 @@ pub(crate) async fn composefs_rollback(
 
     let reverting = new_spec.boot_order == BootOrder::Default;
     if reverting {
-        println!("notice: Reverting queued rollback state");
+        prog.info("notice: Reverting queued rollback state");
     }
 
     let rollback_status = host
@@ -269,9 +271,9 @@ pub(crate) async fn composefs_rollback(
     }
 
     if reverting {
-        println!("Next boot: current deployment");
+        prog.info("Next boot: current deployment");
     } else {
-        println!("Next boot: rollback deployment");
+        prog.info("Next boot: rollback deployment");
     }
 
     Ok(())

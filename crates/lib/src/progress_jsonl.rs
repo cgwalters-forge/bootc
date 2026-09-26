@@ -6,19 +6,20 @@ use canon_json::CanonJsonSerialize;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncWriteExt, BufWriter};
+#[cfg(test)]
 use tokio::net::unix::pipe::Sender;
-use tokio::sync::Mutex;
 
 // Maximum number of times per second that an event will be written.
 const REFRESH_HZ: u16 = 5;
 
 /// Semantic version of the protocol.
-const API_VERSION: &str = "0.1.0";
+pub(crate) const API_VERSION: &str = "0.2.0";
 
 /// An incremental update to e.g. a container image layer download.
 /// The first time a given "subtask" name is seen, a new progress bar should be created.
@@ -68,6 +69,17 @@ pub struct SubTaskStep<'t> {
     pub id: Cow<'t, str>,
     /// Starts as false when beginning to execute and turns true when completed.
     pub completed: bool,
+}
+
+/// The severity of a `Message` event.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageLevel {
+    /// Regular status output, e.g. which image was queued for the next boot.
+    Info,
+    /// Something the user should pay attention to, which did not cause
+    /// the operation to fail.
+    Warning,
 }
 
 /// An event emitted as JSON.
@@ -135,6 +147,15 @@ pub enum Event<'t> {
         /// The currently running subtasks.
         subtasks: Vec<SubTaskStep<'t>>,
     },
+    /// A human readable status message, with the same text that is
+    /// printed to the terminal. The text is not a stable interface.
+    Message {
+        /// The severity of the message.
+        level: MessageLevel,
+        /// The message text, without a trailing newline.
+        #[serde(borrow)]
+        text: Cow<'t, str>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,33 +179,39 @@ struct ProgressWriterInner {
     /// true if we sent the initial Start message
     sent_start: bool,
     last_write: Option<std::time::Instant>,
-    fd: BufWriter<Sender>,
+    fd: BufWriter<File>,
 }
 
+/// Writes progress events as JSON lines to the file descriptor given
+/// with `--progress-fd`, if any.
+///
+/// Writes are blocking so that this can be used from both sync and
+/// async code. Events are small and the lossy ones are rate limited, so
+/// this only blocks if the reader stops draining the pipe.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProgressWriter {
     inner: Arc<Mutex<Option<ProgressWriterInner>>>,
 }
 
-impl TryFrom<OwnedFd> for ProgressWriter {
-    type Error = anyhow::Error;
-
-    fn try_from(value: OwnedFd) -> Result<Self> {
-        let value = Sender::from_owned_fd(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl From<Sender> for ProgressWriter {
-    fn from(value: Sender) -> Self {
+impl From<OwnedFd> for ProgressWriter {
+    fn from(value: OwnedFd) -> Self {
         let inner = ProgressWriterInner {
             sent_start: false,
             last_write: None,
-            fd: BufWriter::new(value),
+            fd: BufWriter::new(File::from(value)),
         };
         Self {
             inner: Arc::new(Some(inner).into()),
         }
+    }
+}
+
+#[cfg(test)]
+impl TryFrom<Sender> for ProgressWriter {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Sender) -> Result<Self> {
+        Ok(value.into_blocking_fd()?.into())
     }
 }
 
@@ -193,26 +220,34 @@ impl TryFrom<RawProgressFd> for ProgressWriter {
 
     #[allow(unsafe_code)]
     fn try_from(fd: RawProgressFd) -> Result<Self> {
-        unsafe { OwnedFd::from_raw_fd(fd.0) }.try_into()
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.0) };
+        // We do blocking writes, so make sure the caller didn't hand us a
+        // non-blocking fd, which would fail with EAGAIN when the pipe is full.
+        let flags = rustix::fs::fcntl_getfl(&fd)?;
+        if flags.contains(rustix::fs::OFlags::NONBLOCK) {
+            rustix::fs::fcntl_setfl(&fd, flags - rustix::fs::OFlags::NONBLOCK)?;
+        }
+        Ok(fd.into())
     }
 }
 
 impl ProgressWriter {
     /// Serialize the target value as a single line of JSON and write it.
-    async fn send_impl_inner<T: Serialize>(inner: &mut ProgressWriterInner, v: T) -> Result<()> {
+    fn send_impl_inner<T: Serialize>(inner: &mut ProgressWriterInner, v: T) -> Result<()> {
         // canon_json is guaranteed not to output newlines here
         let buf = v.to_canon_json_vec()?;
-        inner.fd.write_all(&buf).await?;
+        inner.fd.write_all(&buf)?;
         // We always end in a newline
-        inner.fd.write_all(b"\n").await?;
+        inner.fd.write_all(b"\n")?;
         // And flush to ensure the remote side sees updates immediately
-        inner.fd.flush().await?;
+        inner.fd.flush()?;
         Ok(())
     }
 
     /// Serialize the target object to JSON as a single line
-    pub(crate) async fn send_impl<T: Serialize>(&self, v: T, required: bool) -> Result<()> {
-        let mut guard = self.inner.lock().await;
+    fn send_impl<T: Serialize>(&self, v: T, required: bool) -> Result<()> {
+        // SAFETY: Propagating panics from the mutex here is intentional
+        let mut guard = self.inner.lock().unwrap();
         // Check if we have an inner value; if not, nothing to do.
         let Some(inner) = guard.as_mut() else {
             return Ok(());
@@ -224,7 +259,7 @@ impl ProgressWriter {
             let start = Event::Start {
                 version: API_VERSION.into(),
             };
-            Self::send_impl_inner(inner, &start).await?;
+            Self::send_impl_inner(inner, &start)?;
         }
 
         // For messages that can be dropped, if we already sent an update within this cycle, discard this one.
@@ -239,41 +274,60 @@ impl ProgressWriter {
             }
         }
 
-        Self::send_impl_inner(inner, &v).await?;
+        Self::send_impl_inner(inner, &v)?;
         // Update the last write time
         inner.last_write = Some(now);
         Ok(())
     }
 
     /// Send an event.
-    pub(crate) async fn send(&self, event: Event<'_>) {
-        if let Err(e) = self.send_impl(event, true).await {
-            eprintln!("Failed to write to jsonl: {e}");
-            // Stop writing to fd but let process continue
-            // SAFETY: Propagating panics from the mutex here is intentional
-            let _ = self.inner.lock().await.take();
-        }
+    pub(crate) fn send(&self, event: Event<'_>) {
+        self.send_or_disable(event, true)
     }
 
     /// Send an event that can be dropped.
-    pub(crate) async fn send_lossy(&self, event: Event<'_>) {
-        if let Err(e) = self.send_impl(event, false).await {
+    pub(crate) fn send_lossy(&self, event: Event<'_>) {
+        self.send_or_disable(event, false)
+    }
+
+    /// Print a status message for the user, and if a progress fd is
+    /// attached, also send it there as an [`Event::Message`].
+    ///
+    /// Like `println!()` and `eprintln!()`, info messages go to stdout
+    /// and warnings to stderr; unlike them, a failure to write (e.g. a
+    /// closed pipe) is ignored rather than causing a panic.
+    pub(crate) fn message(&self, level: MessageLevel, text: impl AsRef<str>) {
+        let text = text.as_ref();
+        let _ = match level {
+            MessageLevel::Info => writeln!(std::io::stdout().lock(), "{text}"),
+            MessageLevel::Warning => writeln!(std::io::stderr().lock(), "{text}"),
+        };
+        self.send(Event::Message {
+            level,
+            text: text.into(),
+        });
+    }
+
+    /// Shorthand for [`Self::message`] with [`MessageLevel::Info`].
+    pub(crate) fn info(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Info, text)
+    }
+
+    /// Shorthand for [`Self::message`] with [`MessageLevel::Warning`].
+    pub(crate) fn warning(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Warning, text)
+    }
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "the progress fd itself is failing, so report it on stderr"
+    )]
+    fn send_or_disable(&self, event: Event<'_>, required: bool) {
+        if let Err(e) = self.send_impl(event, required) {
             eprintln!("Failed to write to jsonl: {e}");
             // Stop writing to fd but let process continue
             // SAFETY: Propagating panics from the mutex here is intentional
-            let _ = self.inner.lock().await.take();
-        }
-    }
-
-    /// Flush remaining data and return the underlying file.
-    #[allow(dead_code)]
-    pub(crate) async fn into_inner(self) -> Result<Option<Sender>> {
-        // SAFETY: Propagating panics from the mutex here is intentional
-        let mut mutex = self.inner.lock().await;
-        if let Some(inner) = mutex.take() {
-            Ok(Some(inner.fd.into_inner()))
-        } else {
-            Ok(None)
+            let _ = self.inner.lock().unwrap().take();
         }
     }
 }
@@ -308,13 +362,24 @@ mod test {
                 steps_total: 3,
                 subtasks: Vec::new(),
             },
+            Event::Message {
+                level: MessageLevel::Warning,
+                text: "some warning".into(),
+            },
         ];
+        // ProgressWriter does blocking writes, and the sender and reader
+        // below run on the same thread, so the whole output must fit in
+        // the pipe buffer or this test would deadlock.
         let (send, recv) = tokio::net::unix::pipe::pipe()?;
         let testvalues_sender = testvalues.iter().cloned();
         let sender = async move {
             let w = ProgressWriter::try_from(send)?;
             for value in testvalues_sender {
-                w.send(value).await;
+                match value {
+                    // Exercise the helper, which should send the same event
+                    Event::Message { level, text } => w.message(level, text),
+                    value => w.send(value),
+                }
             }
             anyhow::Ok(())
         };
