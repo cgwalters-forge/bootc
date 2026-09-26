@@ -82,6 +82,18 @@ pub const ESP: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 /// BIOS boot partition type GUID for GPT
 pub const BIOS_BOOT: &str = "21686148-6449-6e6f-744e-656564454649";
 
+/// Extended Boot Loader Partition (XBOOTLDR) type GUID for GPT; see the
+/// [Boot Loader Specification](https://uapi-group.org/specifications/specs/boot_loader_specification/).
+pub const XBOOTLDR: &str = "bc13c2ff-59e6-4262-a352-b275fd6f7172";
+
+/// MBR partition type ID of the XBOOTLDR partition.
+pub const XBOOTLDR_ID_MBR: u8 = 0xEA;
+
+/// Parse an MBR partition type as reported by lsblk, e.g. "0xef".
+fn parse_mbr_parttype(pt: &str) -> Option<u8> {
+    u8::from_str_radix(pt.strip_prefix("0x").unwrap_or(pt), 16).ok()
+}
+
 #[derive(Debug, Deserialize)]
 struct DevicesOutput {
     blockdevices: Vec<Device>,
@@ -217,6 +229,40 @@ impl Device {
             .ok_or_else(|| anyhow!("No ESP partition found among backing devices"))
     }
 
+    /// Like [`Self::find_first_colocated_esp`], but also return the XBOOTLDR
+    /// partition next to that ESP, if there is one.
+    ///
+    /// Per the Boot Loader Specification, the XBOOTLDR partition must be on
+    /// the same disk as the ESP (systemd-boot only looks for it there), so an
+    /// XBOOTLDR partition on another disk is ignored.
+    pub fn find_first_colocated_esp_and_xbootldr(&self) -> Result<(Device, Option<Device>)> {
+        for root in self.find_all_roots()? {
+            if let Some(esp) = root.find_partition_of_esp_optional()? {
+                let xbootldr = root.find_xbootldr_next_to(esp).cloned();
+                return Ok((esp.clone(), xbootldr));
+            }
+        }
+        Err(anyhow!("No ESP partition found among backing devices"))
+    }
+
+    /// Find the XBOOTLDR partition (GPT or MBR) in the same partition table as `esp`,
+    /// recursing like [`Self::find_partition_of_esp_optional`] does (e.g.
+    /// into a firmware RAID array).
+    pub fn find_xbootldr_next_to(&self, esp: &Device) -> Option<&Device> {
+        let children = self.children.as_ref()?;
+        if children.iter().any(|child| child.name == esp.name) {
+            return match self.pttype.as_deref() {
+                Some("dos") => children.iter().find(|child| {
+                    child.parttype.as_deref().and_then(parse_mbr_parttype) == Some(XBOOTLDR_ID_MBR)
+                }),
+                _ => self.find_partition_of_type(XBOOTLDR),
+            };
+        }
+        children
+            .iter()
+            .find_map(|child| child.find_xbootldr_next_to(esp))
+    }
+
     /// Find all BIOS boot partitions across all root devices backing this device.
     /// Calls find_all_roots() to discover physical disks, then searches each for a BIOS boot partition.
     /// Returns None if no BIOS boot partitions are found.
@@ -260,11 +306,8 @@ impl Device {
             Some("dos") => children.iter().find(|child| {
                 child
                     .parttype
-                    .as_ref()
-                    .and_then(|pt| {
-                        let pt = pt.strip_prefix("0x").unwrap_or(pt);
-                        u8::from_str_radix(pt, 16).ok()
-                    })
+                    .as_deref()
+                    .and_then(parse_mbr_parttype)
                     .is_some_and(|pt| ESP_ID_MBR.contains(&pt))
             }),
             // When pttype is None (e.g. older lsblk or partition devices), default
@@ -358,13 +401,18 @@ impl Device {
         // When udev is unavailable, lsblk can't populate parttype/pttype from
         // the udev database. Fall back to blkid -p which probes the disk
         // directly. See https://github.com/osbuild/osbuild/pull/2428
-        if !have_udev() && (self.parttype.is_none() || self.pttype.is_none()) {
+        if !have_udev()
+            && (self.parttype.is_none() || self.pttype.is_none() || self.fstype.is_none())
+        {
             let props = blkid_probe(&self.path())?;
             if self.parttype.is_none() {
                 self.parttype = props.get("PART_ENTRY_TYPE").cloned();
             }
             if self.pttype.is_none() {
                 self.pttype = props.get("PTTYPE").cloned();
+            }
+            if self.fstype.is_none() {
+                self.fstype = props.get("TYPE").cloned();
             }
         }
         // Recurse to child devices
@@ -863,8 +911,20 @@ mod test {
         assert_eq!(esp.partn, Some(1));
     }
 
+    /// Linux root (x86-64) partition type GUID, per the Discoverable Partitions Specification.
+    const ROOT_X86_64: &str = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709";
+
     /// Helper to construct a minimal MBR disk Device with given child partition types.
     fn make_mbr_disk(parttypes: &[&str]) -> Device {
+        make_disk("dos", parttypes)
+    }
+
+    /// Helper to construct a minimal GPT disk Device with given child partition types.
+    fn make_gpt_disk(parttypes: &[&str]) -> Device {
+        make_disk("gpt", parttypes)
+    }
+
+    fn make_disk(pttype: &str, parttypes: &[&str]) -> Device {
         Device {
             name: "vda".into(),
             serial: None,
@@ -880,7 +940,7 @@ mod test {
             fstype: None,
             uuid: None,
             path: Some("/dev/vda".into()),
-            pttype: Some("dos".into()),
+            pttype: Some(pttype.into()),
             ro: None,
             children: Some(
                 parttypes
@@ -901,7 +961,7 @@ mod test {
                         fstype: None,
                         uuid: None,
                         path: None,
-                        pttype: Some("dos".into()),
+                        pttype: Some(pttype.into()),
                         ro: None,
                         children: None,
                     })
@@ -971,6 +1031,51 @@ mod test {
             .find(|c| c.name == "md0")
             .unwrap();
         assert_eq!(md0.fstype.as_deref().unwrap(), "ext4");
+    }
+
+    #[test]
+    fn test_find_xbootldr_next_to() {
+        let cases: &[(&[&str], Option<u32>)] = &[
+            // ESP and XBOOTLDR, in either order
+            (&[BIOS_BOOT, ESP, XBOOTLDR, ROOT_X86_64], Some(3)),
+            (&[XBOOTLDR, ESP, ROOT_X86_64], Some(1)),
+            // The XBOOTLDR type is matched case-insensitively, like the ESP's
+            (&[ESP, "BC13C2FF-59E6-4262-A352-B275FD6F7172"], Some(2)),
+            // No XBOOTLDR
+            (&[BIOS_BOOT, ESP, ROOT_X86_64], None),
+        ];
+        for (parttypes, expected) in cases {
+            let dev = make_gpt_disk(parttypes);
+            let esp = dev.find_partition_of_esp().unwrap();
+            let xbootldr = dev.find_xbootldr_next_to(esp).map(|d| d.partn.unwrap());
+            assert_eq!(xbootldr, *expected, "{parttypes:?}");
+        }
+
+        // MBR: XBOOTLDR is type 0xea
+        let dev = make_mbr_disk(&["0xef", "0xea", "0x83"]);
+        let esp = dev.find_partition_of_esp().unwrap();
+        assert_eq!(dev.find_xbootldr_next_to(esp).unwrap().partn, Some(2));
+        let dev = make_mbr_disk(&["0xef", "0x83"]);
+        let esp = dev.find_partition_of_esp().unwrap();
+        assert!(dev.find_xbootldr_next_to(esp).is_none());
+
+        // An XBOOTLDR partition on another disk isn't next to the ESP
+        let other = make_gpt_disk(&[ESP]);
+        let dev = make_gpt_disk(&[XBOOTLDR]);
+        let esp = other.find_partition_of_esp().unwrap();
+        let esp = Device {
+            name: "vdb1".into(),
+            ..esp.clone()
+        };
+        assert!(dev.find_xbootldr_next_to(&esp).is_none());
+
+        // Firmware RAID: the ESP is inside the md array, so is its XBOOTLDR
+        let fixture = include_str!("../tests/fixtures/lsblk-vroc.json");
+        let devs: DevicesOutput = serde_json::from_str(fixture).unwrap();
+        for nvme in &devs.blockdevices {
+            let esp = nvme.find_partition_of_esp().unwrap();
+            assert!(nvme.find_xbootldr_next_to(esp).is_none());
+        }
     }
 
     #[test]
