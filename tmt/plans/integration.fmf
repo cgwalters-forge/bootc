@@ -331,4 +331,13 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-57-composefs-separate-boot:
+  summary: Test composefs with GRUB and a separate /boot partition
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-57-composefs-separate-boot
+  extra-skip_if_ostree: true
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
