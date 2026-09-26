@@ -1,6 +1,6 @@
 # number: 49
 # tmt:
-#   summary: Test bootc 1.16 old-stager migration for sealed and unsealed UKIs
+#   summary: Test upgrading composefs systems installed by bootc 1.16 to current bootc
 #   duration: 45m
 #   enabled: false
 #   adjust:
@@ -13,35 +13,76 @@
 # This deliberately starts disabled.  The bridge fixtures are large and are
 # supplied from the host's read-only containers-storage mount only on request.
 #
-# The initial fixture is pinned to bootc 1.16.0, which only understands the
-# bare composefs= argument and so stages the V2 fallback of a dual-digest UKI.
-# bootc 1.16.4 and later parse composefs.digest= first and stage V1 directly;
-# that path is not exercised here.
+# The system is installed by a pinned bootc 1.16 release (the "stager"),
+# which then stages the current image.  Which EROFS format that stages
+# depends on the release: 1.16.0-1.16.2 generate V2 images and only read the
+# bare composefs= argument, so they stage the V2 fallback of a dual-digest
+# UKI.  1.16.3 already reads composefs.digest= first but still generates V2,
+# so it rejects the dual-digest UKI ("The UKI has the wrong composefs=
+# parameter") and is not tested here.  1.16.4 generates V1 (composefs-rs
+# 080f925) and stages V1 directly, but only on a repository it created
+# itself: the format comes from the repository's meta.json and is never
+# converted, which is why the fixture is installed by the stager.
+# (1.16.4-1.16.14 staging a UKI on a 1.16.0-1.16.3 install fail instead, see
+# bootc-dev/bootc#2334.)  BLS installs are covered too: there the stager
+# writes the entry for the current image itself, with only a bare composefs=
+# argument.  Current bootc then upgrades (to V1) and rolls back.
 use std assert
 use tap.nu
 
-def bridge-image [] {
-    let image = ($env.BOOTC_bridge_image? | default "")
-    if $image == "" {
-        error make { msg: "BOOTC_bridge_image is required; run with --bridge-image and --bind-storage-ro" }
+const COMPOSEFS_MAGIC = 0xd078629a
+
+def required-env [name: string, hint: string] {
+    let value = ($env | get -i $name | default "")
+    if $value == "" {
+        error make { msg: $"($name) is required; ($hint)" }
     }
-    $image
+    $value
+}
+
+def bridge-image [] {
+    required-env BOOTC_bridge_image "run with --bridge-image and --bind-storage-ro"
 }
 
 def upgrade-image [] {
-    let image = ($env.BOOTC_upgrade_image? | default "")
-    if $image == "" {
-        error make { msg: "BOOTC_upgrade_image is required for old-stager mode" }
-    }
-    $image
+    required-env BOOTC_upgrade_image "run with --upgrade-image"
 }
 
-def integrity-mode [] {
-    let mode = ($env.BOOTC_composefs_bridge_integrity_mode? | default "")
-    if not ($mode in ["sealed" "unsealed"]) {
-        error make { msg: "BOOTC_composefs_bridge_integrity_mode must be sealed or unsealed" }
+# sealed and unsealed are UKI installs (Secure Boot with fs-verity required,
+# and missing fs-verity allowed), bls a Type 1 install.
+def bridge-mode [] {
+    let mode = (required-env BOOTC_bridge_mode "set it to sealed, unsealed or bls")
+    if not ($mode in ["sealed" "unsealed" "bls"]) {
+        error make { msg: $"BOOTC_bridge_mode must be sealed, unsealed or bls, not ($mode)" }
     }
     $mode
+}
+
+def is-uki [] { (bridge-mode) != "bls" }
+
+def stager-version [] {
+    let version = (required-env BOOTC_bridge_stager_version "set it to the pinned bootc 1.16 version")
+    if ($version !~ '^1\.16\.[0-9]+$') {
+        error make { msg: $"BOOTC_bridge_stager_version must be a 1.16.x release, not ($version)" }
+    }
+    $version
+}
+
+# The EROFS format the stager stages the bridge image as.
+def stager-format [] {
+    let format = (required-env BOOTC_bridge_stager_format "set it to v1 or v2")
+    if not ($format in ["v1" "v2"]) {
+        error make { msg: $"BOOTC_bridge_stager_format must be v1 or v2, not ($format)" }
+    }
+    $format
+}
+
+def required-old-bootc-sha256 [] {
+    let checksum = (required-env BOOTC_bridge_stager_bootc_sha256 "set it to the pinned stager's /usr/bin/bootc checksum")
+    if ($checksum | str length) != 64 {
+        error make { msg: "BOOTC_bridge_stager_bootc_sha256 must be a 64-character SHA-256 checksum" }
+    }
+    $checksum | str downcase
 }
 
 def assert-fixture-label [image: string, expected: string] {
@@ -51,17 +92,9 @@ def assert-fixture-label [image: string, expected: string] {
 
 def cmdline [] { open /proc/cmdline | str trim | split row " " }
 
-def required-old-bootc-sha256 [] {
-    let checksum = ($env.BOOTC_1160_bootc_sha256? | default "")
-    if ($checksum | str length) != 64 {
-        error make { msg: "BOOTC_1160_bootc_sha256 must be the required 64-character fixture checksum" }
-    }
-    $checksum | str downcase
-}
-
 def assert-old-fixture [] {
     let version = (bootc --version | str trim)
-    assert equal $version "bootc 1.16.0"
+    assert equal $version $"bootc (stager-version)"
     let rpm_version = (rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' bootc | str trim)
     let binary_sha256 = (sha256sum /usr/bin/bootc | split row " " | first | str downcase)
     assert equal $binary_sha256 (required-old-bootc-sha256)
@@ -71,11 +104,60 @@ def assert-old-fixture [] {
     print $"bootc 1.16 fixture proof: version=($version) rpm=($rpm_version) sha256=($binary_sha256)"
 }
 
+def assert-current-bootc [] {
+    assert ((bootc --version | str trim) != $"bootc (stager-version)") "booted userspace must be current bootc"
+}
+
 def assert-booted-image [expected: string] {
     let st = bootc status --json | from json
     let booted = $st.status.booted.image
     assert equal $booted.image.transport "containers-storage"
     assert equal $booted.image.image $expected
+}
+
+# The EROFS format of a repository image, from the composefs_version field
+# of its composefs header (four little-endian u32s: magic, version, flags,
+# composefs_version): 1 for V1, 2 for V2.
+def image-format [digest: string] {
+    let path = $"/sysroot/composefs/images/($digest)"
+    let header = (^od --endian=little -An -t u4 -N 16 $path
+        | split row --regex '\s+'
+        | where { |w| $w != "" }
+        | each { |w| $w | into int })
+    assert equal ($header | length) 4 $"($path) is too short for a composefs header"
+    assert equal ($header | first) $COMPOSEFS_MAGIC $"($path) has no composefs header"
+    match ($header | get 3) {
+        1 => "v1",
+        2 => "v2",
+        $v => { error make { msg: $"($path) has unexpected composefs_version ($v)" } },
+    }
+}
+
+# The digest in a composefs= or composefs.digest= value, without the
+# optional '?' marker and format prefix.
+def karg-digest [value: string] {
+    $value | str replace --regex '^\?' '' | split row ":" | last
+}
+
+def params-with-prefix [prefix: string] {
+    cmdline | where { |p| $p | into string | str starts-with $prefix } | each { |p| $p | str replace $prefix "" }
+}
+
+# Check the dual-format UKI arguments and return the digest of the given format.
+def uki-digest [format: string] {
+    let v2_params = (params-with-prefix "composefs=")
+    assert (($v2_params | length) == 1) "UKI must contain one V2 fallback argument"
+    let v2_value = ($v2_params | first)
+    let v2_is_unsealed = ($v2_value | str starts-with "?")
+    assert equal $v2_is_unsealed ((bridge-mode) == "unsealed") "UKI integrity marker must match the fixture mode"
+    let v2 = (karg-digest $v2_value)
+    let v1_params = (params-with-prefix "composefs.digest=")
+    assert (($v1_params | length) == 1) "current automatic UKI must retain one V1 argument"
+    # Both arguments carry the same fs-verity policy marker; only the digest
+    # is compared here.
+    let v1 = (karg-digest ($v1_params | first))
+    assert ($v1 != $v2) "dual-format UKI must contain distinct V1 and V2 identities"
+    if $format == "v1" { $v1 } else { $v2 }
 }
 
 # Verify the identity actually selected by the running initramfs, as well as
@@ -85,8 +167,9 @@ def assert-selected-format [format: string] {
         error make { msg: $"Unsupported expected composefs format: ($format)" }
     }
     let st = bootc status --json | from json
-    assert ((($st.status.booted.composefs.bootType | into string | str downcase) == "uki"))
-    assert equal $st.status.booted.composefs.missingVerityAllowed ((integrity-mode) == "unsealed") "booted composefs policy must match the requested integrity mode"
+    let expected_boot_type = if (is-uki) { "uki" } else { "bls" }
+    assert equal ($st.status.booted.composefs.bootType | into string | str downcase) $expected_boot_type
+    assert equal $st.status.booted.composefs.missingVerityAllowed ((bridge-mode) == "unsealed") "booted composefs policy must match the fixture mode"
     let selected = $st.status.booted.composefs.verity
     assert equal ($selected | str length) 128
 
@@ -95,26 +178,19 @@ def assert-selected-format [format: string] {
     assert ($root_source | str starts-with "composefs:") "normal bridge boots must mount / directly from composefs"
     assert equal $root_source $"composefs:($selected)"
 
-    let params = cmdline
-    let v2_params = ($params | where { |p| $p | into string | str starts-with "composefs=" })
-    assert (($v2_params | length) == 1) "UKI must contain one V2 fallback argument"
-    let v2_value = ($v2_params | first | str replace "composefs=" "" | into string)
-    let v2_is_unsealed = ($v2_value | str starts-with "?")
-    assert equal $v2_is_unsealed ((integrity-mode) == "unsealed") "UKI integrity marker must match the fixture mode"
-    let v2 = ($v2_value | str replace --regex "^\\?" "")
-    let v1_params = ($params | where { |p| $p | into string | str starts-with "composefs.digest=" })
-    assert (($v1_params | length) == 1) "current automatic UKI must retain one V1 argument"
-    let v1_value = ($v1_params | first | str replace "composefs.digest=" "" | into string)
-    # Both arguments carry the same fs-verity policy marker; only the digest
-    # is compared here.
-    let v1 = ($v1_value | split row ":" | last)
-    assert ($v1 != $v2) "dual-format UKI must contain distinct V1 and V2 identities"
-
-    let expected = if $format == "v1" { $v1 } else { $v2 }
-    assert equal $expected $selected "selected UKI identity must match bootc status"
+    if (is-uki) {
+        assert equal (uki-digest $format) $selected "selected UKI identity must match bootc status"
+    } else {
+        # BLS entries are written by whichever bootc staged them, so only
+        # check that the booted digest is the one on the command line.
+        let digests = (params-with-prefix "composefs=") ++ (params-with-prefix "composefs.digest=")
+            | each { |v| karg-digest $v }
+        assert ($selected in $digests) $"booted digest must be on the kernel command line: ($digests)"
+    }
     assert ($"/sysroot/composefs/images/($selected)" | path exists) "selected composefs image must exist"
+    assert equal (image-format $selected) $format "selected composefs image has the wrong EROFS format"
     assert ($"/sysroot/state/deploy/($selected)" | path exists) "selected deployment state must exist"
-    { selected: $selected, v1: $v1, v2: $v2 }
+    $selected
 }
 
 def write-sentinels [] {
@@ -138,33 +214,36 @@ def stage [image: string, save_as: string] {
     $staged.composefs.verity | save --force $save_as
 }
 
+const BRIDGE_IDENTITY = "/var/composefs-bridge-identity"
+const UPGRADE_IDENTITY = "/var/composefs-bridge-upgrade-identity"
+
 def old_stager_boot0 [] {
-    tap begin $"bootc 1.16 stager to current dual-UKI bridge ((integrity-mode))"
+    tap begin $"bootc (stager-version) stager to current bridge \((bridge-mode)\)"
     assert-old-fixture
     let initial = (bootc status --json | from json).status.booted.image.image.image
-    assert-fixture-label $initial "bootc-1.16.0-stager"
-    assert-fixture-label (bridge-image) $"current-dual-uki-((integrity-mode))"
+    assert-fixture-label $initial $"bootc-(stager-version)-stager"
+    assert-fixture-label (bridge-image) $"current-(bridge-mode)"
     write-sentinels
-    stage (bridge-image) /var/composefs-bridge-v2-identity
+    stage (bridge-image) $BRIDGE_IDENTITY
     tmt-reboot
 }
 
 def old_stager_boot1 [] {
     assert-booted-image (bridge-image)
-    assert (not ((bootc --version) | str starts-with "bootc 1.16.0")) "bridge userspace must be current"
-    let identity = assert-selected-format v2
-    assert equal $identity.selected (open /var/composefs-bridge-v2-identity | str trim)
+    assert-current-bootc
+    let selected = assert-selected-format (stager-format)
+    assert equal $selected (open $BRIDGE_IDENTITY | str trim)
     assert-sentinels
-    assert-fixture-label (upgrade-image) $"current-dual-uki-upgrade-((integrity-mode))"
-    stage (upgrade-image) /var/composefs-bridge-v1-identity
+    assert-fixture-label (upgrade-image) $"current-(bridge-mode)-upgrade"
+    stage (upgrade-image) $UPGRADE_IDENTITY
     tmt-reboot
 }
 
 def old_stager_boot2 [] {
     assert-booted-image (upgrade-image)
-    assert (not ((bootc --version) | str starts-with "bootc 1.16.0")) "upgraded userspace must be current"
-    let identity = assert-selected-format v1
-    assert equal $identity.selected (open /var/composefs-bridge-v1-identity | str trim)
+    assert-current-bootc
+    let selected = assert-selected-format v1
+    assert equal $selected (open $UPGRADE_IDENTITY | str trim)
     assert-sentinels
     bootc rollback
     assert equal ((bootc status --json | from json).status.rollbackQueued) true
@@ -173,8 +252,8 @@ def old_stager_boot2 [] {
 
 def old_stager_boot3 [] {
     assert-booted-image (bridge-image)
-    let identity = assert-selected-format v2
-    assert equal $identity.selected (open /var/composefs-bridge-v2-identity | str trim)
+    let selected = assert-selected-format (stager-format)
+    assert equal $selected (open $BRIDGE_IDENTITY | str trim)
     assert-sentinels
     assert equal ((bootc status --json | from json).status.rollbackQueued) false
     bootc internals composefs-gc --assert-no-op
