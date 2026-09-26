@@ -206,3 +206,11 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-55-composefs-xbootldr:
+  summary: Test composefs with systemd-boot entries on an XBOOTLDR partition
+  duration: 90m
+  require:
+  - dosfstools
+  - e2fsprogs
+  test: nu booted/test-composefs-xbootldr.nu

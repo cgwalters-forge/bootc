@@ -98,7 +98,7 @@ use rustix::{mount::MountFlags, path::Arg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
+use crate::bootc_composefs::state::{find_bls_for_digest, get_booted_bls, write_composefs_state};
 use crate::bootc_composefs::status::build_composefs_karg;
 use crate::bootc_kargs::compute_new_kargs;
 use crate::composefs_consts::{TYPE1_BOOT_DIR_PREFIX, TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED};
@@ -391,7 +391,8 @@ fn mount_esp(device: &str) -> Result<TempMount> {
     TempMount::mount_dev(device, "vfat", ESP_MOUNT_FLAGS, Some(ESP_MOUNT_DATA))
 }
 
-/// Get a read-only view of the ESP for the provided device, gracefully
+/// Get a read-only view of the ESP (or another FAT boot partition, such as
+/// XBOOTLDR) for the provided device, gracefully
 /// handling the case where the ESP is already mounted in the root mount
 /// namespace (e.g. via `systemd.mount-extra=UUID=<ESP>:/boot:auto:ro`).
 /// If the ESP is already mounted, that mount is cloned privately into a
@@ -404,7 +405,8 @@ pub fn mount_esp_readonly(device: &str) -> Result<TempMount> {
     mount_esp(device)
 }
 
-/// Get a read-write view of the ESP for the provided device, gracefully
+/// Get a read-write view of the ESP (or another FAT boot partition, such as
+/// XBOOTLDR) for the provided device, gracefully
 /// handling the case where the ESP is already mounted (possibly read-only)
 /// in the current mount namespace.
 ///
@@ -451,6 +453,135 @@ pub(crate) fn mount_esp_at(
         ESP_MOUNT_FLAGS,
         Some(ESP_MOUNT_DATA),
     )
+}
+
+/// The filesystem type an XBOOTLDR partition must have for bootc to use it.
+///
+/// systemd-boot reads XBOOTLDR through the firmware's file system drivers,
+/// which in practice only support FAT.
+const XBOOTLDR_FSTYPE: &str = "vfat";
+
+/// The partitions a systemd-boot system boots from.
+///
+/// Per the Boot Loader Specification, `$BOOT` is the XBOOTLDR partition when
+/// there is one, and the ESP otherwise. `$BOOT` holds the Type #1 entries,
+/// the kernels and initrds and the UKIs, while the ESP always holds the boot
+/// loader itself and `loader/loader.conf`. With GRUB, UKIs stay on the ESP
+/// and Type #1 entries on `/boot`, so `xbootldr` is always `None`.
+#[derive(Debug, Clone)]
+pub(crate) struct BootPartitions {
+    /// The ESP's device path
+    pub(crate) esp: String,
+    /// The XBOOTLDR partition's device path, if bootc uses one
+    pub(crate) xbootldr: Option<String>,
+}
+
+impl BootPartitions {
+    /// Find the ESP on the disk(s) backing `dev`, and the XBOOTLDR partition
+    /// next to it if `bootloader` reads one and bootc can use it, for an
+    /// install.
+    #[context("Finding boot partitions")]
+    pub(crate) fn find(dev: &bootc_blockdev::Device, bootloader: &Bootloader) -> Result<Self> {
+        let (esp, xbootldr) = dev.find_first_colocated_esp_and_xbootldr()?;
+        Self::new(&esp, xbootldr, bootloader, tracing::Level::WARN)
+    }
+
+    /// `unusable_log_level` is how loudly to say that an XBOOTLDR partition
+    /// can't be used.
+    fn new(
+        esp: &bootc_blockdev::Device,
+        xbootldr: Option<bootc_blockdev::Device>,
+        bootloader: &Bootloader,
+        unusable_log_level: tracing::Level,
+    ) -> Result<Self> {
+        let xbootldr = match bootloader.kind()? {
+            BootloaderKind::BLSCompatible => {
+                xbootldr.filter(|d| xbootldr_is_usable(d, unusable_log_level))
+            }
+            BootloaderKind::GRUBClassic => None,
+        };
+        Ok(Self {
+            esp: esp.path(),
+            xbootldr: xbootldr.map(|d| d.path()),
+        })
+    }
+
+    /// Like [`Self::find`], for the booted system: an XBOOTLDR partition is
+    /// only used if it has the entry for the booted deployment (identified
+    /// by its composefs digest). Systems installed before bootc supported
+    /// XBOOTLDR keep their entries on the ESP, even if an unused XBOOTLDR
+    /// partition exists, and so does another install sharing the disk.
+    #[context("Finding boot partitions of the booted system")]
+    pub(crate) fn find_booted(
+        dev: &bootc_blockdev::Device,
+        bootloader: &Bootloader,
+        booted_digest: &str,
+    ) -> Result<Self> {
+        let (esp, xbootldr) = dev.find_first_colocated_esp_and_xbootldr()?;
+        // This runs for every command, so don't warn about the same
+        // unusable XBOOTLDR partition every time; the install did.
+        let mut parts = Self::new(&esp, xbootldr, bootloader, tracing::Level::DEBUG)?;
+        let Some(xbootldr) = parts.xbootldr.as_deref() else {
+            return Ok(parts);
+        };
+        match has_entry_for(xbootldr, booted_digest) {
+            Ok(true) => {
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && has_entry_for(&parts.esp, booted_digest).unwrap_or(false)
+                {
+                    tracing::debug!(
+                        "Both the ESP {} and XBOOTLDR {xbootldr} have an entry for the booted deployment; using XBOOTLDR",
+                        parts.esp
+                    );
+                }
+            }
+            Ok(false) => {
+                tracing::debug!("No entry for the booted deployment on {xbootldr}, using the ESP");
+                parts.xbootldr = None;
+            }
+            // Don't let an unrelated, broken XBOOTLDR partition break a
+            // system whose entries are on the ESP.
+            Err(e) => {
+                tracing::warn!("Not using XBOOTLDR partition {xbootldr}: {e:#}");
+                parts.xbootldr = None;
+            }
+        }
+        Ok(parts)
+    }
+
+    /// The device of `$BOOT`: where Type #1 entries and UKIs go.
+    pub(crate) fn boot(&self) -> &str {
+        self.xbootldr.as_deref().unwrap_or(&self.esp)
+    }
+}
+
+/// Whether the FAT boot partition `device` has the Type #1 entry for the
+/// deployment with the composefs digest `digest`.
+#[context("Looking for boot entries on {device}")]
+fn has_entry_for(device: &str, digest: &str) -> Result<bool> {
+    let mnt = mount_esp_readonly(device)?;
+    if !mnt.fd.try_exists(TYPE1_ENT_PATH)? {
+        return Ok(false);
+    }
+    Ok(find_bls_for_digest(&mnt.fd, digest)?.is_some())
+}
+
+fn xbootldr_is_usable(dev: &bootc_blockdev::Device, unusable_log_level: tracing::Level) -> bool {
+    let fstype = dev.fstype.as_deref();
+    if fstype == Some(XBOOTLDR_FSTYPE) {
+        return true;
+    }
+    let msg = format!(
+        "Not using XBOOTLDR partition {}: its filesystem is {}, but systemd-boot can only read {XBOOTLDR_FSTYPE}; using the ESP instead",
+        dev.path(),
+        fstype.unwrap_or("unknown"),
+    );
+    if unusable_log_level == tracing::Level::WARN {
+        tracing::warn!("{msg}");
+    } else {
+        tracing::debug!("{msg}");
+    }
+    false
 }
 
 /// Filename release field for primary (new/upgraded) entry.
@@ -744,7 +875,7 @@ pub(crate) fn setup_composefs_bls_boot(
 ) -> Result<String> {
     let id_hex = id.to_hex();
 
-    let (root_path, esp_device, mut cmdline_refs, bootloader) = match setup_type {
+    let (root_path, boot_parts, mut cmdline_refs, bootloader) = match setup_type {
         BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
             // root_setup.kargs has [root=UUID=<UUID>, "rw"]
             let mut cmdline_options = Cmdline::new();
@@ -777,12 +908,13 @@ pub(crate) fn setup_composefs_bls_boot(
                 }
             }
 
-            // Locate ESP partition device by walking up to the root disk(s)
-            let esp_part = root_setup.device_info.find_first_colocated_esp()?;
+            // Locate the ESP (and XBOOTLDR) by walking up to the root disk(s)
+            let boot_parts =
+                BootPartitions::find(&root_setup.device_info, &postfetch.detected_bootloader)?;
 
             (
                 root_setup.physical_root_path.clone(),
-                esp_part.path(),
+                boot_parts,
                 cmdline_options,
                 postfetch.detected_bootloader.clone(),
             )
@@ -814,13 +946,11 @@ pub(crate) fn setup_composefs_bls_boot(
                 ),
             )?;
 
-            // Locate ESP partition device by walking up to the root disk(s)
-            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?;
-            let esp_dev = root_dev.find_first_colocated_esp()?;
+            let boot_parts = storage.require_boot_partitions()?.clone();
 
             (
                 Utf8PathBuf::from("/sysroot"),
-                esp_dev.path(),
+                boot_parts,
                 cmdline,
                 bootloader,
             )
@@ -863,18 +993,19 @@ pub(crate) fn setup_composefs_bls_boot(
         }
 
         BootloaderKind::BLSCompatible => {
-            let efi_mount = mount_esp_writable(&esp_device).context("Mounting ESP")?;
+            let boot_mount =
+                mount_esp_writable(boot_parts.boot()).context("Mounting boot partition")?;
 
-            let mounted_efi = Utf8PathBuf::from(efi_mount.dir.path().as_str()?);
-            let efi_linux_dir = mounted_efi.join(EFI_LINUX);
+            let mounted_boot = Utf8PathBuf::from(boot_mount.dir.path().as_str()?);
+            let efi_linux_dir = mounted_boot.join(EFI_LINUX);
 
             (
                 BLSEntryPath {
                     entries_path: efi_linux_dir,
-                    config_path: mounted_efi.clone(),
+                    config_path: mounted_boot.clone(),
                     abs_entries_path: Utf8PathBuf::from("/").join(EFI_LINUX),
                 },
-                Some(efi_mount),
+                Some(boot_mount),
             )
         }
     };
@@ -1675,7 +1806,7 @@ fn write_grub_uki_menuentry(
 
 #[context("Writing systemd UKI config")]
 fn write_systemd_uki_config(
-    esp_dir: &Dir,
+    boot_dir: &Dir,
     setup_type: &BootSetupType,
     boot_label: String,
     version: Option<String>,
@@ -1700,22 +1831,22 @@ fn write_systemd_uki_config(
 
     let (entries_dir, booted_bls) = match setup_type {
         BootSetupType::Setup(..) => {
-            esp_dir
+            boot_dir
                 .create_dir_all(TYPE1_ENT_PATH)
                 .with_context(|| format!("Creating {TYPE1_ENT_PATH}"))?;
 
-            (esp_dir.open_dir(TYPE1_ENT_PATH)?, None)
+            (boot_dir.open_dir(TYPE1_ENT_PATH)?, None)
         }
 
         BootSetupType::Upgrade((_, booted_cfs, ..)) => {
-            esp_dir
+            boot_dir
                 .create_dir_all(TYPE1_ENT_PATH_STAGED)
                 .with_context(|| format!("Creating {TYPE1_ENT_PATH_STAGED}"))?;
 
-            let mut booted_bls = get_booted_bls(&esp_dir, booted_cfs)?;
+            let mut booted_bls = get_booted_bls(&boot_dir, booted_cfs)?;
             booted_bls.sort_key = Some(secondary_sort_key(os_id));
 
-            (esp_dir.open_dir(TYPE1_ENT_PATH_STAGED)?, Some(booted_bls))
+            (boot_dir.open_dir(TYPE1_ENT_PATH_STAGED)?, Some(booted_bls))
         }
     };
 
@@ -1733,18 +1864,23 @@ fn write_systemd_uki_config(
         )?;
     }
 
-    // Write the timeout for bootloader menu if not exists
-    if !esp_dir.exists(SYSTEMD_LOADER_CONF_PATH) {
-        esp_dir
-            .atomic_write(SYSTEMD_LOADER_CONF_PATH, SYSTEMD_TIMEOUT)
-            .with_context(|| format!("Writing to {SYSTEMD_LOADER_CONF_PATH}"))?;
-    }
-
-    let esp_dir = esp_dir
+    let boot_dir = boot_dir
         .reopen_as_ownedfd()
         .context("Reopening as owned fd")?;
-    rustix::fs::fsync(esp_dir).context("fsync")?;
+    rustix::fs::fsync(boot_dir).context("fsync")?;
 
+    Ok(())
+}
+
+/// Write the timeout for the systemd-boot menu, unless `loader.conf` exists.
+#[context("Writing {SYSTEMD_LOADER_CONF_PATH}")]
+fn write_systemd_loader_conf(esp_dir: &Dir) -> Result<()> {
+    if esp_dir.exists(SYSTEMD_LOADER_CONF_PATH) {
+        return Ok(());
+    }
+    esp_dir.create_dir_all("loader")?;
+    esp_dir.atomic_write(SYSTEMD_LOADER_CONF_PATH, SYSTEMD_TIMEOUT)?;
+    rustix::fs::fsync(esp_dir.reopen_as_ownedfd()?).context("fsync")?;
     Ok(())
 }
 
@@ -1756,17 +1892,18 @@ pub(crate) fn setup_composefs_uki_boot(
     boot_ids: &ExpectedBootImageIds,
     entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
 ) -> Result<(String, Sha512HashValue)> {
-    let (root_path, esp_device, bootloader, missing_fsverity_allowed, uki_addons) = match setup_type
+    let (root_path, boot_parts, bootloader, missing_fsverity_allowed, uki_addons) = match setup_type
     {
         BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
             state.require_no_kargs_for_uki()?;
 
-            // Locate ESP partition device by walking up to the root disk(s)
-            let esp_part = root_setup.device_info.find_first_colocated_esp()?;
+            // Locate the ESP (and XBOOTLDR) by walking up to the root disk(s)
+            let boot_parts =
+                BootPartitions::find(&root_setup.device_info, &postfetch.detected_bootloader)?;
 
             (
                 root_setup.physical_root_path.clone(),
-                esp_part.path(),
+                boot_parts,
                 postfetch.detected_bootloader.clone(),
                 allow_missing_fsverity,
                 state.composefs_options.uki_addon.as_ref(),
@@ -1777,13 +1914,11 @@ pub(crate) fn setup_composefs_uki_boot(
             let sysroot = Utf8PathBuf::from("/sysroot"); // Still needed for root_path
             let bootloader = host.require_composefs_booted()?.bootloader.clone();
 
-            // Locate ESP partition device by walking up to the root disk(s)
-            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?;
-            let esp_dev = root_dev.find_first_colocated_esp()?;
+            let boot_parts = storage.require_boot_partitions()?.clone();
 
             (
                 sysroot,
-                esp_dev.path(),
+                boot_parts,
                 bootloader,
                 booted_cfs.cmdline.allow_missing_fsverity,
                 // TODO: We never (re)install UKI addons on upgrade, only on initial
@@ -1795,7 +1930,7 @@ pub(crate) fn setup_composefs_uki_boot(
         }
     };
 
-    let esp_mount = mount_esp_writable(&esp_device).context("Mounting ESP")?;
+    let boot_mount = mount_esp_writable(boot_parts.boot()).context("Mounting boot partition")?;
 
     let mut uki_info: Option<UKIInfo> = None;
 
@@ -1843,7 +1978,7 @@ pub(crate) fn setup_composefs_uki_boot(
                     &id,
                     boot_ids,
                     missing_fsverity_allowed,
-                    esp_mount.dir.path(),
+                    boot_mount.dir.path(),
                 )?;
 
                 if let Some(label) = ret {
@@ -1865,19 +2000,38 @@ pub(crate) fn setup_composefs_uki_boot(
     } = uki_info;
 
     match bootloader.kind()? {
-        BootloaderKind::GRUBClassic => {
-            write_grub_uki_menuentry(root_path, &setup_type, boot_label, &deploy_id, &esp_device)?
-        }
-
-        BootloaderKind::BLSCompatible => write_systemd_uki_config(
-            &esp_mount.fd,
+        BootloaderKind::GRUBClassic => write_grub_uki_menuentry(
+            root_path,
             &setup_type,
             boot_label,
-            version,
-            os_id,
             &deploy_id,
-            &bootloader,
+            &boot_parts.esp,
         )?,
+
+        BootloaderKind::BLSCompatible => {
+            write_systemd_uki_config(
+                &boot_mount.fd,
+                &setup_type,
+                boot_label,
+                version,
+                os_id,
+                &deploy_id,
+                &bootloader,
+            )?;
+            // systemd-boot only reads loader.conf from the ESP. It's only
+            // written at install time, so that upgrades never touch the ESP
+            // when XBOOTLDR is used.
+            if matches!(setup_type, BootSetupType::Setup(..)) {
+                match boot_parts.xbootldr {
+                    Some(_) => {
+                        let esp_mount =
+                            mount_esp_writable(&boot_parts.esp).context("Mounting ESP")?;
+                        write_systemd_loader_conf(&esp_mount.fd)?;
+                    }
+                    None => write_systemd_loader_conf(&boot_mount.fd)?,
+                }
+            }
+        }
     };
 
     Ok((boot_digest, deploy_id))
@@ -1945,10 +2099,10 @@ impl MountedImageRoot {
         let composefs = TempMount::mount_fd(composefs_mnt_fd)
             .context("Attaching composefs image to temporary directory")?;
 
-        // TODO: support XBOOTLDR.  Per BLS, the ESP should be mounted at /efi
-        // when a separate XBOOTLDR partition is present at /boot.  bootc does
-        // not yet detect or use XBOOTLDR in the composefs install path, so
-        // unconditionally mount the ESP at /boot for now.
+        // Mount the ESP at /boot even if there's an XBOOTLDR partition: this
+        // root is only used to install the boot loader itself, which always
+        // goes on the ESP.  bootc writes the entries to XBOOTLDR itself (see
+        // `BootPartitions`).
         let esp_subdir = "boot";
 
         // Mount a tmpfs over /tmp so that tools invoked with --root have a
@@ -2274,6 +2428,47 @@ pub(crate) fn expected_boot_image_ids(
 mod tests {
     use super::*;
     use composefs::erofs::format::FormatVersion;
+
+    #[test]
+    fn test_boot_partitions() -> Result<()> {
+        let dev = |name: &str, fstype: Option<&str>| -> bootc_blockdev::Device {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "path": format!("/dev/{name}"),
+                "size": 0,
+                "fstype": fstype,
+            }))
+            .unwrap()
+        };
+        let esp = dev("vda2", Some("vfat"));
+        let cases = [
+            // systemd-boot uses a FAT XBOOTLDR partition...
+            (Bootloader::Systemd, Some("vfat"), Some("/dev/vda3")),
+            // ...but can't read any other filesystem
+            (Bootloader::Systemd, Some("ext4"), None),
+            (Bootloader::Systemd, None, None),
+            // GRUB keeps its entries on /boot
+            (Bootloader::Grub, Some("vfat"), None),
+        ];
+        for (bootloader, fstype, expected) in cases {
+            let parts = BootPartitions::new(
+                &esp,
+                Some(dev("vda3", fstype)),
+                &bootloader,
+                tracing::Level::DEBUG,
+            )?;
+            assert_eq!(parts.esp, "/dev/vda2");
+            assert_eq!(
+                parts.xbootldr.as_deref(),
+                expected,
+                "{bootloader} {fstype:?}"
+            );
+            assert_eq!(parts.boot(), expected.unwrap_or("/dev/vda2"));
+        }
+        let parts = BootPartitions::new(&esp, None, &Bootloader::Systemd, tracing::Level::DEBUG)?;
+        assert_eq!(parts.boot(), "/dev/vda2");
+        Ok(())
+    }
 
     #[test]
     fn test_replace_composefs_karg() {
