@@ -259,6 +259,89 @@ test-upgrade *ARGS: build _build-upgrade-source-image
         "${composefs_args[@]}" \
         {{upgrade_source_img}} {{ARGS}} readonly
 
+# The pinned bootc 1.16 builds for the composefs 1.16 bridge test, and the
+# checksums of their /usr/bin/bootc that the test verifies after booting.
+# 1.16.0 generates V2 EROFS images and reads only the bare composefs=
+# argument. 1.16.3 is the first release to read composefs.digest=, but it
+# still generates V2 and so fails to switch to a dual-format UKI; 1.16.4 is
+# the first to generate V1 (composefs-rs 080f925). Koji only has an fc45
+# build of 1.16.0; it installs fine on Fedora 44. If Koji prunes a build,
+# mirror that exact RPM somewhere stable and point the URL there (the
+# checksums stay the same), or re-pin to another build of the same version
+# and update both checksums.
+bridge_1160_rpm_url := "https://kojipkgs.fedoraproject.org/packages/bootc/1.16.0/1.fc45/x86_64/bootc-1.16.0-1.fc45.x86_64.rpm"
+bridge_1160_rpm_sha256 := "86436dfbf68b3c95557361384a9d9ce7d5333edc0262b9fbf269fc3e942626b4"
+bridge_1160_bootc_sha256 := "db0e84f902f1c5220bdc31c3237fad705b4317b23ad7bcfc04393231c2ab2830"
+bridge_1164_rpm_url := "https://kojipkgs.fedoraproject.org/packages/bootc/1.16.4/1.fc44/x86_64/bootc-1.16.4-1.fc44.x86_64.rpm"
+bridge_1164_rpm_sha256 := "bdb66e290e45cf5d6b9fec283840e650fb9f6859091a7a461667e5a98f14edba"
+bridge_1164_bootc_sha256 := "38136fbd07a93c6b70267bf0083bd5aebe7099c5a024f053aa2ebf0ac561f391"
+
+# Run the bootc 1.16 -> current composefs bridge test (test-49): install
+# with a pinned bootc 1.16 release (stager: 1.16.0 or 1.16.4), switch to the
+# current image with it, then upgrade and roll back with current bootc.
+# mode is sealed (UKI, ext4, Secure Boot), unsealed (UKI, xfs, missing
+# fs-verity allowed) or bls (grub, ext4). Fedora bases only.
+[group('testing')]
+test-composefs-bridge mode stager="1.16.0":
+    #!/bin/bash
+    set -xeuo pipefail
+    # The pinned RPMs are Fedora x86_64 builds.
+    os_id=$(podman run --rm {{base}} bash -c '. /usr/lib/os-release && echo $ID')
+    if [ "${os_id}" != fedora ] || [ "$(uname -m)" != x86_64 ]; then
+        echo "test-composefs-bridge requires a Fedora base on x86_64 (have ${os_id} on $(uname -m))" >&2
+        exit 1
+    fi
+    case "{{stager}}" in
+        1.16.0)
+            rpm_url={{bridge_1160_rpm_url}} rpm_sha256={{bridge_1160_rpm_sha256}}
+            bootc_sha256={{bridge_1160_bootc_sha256}} stager_format=v2 ;;
+        1.16.4)
+            rpm_url={{bridge_1164_rpm_url}} rpm_sha256={{bridge_1164_rpm_sha256}}
+            bootc_sha256={{bridge_1164_bootc_sha256}} stager_format=v1 ;;
+        *) echo "stager must be 1.16.0 or 1.16.4" >&2; exit 1 ;;
+    esac
+    case "{{mode}}" in
+        sealed) bootloader=systemd boot_type=uki seal_state=sealed fs=ext4 ;;
+        unsealed) bootloader=systemd boot_type=uki seal_state=unsealed fs=xfs ;;
+        bls) bootloader=grub boot_type=bls seal_state=unsealed fs=ext4 ;;
+        *) echo "mode must be sealed, unsealed or bls" >&2; exit 1 ;;
+    esac
+    cfs=(variant=composefs bootloader=$bootloader boot_type=$boot_type seal_state=$seal_state filesystem=$fs)
+    just "${cfs[@]}" build
+    just "${cfs[@]}" _build-upgrade-image
+    stager={{base_img}}-{{stager}}-stager
+    podman build \
+        --target=stager-${boot_type} \
+        --build-arg=base={{base_img}} \
+        --build-arg=seal_state=${seal_state} \
+        --build-arg=bootc_version={{stager}} \
+        --build-arg=bootc_rpm_url=${rpm_url} \
+        --build-arg=bootc_rpm_sha256=${rpm_sha256} \
+        --secret=id=secureboot_key,src=target/test-secureboot/db.key \
+        --secret=id=secureboot_cert,src=target/test-secureboot/db.crt \
+        --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse \
+        -t "$stager" -f tmt/tests/Dockerfile.composefs-1-16-stager .
+    # The test checks these labels so it can't be run against the wrong images.
+    ctx=$(mktemp -d)
+    trap 'rm -rf "${ctx}"' EXIT
+    label() {
+        echo "FROM $1" | podman build --label=bootc.test.fixture="$3" -t "$2" -f - "${ctx}"
+    }
+    label {{base_img}} {{base_img}}-bridge current-{{mode}}
+    label {{upgrade_img}} {{upgrade_img}}-bridge current-{{mode}}-upgrade
+    cargo xtask run-tmt \
+        --env=BOOTC_variant=composefs \
+        --env=BOOTC_bridge_mode={{mode}} \
+        --env=BOOTC_bridge_stager_version={{stager}} \
+        --env=BOOTC_bridge_stager_format=${stager_format} \
+        --env=BOOTC_bridge_stager_bootc_sha256=${bootc_sha256} \
+        --context=composefs_bridge=true \
+        --composefs-backend --bootloader=${bootloader} --boot-type=${boot_type} \
+        --seal-state=${seal_state} --filesystem=${fs} \
+        --bridge-image={{base_img}}-bridge \
+        --upgrade-image={{upgrade_img}}-bridge \
+        "$stager" composefs-1-16-bridge
+
 # Run all validation checks: tmt plan staleness (local), then fmt/clippy/man/schema (container)
 [group('core')]
 validate:
