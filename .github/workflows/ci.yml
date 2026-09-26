@@ -500,16 +500,23 @@ jobs:
           name: "tmt-log-${{ matrix.test_os }}-${{ matrix.variant }}-upgrade-${{ env.ARCH }}"
           path: /var/tmp/tmt
 
-  # Upgrade a composefs UKI system installed by bootc 1.16.0 through the
-  # dual-format UKI bridge (test-49-composefs-1-16-bridge). Fedora 44 only,
-  # as the pinned 1.16.0 build comes from Fedora's Koji.
+  # Upgrade composefs systems installed by bootc 1.16 releases to the current
+  # bootc (test-49-composefs-1-16-bridge): 1.16.0 stages the V2 fallback of
+  # the dual-format UKI, 1.16.4 stages V1 directly on a repository it
+  # installed (not on older ones, bootc-dev/bootc#2334), and on BLS the
+  # old client writes the entry for the new image. Fedora 44 only, as the
+  # pinned builds come from Fedora's Koji.
   test-composefs-bridge:
     if: needs.compute-ci-level.outputs.run_heavy == 'true' && contains(fromJson(needs.compute-ci-level.outputs.package_os_matrix), 'fedora-44')
     needs: [compute-ci-level, package]
     strategy:
       fail-fast: false
       matrix:
-        seal_state: [sealed, unsealed]
+        include:
+          - {stager: "1.16.0", mode: sealed, bootloader: systemd, boot_type: uki, seal_state: sealed}
+          - {stager: "1.16.0", mode: unsealed, bootloader: systemd, boot_type: uki, seal_state: unsealed}
+          - {stager: "1.16.4", mode: sealed, bootloader: systemd, boot_type: uki, seal_state: sealed}
+          - {stager: "1.16.4", mode: bls, bootloader: grub, boot_type: bls, seal_state: unsealed}
 
     runs-on: ubuntu-26.04
 
@@ -530,8 +537,8 @@ jobs:
           printf 'BOOTC_buildroot_base=%s\n' "$BUILDROOT_BASE" >> "$GITHUB_ENV"
           # Match the build in test-composefs-bridge so build-fetch warms its cache
           echo "BOOTC_variant=composefs" >> "$GITHUB_ENV"
-          echo "BOOTC_bootloader=systemd" >> "$GITHUB_ENV"
-          echo "BOOTC_boot_type=uki" >> "$GITHUB_ENV"
+          echo "BOOTC_bootloader=${{ matrix.bootloader }}" >> "$GITHUB_ENV"
+          echo "BOOTC_boot_type=${{ matrix.boot_type }}" >> "$GITHUB_ENV"
           echo "BOOTC_seal_state=${{ matrix.seal_state }}" >> "$GITHUB_ENV"
           echo "BOOTC_SKIP_PACKAGE=1" >> "$GITHUB_ENV"
           echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
@@ -546,7 +553,7 @@ jobs:
         run: just build-fetch
 
       - name: Run bridge test
-        run: just test-composefs-bridge ${{ matrix.seal_state }}
+        run: just test-composefs-bridge ${{ matrix.mode }} ${{ matrix.stager }}
 
       - name: Disk usage summary
         if: always()
@@ -560,7 +567,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: "tmt-log-fedora-44-composefs-bridge-${{ matrix.seal_state }}-${{ env.ARCH }}"
+          name: "tmt-log-fedora-44-composefs-bridge-${{ matrix.stager }}-${{ matrix.mode }}-${{ env.ARCH }}"
           path: /var/tmp/tmt
 
   # Test readonly behaviour with baseconfigs (transient mounts) baked into the image.
