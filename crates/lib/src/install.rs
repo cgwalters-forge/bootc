@@ -395,6 +395,15 @@ pub(crate) struct InstallConfigOpts {
     #[clap(long)]
     #[serde(default)]
     pub(crate) bootloader: Option<Bootloader>,
+
+    /// Skip checking the source container image with the fatal lints from
+    /// `bootc container lint` before installing.
+    ///
+    /// These checks are only performed when installing from the running
+    /// container image, i.e. without `--source-imgref`.
+    #[clap(long)]
+    #[serde(default)]
+    pub(crate) skip_lints: bool,
 }
 
 #[derive(Debug, Default, Clone, clap::Parser, Serialize, Deserialize, PartialEq, Eq)]
@@ -1763,6 +1772,16 @@ async fn prepare_install(
     // Now, deal with SELinux state.
     let selinux_state = reexecute_self_for_selinux_if_needed(&source, config_opts.disable_selinux)?;
     tracing::debug!("SELinux state: {selinux_state:?}");
+
+    // Catch known-broken images before we write to the target. This is done
+    // after the SELinux re-exec above so that it only runs once. The
+    // recursive lints skip all mount points, so mounts from the host
+    // (/target, container storage etc.) are not traversed.
+    match target_rootfs.as_ref() {
+        Some(_) if config_opts.skip_lints => tracing::debug!("Skipping lints"),
+        Some(root) => crate::lints::lint_for_install(root, composefs_options.composefs_backend)?,
+        None => tracing::debug!("Not linting external source image"),
+    }
 
     println!("Installing image: {:#}", &target_imgref);
     if let Some(digest) = source.digest.as_deref() {
