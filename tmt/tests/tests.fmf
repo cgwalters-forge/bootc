@@ -238,6 +238,14 @@ check:
   duration: 30m
   test: nu booted/test-install-repart.nu
 
+/test-55-composefs-xbootldr:
+  summary: Test composefs with systemd-boot entries on an XBOOTLDR partition
+  duration: 90m
+  require:
+  - dosfstools
+  - e2fsprogs
+  test: nu booted/test-composefs-xbootldr.nu
+
 /test-57-composefs-separate-boot:
   summary: Test composefs with GRUB and a separate /boot partition
   duration: 60m

@@ -118,7 +118,7 @@ use composefs_ctl::composefs;
 
 use crate::bootc_composefs::backwards_compat::bcompat_boot::prepend_custom_prefix;
 use crate::bootc_composefs::boot::{
-    BootType, EFI_LINUX, mount_esp, mount_esp_readonly, mount_esp_writable,
+    BootPartitions, BootType, EFI_LINUX, mount_esp, mount_esp_readonly, mount_esp_writable,
 };
 use crate::bootc_composefs::status::{ComposefsCmdline, composefs_booted, get_bootloader};
 use crate::bootc_composefs::{aboot, state::read_boot_type};
@@ -604,35 +604,56 @@ impl BootedStorage {
                 }
                 let composefs = Arc::new(composefs);
 
-                let (boot_dir, grub_boot_path, esp) = if is_aboot {
-                    (None, None, None)
+                let (boot_dir, grub_boot_path, esp, xbootldr, boot_partitions) = if is_aboot {
+                    (None, None, None, None, None)
                 } else {
-                    // Locate ESP by walking up to the root disk(s), and reading
-                    // [`LOADER_DEVICE_PART_UUID`] and matching the UUID with the
-                    // respective ESP device UUID
-                    //
-                    // Both mount variants transparently reuse an already-mounted
-                    // ESP when present (e.g. auto-mounted at /boot ro via
-                    // `systemd.mount-extra` in the deployment cmdline).
+                    // Locate the ESP and XBOOTLDR on the root disk(s), reusing
+                    // already-mounted partitions when present.
+                    let root_dev = bootc_blockdev::list_dev_by_dir(&physical_root)?;
                     let esp_path = find_booted_from_esp(&physical_root)?;
-
-                    let esp_mount = match esp_access {
-                        EspAccess::ReadOnly => mount_esp_readonly(&esp_path)?,
-                        EspAccess::ReadWrite => mount_esp_writable(&esp_path)?,
+                    let esp_dev = bootc_blockdev::list_dev(Utf8Path::new(&esp_path))?;
+                    let bootloader = get_bootloader()?;
+                    let boot_parts = BootPartitions::find_booted(
+                        &root_dev,
+                        &esp_dev,
+                        &bootloader,
+                        &cmdline.digest,
+                    )?;
+                    let mount = |dev: &str| match esp_access {
+                        EspAccess::ReadOnly => mount_esp_readonly(dev),
+                        EspAccess::ReadWrite => mount_esp_writable(dev),
+                    };
+                    // Nothing after install touches the ESP with XBOOTLDR.
+                    // Leave it alone: an /efi automount can expire at shutdown.
+                    let (esp_mount, xbootldr_mount) = match boot_parts.xbootldr.as_deref() {
+                        Some(xbootldr) => (None, Some(mount(xbootldr)?)),
+                        None => (Some(mount(&boot_parts.esp)?), None),
                     };
 
-                    let (boot_dir, grub_boot_path) = match get_bootloader()?.kind()? {
+                    let (boot_dir, grub_boot_path) = match bootloader.kind()? {
                         // We can have a separate /boot and not /sysroot/boot
                         BootloaderKind::GRUBClassic => {
                             let (dir, path) = get_boot_dir_for_grub(&physical_root)?;
                             (dir, Some(path))
                         }
-                        // NOTE: Handle XBOOTLDR partitions here if and when we use it
-                        BootloaderKind::BLSCompatible => {
-                            (esp_mount.fd.try_clone().context("Cloning fd")?, None)
-                        }
+                        BootloaderKind::BLSCompatible => (
+                            xbootldr_mount
+                                .as_ref()
+                                .or(esp_mount.as_ref())
+                                .ok_or_else(|| anyhow::anyhow!("BUG: no boot partition mounted"))?
+                                .fd
+                                .try_clone()
+                                .context("Cloning fd")?,
+                            None,
+                        ),
                     };
-                    (Some(boot_dir), grub_boot_path, Some(esp_mount))
+                    (
+                        Some(boot_dir),
+                        grub_boot_path,
+                        esp_mount,
+                        xbootldr_mount,
+                        Some(boot_parts),
+                    )
                 };
 
                 let storage = Storage {
@@ -643,6 +664,8 @@ impl BootedStorage {
                     boot_dir,
                     grub_boot_path,
                     esp,
+                    xbootldr,
+                    boot_partitions,
                     ostree: Default::default(),
                     composefs: OnceCell::from(composefs.clone()),
                     imgstore: Default::default(),
@@ -691,6 +714,8 @@ impl BootedStorage {
                     boot_dir: None,
                     grub_boot_path: None,
                     esp: None,
+                    xbootldr: None,
+                    boot_partitions: None,
                     ostree: OnceCell::from(sysroot),
                     composefs: Default::default(),
                     imgstore: Default::default(),
@@ -745,14 +770,23 @@ pub(crate) struct Storage {
     /// The 'boot' directory, useful and `Some` only for composefs systems
     /// For grub booted systems, this points to `/sysroot/boot`, or to `/boot`
     /// if that's a separate boot partition
-    /// For systemd booted systems, this points to the ESP
+    /// For systemd booted systems, this points to XBOOTLDR if bootc uses it,
+    /// and to the ESP otherwise
     pub boot_dir: Option<Dir>,
 
     /// The absolute path of `boot_dir` on composefs systems booted with grub
     grub_boot_path: Option<Utf8PathBuf>,
 
-    /// The ESP mounted at a tmp location
+    /// The ESP mounted at a tmp location; `None` on composefs systems using
+    /// XBOOTLDR
     pub esp: Option<TempMount>,
+
+    /// The XBOOTLDR partition mounted at a tmp location, if bootc keeps
+    /// the systemd-boot entries and UKIs there
+    pub(crate) xbootldr: Option<TempMount>,
+
+    /// The composefs system's ESP and XBOOTLDR devices, as found at startup
+    pub(crate) boot_partitions: Option<BootPartitions>,
 
     /// Our runtime state
     run: Dir,
@@ -786,6 +820,8 @@ impl Storage {
             grub_boot_path: None,
             esp: None,
             run: run.try_clone()?,
+            xbootldr: None,
+            boot_partitions: None,
             ostree: Default::default(),
             composefs: Default::default(),
             imgstore: Default::default(),
@@ -833,6 +869,8 @@ impl Storage {
             boot_dir: None,
             grub_boot_path: None,
             esp: None,
+            xbootldr: None,
+            boot_partitions: None,
             ostree: ostree_cell,
             composefs: Default::default(),
             imgstore: Default::default(),
@@ -872,13 +910,31 @@ impl Storage {
             .ok_or_else(|| anyhow::anyhow!("ESP not found"))
     }
 
+    /// Returns the ESP and XBOOTLDR devices of a composefs system
+    pub(crate) fn require_boot_partitions(&self) -> Result<&BootPartitions> {
+        self.boot_partitions
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Boot partitions not found"))
+    }
+
+    /// Returns the partition holding the UKIs: the XBOOTLDR partition if bootc
+    /// uses one, and the ESP otherwise
+    pub(crate) fn require_uki_partition(&self) -> Result<&Dir> {
+        let mount = match &self.xbootldr {
+            Some(xbootldr) => xbootldr,
+            None => self.require_esp()?,
+        };
+        Ok(&mount.fd)
+    }
+
     /// Returns the Directory where the Type1 boot binaries are stored
-    /// The grub boot directory (see `require_boot_dir`) for Grub, and ESP/EFI/Linux for systemd-boot
+    /// The grub boot directory (see `require_boot_dir`) for Grub, and EFI/Linux
+    /// on the ESP or XBOOTLDR for systemd-boot
     pub(crate) fn bls_boot_binaries_dir(&self) -> Result<Dir> {
         let boot_dir = self.require_boot_dir()?;
 
-        // boot dir in case of systemd-boot points to the ESP, but we store
-        // the actual binaries inside ESP/EFI/Linux
+        // boot dir in case of systemd-boot points to the ESP or XBOOTLDR, but we store
+        // the actual binaries inside EFI/Linux on that partition
         let boot_dir = match get_bootloader()?.kind()? {
             BootloaderKind::GRUBClassic => boot_dir.try_clone()?,
             BootloaderKind::BLSCompatible => {

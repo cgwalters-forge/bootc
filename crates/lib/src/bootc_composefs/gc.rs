@@ -86,10 +86,10 @@ fn image_refs_match(
 fn collect_boot_binaries(storage: &Storage) -> Result<Vec<BootBinary>> {
     let mut boot_binaries = Vec::new();
     let boot_dir = storage.bls_boot_binaries_dir()?;
-    let esp = storage.require_esp()?;
+    let uki_partition = storage.require_uki_partition()?;
 
     // Scan for UKI binaries in EFI/Linux/bootc
-    collect_uki_binaries(&esp.fd, &mut boot_binaries)?;
+    collect_uki_binaries(uki_partition, &mut boot_binaries)?;
 
     // Scan for Type1 boot binaries (kernels + initrds) in `boot_dir`
     // depending upon whether systemd-boot is being used, or grub
@@ -164,9 +164,7 @@ fn delete_kernel_initrd(storage: &Storage, dir_to_delete: &str, dry_run: bool) -
 /// Deletes the UKI `uki_id` and any addons specific to it
 #[fn_error_context::context("Deleting UKI and UKI addons {uki_id}")]
 fn delete_uki(storage: &Storage, uki_id: &str, dry_run: bool) -> Result<()> {
-    let esp_mnt = storage.require_esp()?;
-
-    let uki_dir = esp_mnt.fd.open_dir(BOOTC_UKI_DIR)?;
+    let uki_dir = storage.require_uki_partition()?.open_dir(BOOTC_UKI_DIR)?;
 
     for entry in uki_dir.entries_utf8()? {
         let entry = entry?;
@@ -271,8 +269,7 @@ fn gc_global_uki_addons(
 
     if !unreferenced_global_addons.is_empty() {
         let global_uki_dir = storage
-            .require_esp()?
-            .fd
+            .require_uki_partition()?
             .open_dir(GLOBAL_UKI_ADDONS_DIR)
             .context("Opening global UKI Addons dir")?;
 

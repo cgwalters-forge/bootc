@@ -218,19 +218,12 @@ impl Device {
         Ok((!esps.is_empty()).then_some(esps))
     }
 
-    /// Find a single ESP partition among all root devices backing this device.
+    /// Find a single ESP partition among all root devices backing this device,
+    /// and the XBOOTLDR partition next to it, if there is one.
     ///
     /// Walks the parent chain to find all backing disks, then looks for ESP
-    /// partitions on each. Returns the first ESP found. This is the common
+    /// partitions on each, and returns the first ESP found. This is the common
     /// case for composefs/UKI boot paths where exactly one ESP is expected.
-    pub fn find_first_colocated_esp(&self) -> Result<Device> {
-        self.find_colocated_esps()?
-            .and_then(|mut v| Some(v.remove(0)))
-            .ok_or_else(|| anyhow!("No ESP partition found among backing devices"))
-    }
-
-    /// Like [`Self::find_first_colocated_esp`], but also return the XBOOTLDR
-    /// partition next to that ESP, if there is one.
     ///
     /// Per the Boot Loader Specification, the XBOOTLDR partition must be on
     /// the same disk as the ESP (systemd-boot only looks for it there), so an

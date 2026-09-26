@@ -102,9 +102,7 @@ pub(crate) fn handle_addon_cli_cmd(
     host: &Host,
     opts: &UkiAddonCliOpts,
 ) -> Result<()> {
-    let Ok(esp) = storage.require_esp() else {
-        anyhow::bail!("ESP not found");
-    };
+    let boot_partition = storage.require_uki_partition()?;
 
     match opts {
         UkiAddonCliOpts::List { json, verbose } => {
@@ -171,8 +169,7 @@ pub(crate) fn handle_addon_cli_cmd(
 
                     // Absolutely make sure the addon doesn't contain `composefs=` cmdline
                     // if it does, we can't remove it
-                    let mut addon_file = esp
-                        .fd
+                    let mut addon_file = boot_partition
                         .open(&addon_path)
                         .with_context(|| format!("Opening {}", addon_path.display()))?;
 
@@ -194,7 +191,7 @@ pub(crate) fn handle_addon_cli_cmd(
                         Err(e) => Err(e).context("Reading cmdline section from addon")?,
                     };
 
-                    esp.fd
+                    boot_partition
                         .remove_file(&addon_path)
                         .with_context(|| format!("Failed to remove addon {addon_name}"))?;
 
@@ -204,8 +201,7 @@ pub(crate) fn handle_addon_cli_cmd(
                         .parent()
                         .expect("Expected addon path to have a parent");
 
-                    let num_ents = esp
-                        .fd
+                    let num_ents = boot_partition
                         .open_dir(addons_dir)
                         .context("Opening addons dir")?
                         .entries()
@@ -214,7 +210,7 @@ pub(crate) fn handle_addon_cli_cmd(
 
                     // Remove directory if empty
                     if num_ents == 0 {
-                        esp.fd.remove_dir(&addons_dir).with_context(|| {
+                        boot_partition.remove_dir(&addons_dir).with_context(|| {
                             format!("Removing addons dir: {}", addons_dir.display())
                         })?;
 
@@ -243,14 +239,13 @@ pub(crate) fn handle_addon_cli_cmd(
                         GLOBAL_UKI_ADDONS_DIR
                     };
 
-                    esp.fd
+                    boot_partition
                         .remove_file(format!("{global_addons_dir}/{full_addon_name}"))
                         .with_context(|| format!("Removing global addon {full_addon_name}"))?;
 
                     println!("Removed Global Addon {addon_name}");
 
-                    let num_ents = esp
-                        .fd
+                    let num_ents = boot_partition
                         .open_dir(global_addons_dir)
                         .context("Opening global addons dir")?
                         .entries()
@@ -259,7 +254,7 @@ pub(crate) fn handle_addon_cli_cmd(
 
                     // Remove the directory if it's now empty.
                     if num_ents == 0 {
-                        esp.fd
+                        boot_partition
                             .remove_dir(global_addons_dir)
                             .context("Removing global addons dir")?;
 
@@ -390,12 +385,11 @@ pub(crate) fn handle_addon_cli_cmd(
                         GLOBAL_UKI_ADDONS_DIR
                     };
 
-                    esp.fd
+                    boot_partition
                         .create_dir_all(global_addons_dir)
                         .context("Creating global addons directory")?;
 
-                    let global_addons_dir = esp
-                        .fd
+                    let global_addons_dir = boot_partition
                         .open_dir(global_addons_dir)
                         .context("Opening global addons dir")?;
 
@@ -405,12 +399,11 @@ pub(crate) fn handle_addon_cli_cmd(
                     let dir_path = Path::new(BOOTC_UKI_DIR)
                         .join(get_uki_addon_dir_name(&deployment_digest.to_hex()));
 
-                    esp.fd
+                    boot_partition
                         .create_dir_all(&dir_path)
                         .context("Creating addons directory")?;
 
-                    let to_dir = esp
-                        .fd
+                    let to_dir = boot_partition
                         .open_dir(&dir_path)
                         .context("Opening addons directory")?;
 
