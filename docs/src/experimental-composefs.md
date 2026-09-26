@@ -62,6 +62,23 @@ So bootc accepts a bare `composefs=` digest that matches either a V1 or a V2
 image, and only enforces the format for the explicit
 `composefs.digest=v1-…`/`composefs.digest=v2-…` form.
 
+### Boot entries (BLS)
+
+For a Type 1 (BLS) boot entry, bootc writes the kernel arguments itself, and
+the image it writes them for may carry an initramfs from an older bootc, for
+example after `bootc switch` to an image that still ships bootc 1.16. That
+initramfs only runs its root setup when an argument named `composefs` is
+present, and before 1.16.3 it only reads `composefs=`. So for a V1 deployment
+bootc writes `composefs.digest=v1-sha512-12:<digest>` followed by
+`composefs=<digest>` with the **same V1 digest**, which also names the
+deployment's state directory.
+
+This differs from UKIs, where the bare `composefs=` argument carries the V2
+digest, and from composefs-rs's documentation, which defines bare
+`composefs=` as an alias for V2. Current initramfs versions try both
+arguments in order; for a BLS entry both name the same image, and
+`composefs.digest=` comes first.
+
 ### Upgrading from bootc 1.16
 
 When you update bootc in an image, **regenerate the initramfs before

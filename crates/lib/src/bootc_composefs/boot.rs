@@ -92,14 +92,14 @@ use composefs_ctl::composefs;
 use composefs_ctl::composefs_boot;
 use composefs_ctl::composefs_oci;
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::{Cmdline, Parameter, ParameterKey};
+use linux_kernel_cmdline::utf8::{Cmdline, ParameterKey};
 use ostree_ext::composefs::dumpfile;
 use rustix::{mount::MountFlags, path::Arg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
-use crate::bootc_composefs::status::build_composefs_karg;
+use crate::bootc_composefs::status::build_bls_composefs_kargs;
 use crate::bootc_kargs::compute_new_kargs;
 use crate::composefs_consts::{TYPE1_BOOT_DIR_PREFIX, TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED};
 use crate::parsers::bls_config::{BLSConfig, BLSConfigType, EFIKey};
@@ -720,13 +720,11 @@ struct BLSEntryPath {
     config_path: Utf8PathBuf,
 }
 
-/// Replace either karg spelling to ensure only the selected EROFS format remains.
-fn replace_composefs_karg(cmdline: &mut Cmdline, new_karg: &str) -> Result<()> {
+/// Replace both karg spellings with `new_kargs` (see [`build_bls_composefs_kargs`]).
+fn replace_composefs_karg(cmdline: &mut Cmdline, new_kargs: &str) {
     cmdline.remove(&ParameterKey::from(KARG_V2));
     cmdline.remove(&ParameterKey::from(KARG_COMPOSEFS_DIGEST));
-    let parameter = Parameter::parse(new_karg).context("Parsing composefs kernel parameter")?;
-    cmdline.add_or_modify(&parameter);
-    Ok(())
+    cmdline.extend(&Cmdline::from(new_kargs));
 }
 
 /// Sets up and writes BLS entries and binaries (VMLinuz + Initrd) to disk
@@ -758,7 +756,7 @@ pub(crate) fn setup_composefs_bls_boot(
             }
 
             let composefs_cmdline =
-                build_composefs_karg(id.clone(), format_version, allow_missing_fsverity);
+                build_bls_composefs_kargs(id.clone(), format_version, allow_missing_fsverity);
             cmdline_options.extend(&Cmdline::from(&composefs_cmdline));
 
             // If there's a separate /boot partition, add a systemd.mount-extra
@@ -807,12 +805,12 @@ pub(crate) fn setup_composefs_bls_boot(
 
             replace_composefs_karg(
                 &mut cmdline,
-                &build_composefs_karg(
+                &build_bls_composefs_kargs(
                     id.clone(),
                     format_version,
                     booted_cfs.cmdline.allow_missing_fsverity,
                 ),
-            )?;
+            );
 
             // Locate ESP partition device by walking up to the root disk(s)
             let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?;
@@ -2277,17 +2275,17 @@ mod tests {
 
     #[test]
     fn test_replace_composefs_karg() {
+        let hex = "f".repeat(128);
         let mut cmdline =
-            Cmdline::from("root=UUID=abc composefs=old composefs.digest=v1-sha512-12:stale");
+            Cmdline::from("root=UUID=abc composefs=old composefs.digest=v1-sha512-12:stale rw");
         replace_composefs_karg(
             &mut cmdline,
-            "composefs.digest=v1-sha512-12:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        )
-        .unwrap();
-        let rendered = cmdline.to_string();
-        assert!(!rendered.contains("composefs=old"));
-        assert!(!rendered.contains(":stale"));
-        assert!(rendered.contains("root=UUID=abc"));
+            &format!("composefs.digest=v1-sha512-12:{hex} composefs={hex}"),
+        );
+        assert_eq!(
+            cmdline.to_string(),
+            format!("root=UUID=abc rw composefs.digest=v1-sha512-12:{hex} composefs={hex}")
+        );
     }
 
     #[test]
