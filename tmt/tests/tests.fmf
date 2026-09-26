@@ -206,3 +206,8 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-56-composefs-legacy-initramfs:
+  summary: Boot a BLS entry for an image whose initramfs predates composefs.digest=
+  duration: 30m
+  test: nu booted/test-composefs-legacy-initramfs.nu

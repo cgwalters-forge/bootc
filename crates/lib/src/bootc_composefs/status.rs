@@ -142,6 +142,37 @@ pub(crate) fn build_composefs_karg(
     .to_cmdline_arg()
 }
 
+/// Render the composefs kargs for a Type 1 BLS entry, which (unlike a UKI)
+/// may be written by a newer bootc than the one in the target's initramfs.
+///
+/// For a V1 digest this is `composefs.digest=v1-...` followed by the legacy
+/// `composefs=` key carrying the *same* digest: the initramfs of bootc 1.16
+/// and earlier only starts `bootc-root-setup.service` when a karg named
+/// `composefs` is present, and before 1.16.3 it only parses `composefs=`.
+/// The digest must stay the deployment's own, since the initramfs also uses
+/// it to find `state/deploy/<digest>`. Current parsers (the initramfs and
+/// [`ComposefsCmdline::find_in_cmdline`]) prefer `composefs.digest=`, and
+/// bootc 1.16.4 through 1.16.14 already wrote V1 digests under `composefs=`.
+///
+/// The legacy karg can be dropped once bootc no longer needs to write boot
+/// entries for images whose initramfs predates `composefs.digest=` support in
+/// `bootc-root-setup.service` (i.e. 1.16.x and older are out of support).
+pub(crate) fn build_bls_composefs_kargs(
+    digest: Sha512HashValue,
+    format_version: FormatVersion,
+    allow_missing_fsverity: bool,
+) -> String {
+    let karg = build_composefs_karg(digest.clone(), format_version, allow_missing_fsverity);
+    match format_version {
+        FormatVersion::V2 => karg,
+        FormatVersion::V0 | FormatVersion::V1 => {
+            let legacy =
+                BootComposefsCmdline::new_v2(digest, allow_missing_fsverity).to_cmdline_arg();
+            format!("{karg} {legacy}")
+        }
+    }
+}
+
 impl std::fmt::Display for ComposefsCmdline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let allow_missing_fsverity = if self.allow_missing_fsverity { "?" } else { "" };
@@ -1194,6 +1225,38 @@ mod tests {
                 .as_ref(),
             hex
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_bls_composefs_kargs() -> Result<()> {
+        let hex = "ab".repeat(64);
+        let digest = || Sha512HashValue::from_hex(&hex).unwrap();
+
+        let cases = [
+            (
+                FormatVersion::V1,
+                false,
+                format!("composefs.digest=v1-sha512-12:{hex} composefs={hex}"),
+            ),
+            (
+                FormatVersion::V1,
+                true,
+                format!("composefs.digest=?v1-sha512-12:{hex} composefs=?{hex}"),
+            ),
+            (FormatVersion::V2, false, format!("composefs={hex}")),
+            (FormatVersion::V2, true, format!("composefs=?{hex}")),
+        ];
+        for (format_version, insecure, expected) in cases {
+            let kargs = build_bls_composefs_kargs(digest(), format_version, insecure);
+            assert_eq!(kargs, expected);
+            // Current parsers still resolve the deployment from either form.
+            let parsed = ComposefsCmdline::find_in_cmdline(&Cmdline::from(kargs))?
+                .expect("composefs argument should be present");
+            assert_eq!(parsed.digest.as_ref(), hex);
+            assert_eq!(parsed.allow_missing_fsverity, insecure);
+        }
 
         Ok(())
     }
