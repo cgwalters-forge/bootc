@@ -187,9 +187,7 @@ build-sealed:
 
 # Run tmt integration tests in VMs (e.g. `just test-tmt readonly`)
 [group('core')]
-test-tmt *ARGS: build
-    @just _build-upgrade-image
-    @just test-tmt-nobuild {{ARGS}}
+test-tmt *ARGS: build _build-upgrade-image (test-tmt-nobuild ARGS)
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
