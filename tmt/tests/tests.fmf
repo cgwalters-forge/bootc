@@ -206,3 +206,12 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-58-selinux-policy-finalize:
+  summary: Local SELinux policy modules survive an upgrade with a new policy
+  duration: 30m
+  adjust:
+  - when: running_env != image_mode
+    enabled: false
+    because: these tests require features only available in image mode
+  test: nu booted/test-selinux-policy-finalize.nu
