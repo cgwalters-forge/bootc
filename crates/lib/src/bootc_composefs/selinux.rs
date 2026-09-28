@@ -1,6 +1,10 @@
+use std::os::fd::OwnedFd;
+
 use anyhow::{Context, Result};
 use bootc_initramfs_setup::mount_composefs_image;
 use bootc_mount::tempmount::TempMount;
+use bootc_utils::{BindMode, ChrootCmd};
+use camino::Utf8Path;
 use cap_std_ext::cap_std::{ambient_authority, fs::Dir};
 use cap_std_ext::dirext::CapStdExtDirExt;
 use fn_error_context::context;
@@ -10,8 +14,19 @@ use crate::lsm::selinux_enabled;
 use crate::store::Storage;
 
 const SELINUX_CONFIG_PATH: &str = "etc/selinux/config";
+/// [`SELINUX_CONFIG_PATH`], relative to /etc.
+const ETC_SELINUX_CONFIG: &str = "selinux/config";
 const SELINUX_TYPE: &str = "SELINUXTYPE=";
 const POLICY_FILE_PREFIX: &str = "policy.";
+/// The `semodule` option that rebuilds the policy only if the modules changed
+/// since it was last built (formerly `--rebuild-if-modules-changed`).
+const SEMODULE_REFRESH: &str = "--refresh";
+/// libsemanage's config, relative to /etc.
+const ETC_SEMANAGE_CONF: &str = "selinux/semanage.conf";
+/// libsemanage's default `store-root` when semanage.conf doesn't set one.
+const DEFAULT_STORE_ROOT: &str = "/var/lib/selinux";
+/// Where the image may ship `semodule` (/usr/sbin is merged into /usr/bin on newer Fedora).
+const SEMODULE_PATHS: &[&str] = &["usr/sbin/semodule", "usr/bin/semodule"];
 
 /// Find the highest versioned policy file in the given directory
 fn find_latest_policy_file(policy_dir: &Dir) -> Result<String> {
@@ -146,11 +161,174 @@ pub(crate) fn are_selinux_policies_compatible(
     Ok(sl_policy_match)
 }
 
+/// The policy module store's root directory set by a semanage.conf.
+fn semanage_store_root(semanage_conf: &str) -> &str {
+    // Like libsemanage, accept quoted values and let the last assignment win.
+    semanage_conf
+        .lines()
+        .filter_map(|l| l.trim().split_once('='))
+        .filter(|(k, _)| k.trim() == "store-root")
+        .map(|(_, v)| {
+            let v = v.trim();
+            v.strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v)
+        })
+        .next_back()
+        .unwrap_or(DEFAULT_STORE_ROOT)
+}
+
+/// Conservatively require a store under /etc without symlink or parent traversal.
+/// Absolute symlinks would resolve in the deployment, not in the host namespace.
+fn store_is_in_merged_etc(merged_etc: &Utf8Path, store_root: &str) -> Result<bool> {
+    let Ok(relative) = Utf8Path::new(store_root).strip_prefix("/etc") else {
+        return Ok(false);
+    };
+    let mut path = merged_etc.to_owned();
+    for component in relative.components() {
+        match component {
+            camino::Utf8Component::Normal(name) => path.push(name),
+            camino::Utf8Component::CurDir => continue,
+            _ => return Ok(false),
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).context("Checking SELinux policy store path"),
+        }
+    }
+    Ok(true)
+}
+
+/// Rebuild the binary SELinux policy in a staged deployment's merged /etc
+/// if its policy modules changed.
+///
+/// The /etc merge keeps locally modified files, so once a local module is
+/// installed (`semodule -i`), the booted system's compiled policy wins over
+/// the new image's, silently dropping every policy change the new image
+/// ships. `semodule --refresh` recompiles the policy only if the module store
+/// differs from what the policy was built from, so it is cheap in the common
+/// case of no local changes.
+///
+/// It runs the new image's own `semodule` (chrooted into its EROFS, with the
+/// merged /etc bound over it) rather than the booted one's, so the policy is
+/// built by the libsemanage/libsepol that will load it. This mirrors
+/// `sysroot_finalize_selinux_policy()` in ostree, which uses bwrap instead.
+#[context("Finalizing SELinux policy")]
+pub(crate) fn finalize_selinux_policy(
+    sysroot_fd: &OwnedFd,
+    deployment_verity: &str,
+    allow_missing_fsverity: bool,
+    merged_etc: &Utf8Path,
+) -> Result<()> {
+    if !merged_etc.join(ETC_SELINUX_CONFIG).try_exists()? {
+        tracing::debug!("No SELinux config in {merged_etc}, skipping policy rebuild");
+        return Ok(());
+    }
+
+    // Only /etc is bound to writable deployment state; /var is the image's own
+    // read-only directory. Do not follow symlinks out of the merged tree.
+    let semanage_conf = std::fs::read_to_string(merged_etc.join(ETC_SEMANAGE_CONF))
+        .or_else(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(String::new()),
+            _ => Err(e),
+        })
+        .context("Reading semanage.conf")?;
+    let store_root = semanage_store_root(&semanage_conf);
+    if !store_is_in_merged_etc(merged_etc, store_root)? {
+        tracing::warn!(
+            "SELinux policy store-root {store_root} is not safely under merged /etc, skipping policy rebuild"
+        );
+        return Ok(());
+    }
+
+    let composefs_fd =
+        mount_composefs_image(sysroot_fd, deployment_verity, allow_missing_fsverity)?;
+    let root = TempMount::mount_fd(&composefs_fd)?;
+    let root_path = Utf8Path::from_path(root.dir.path())
+        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 mount path {:?}", root.dir.path()))?;
+
+    let mut have_semodule = false;
+    for p in SEMODULE_PATHS {
+        have_semodule |= root.fd.try_exists(p)?;
+    }
+    if !have_semodule {
+        tracing::debug!("No semodule in deployment {deployment_verity}, skipping policy rebuild");
+        return Ok(());
+    }
+
+    let chroot = || {
+        ChrootCmd::new(root_path)
+            .bind(&merged_etc, &"/etc", BindMode::Default)
+            .set_default_path()
+    };
+
+    let help = chroot()
+        .run_get_string(["semodule", "--help"])
+        .context("Running semodule --help")?;
+    if !help.contains(SEMODULE_REFRESH) {
+        tracing::info!("semodule does not support {SEMODULE_REFRESH}, skipping policy rebuild");
+        return Ok(());
+    }
+
+    tracing::info!("Refreshing SELinux policy");
+    let start = std::time::Instant::now();
+    // -N: don't load the policy into the running kernel; it's for the next boot.
+    chroot().run(["semodule", "-N", SEMODULE_REFRESH])?;
+    tracing::info!("Refreshed SELinux policy in {:?}", start.elapsed());
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cap_std_ext::cap_std::ambient_authority;
     use cap_std_ext::dirext::CapStdExtDirExt;
+
+    #[test]
+    fn test_semanage_store_root() {
+        let cases = [
+            ("", DEFAULT_STORE_ROOT),
+            ("module-store = direct\n", DEFAULT_STORE_ROOT),
+            ("# store-root=/etc/selinux\n", DEFAULT_STORE_ROOT),
+            ("expand-check=0\nstore-root=/etc/selinux\n", "/etc/selinux"),
+            ("  store-root = /var/lib/selinux  \n", "/var/lib/selinux"),
+            ("store-root = \"/etc/selinux\"\n", "/etc/selinux"),
+            (
+                "store-root=/var/lib/selinux\nstore-root=/etc/selinux\n",
+                "/etc/selinux",
+            ),
+            (
+                "store-root=/etc/selinux\nstore-root=/var/lib/selinux\n",
+                "/var/lib/selinux",
+            ),
+        ];
+        for (conf, expected) in cases {
+            assert_eq!(semanage_store_root(conf), expected, "{conf:?}");
+        }
+    }
+
+    #[test]
+    fn test_store_is_in_merged_etc() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let etc = Utf8Path::from_path(tmp.path()).unwrap();
+        std::os::unix::fs::symlink("/var/lib/selinux", etc.join("linked"))?;
+        for (store, expected) in [
+            ("/etc/selinux", true),
+            ("/etc", true),
+            ("/etc/./selinux", true),
+            ("/var/lib/selinux", false),
+            ("/etc-other/selinux", false),
+            ("/etc/../var/lib/selinux", false),
+            ("/etc/linked", false),
+            ("/etc/linked/child", false),
+        ] {
+            assert_eq!(store_is_in_merged_etc(etc, store)?, expected, "{store}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_find_latest_policy_file() -> Result<()> {

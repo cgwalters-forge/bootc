@@ -229,6 +229,15 @@ check:
   - e2fsprogs
   test: nu booted/test-composefs-separate-boot.nu
 
+/test-58-selinux-policy-finalize:
+  summary: Local SELinux policy modules survive an upgrade with a new policy
+  duration: 30m
+  adjust:
+  - when: running_env != image_mode
+    enabled: false
+    because: these tests require features only available in image mode
+  test: nu booted/test-selinux-policy-finalize.nu
+
 /test-60-install-composefs-native:
   summary: Test that composefs-native images default to the composefs backend
   duration: 45m
