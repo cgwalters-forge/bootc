@@ -4,7 +4,7 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ocidir::cap_std::fs::Dir;
 use ostree::glib;
 
@@ -18,6 +18,15 @@ pub const OSTREE_BOOTED: &str = "run/ostree-booted";
 // it will be ignored.
 const V0_REPO_CONFIG: &str = "/sysroot/config";
 const V1_REPO_CONFIG: &str = "/sysroot/ostree/repo/config";
+
+/// Where rpm-ostree based images (Fedora CoreOS, fedora-bootc, ...) keep the
+/// rpm database, and where rpm-ostree writes it when installing packages in a
+/// container build. Plain Fedora, CentOS and RHEL images keep it in
+/// `/usr/lib/sysimage/rpm` or `/var/lib/rpm` instead.
+const OSTREE_RPMDB: &str = "/usr/share/rpm";
+
+/// Set by systemd for the processes of a unit.
+const SYSTEMD_INVOCATION_ID: &str = "INVOCATION_ID";
 
 /// Attempts to detect if the current process is running inside a container.
 /// This looks for the `container` environment variable or the presence
@@ -82,17 +91,61 @@ pub fn is_ostree_booted_in(rootfs: &Dir) -> io::Result<bool> {
     rootfs.try_exists(OSTREE_BOOTED)
 }
 
+/// The facts [`is_ostree_container`] decides on, read from the running system.
+#[derive(Debug, Default, Clone, Copy)]
+struct ContainerSignals {
+    /// See [`ostree_booted`].
+    ostree_booted: bool,
+    /// The root filesystem has an ostree image layout: an rpm database in
+    /// [`OSTREE_RPMDB`], or an ostree repository in `bare-split-xattrs` mode
+    /// (see [`is_bare_split_xattrs`]).
+    ostree_layout: bool,
+    /// See [`running_in_container`].
+    container_markers: bool,
+    /// We are part of a systemd unit.
+    in_systemd_unit: bool,
+    /// The system was booted with systemd (`/run/systemd/system` exists).
+    systemd_booted: bool,
+}
+
+impl ContainerSignals {
+    fn read() -> Result<Self> {
+        let ostree_layout = Path::new(OSTREE_RPMDB)
+            .try_exists()
+            .with_context(|| format!("Checking for {OSTREE_RPMDB}"))?
+            || is_bare_split_xattrs()?;
+        Ok(Self {
+            ostree_booted: ostree_booted().context("Checking for ostree-booted")?,
+            ostree_layout,
+            container_markers: running_in_container(),
+            in_systemd_unit: std::env::var_os(SYSTEMD_INVOCATION_ID).is_some(),
+            systemd_booted: libsystemd::daemon::booted(),
+        })
+    }
+
+    fn is_ostree_container(&self) -> bool {
+        // A booted ostree host, or a chroot into one, is never a container
+        // build, even with a `container` variable leaked into its environment.
+        if self.ostree_booted || !self.ostree_layout {
+            return false;
+        }
+        // BuildKit (`docker buildx`) RUN steps set none of the container
+        // markers, so otherwise take the absence of systemd as the sign of a
+        // build environment.
+        self.container_markers || !(self.in_systemd_unit || self.systemd_booted)
+    }
+}
+
 /// Returns `true` if the current booted filesystem appears to be an ostree-native container.
 ///
-/// This just invokes [`is_bare_split_xattrs`] and [`running_in_container`].
+/// That is, the root filesystem has an ostree image layout (an rpm database in
+/// `/usr/share/rpm`, or an ostree repository in `bare-split-xattrs` mode), the
+/// system was not booted via ostree, and either [`running_in_container`] is
+/// true or there is no sign of systemd.
+///
+/// The ostree repository is not required, as images may omit it.
 pub fn is_ostree_container() -> Result<bool> {
-    let is_container_ostree = is_bare_split_xattrs()?;
-    let running_in_systemd = std::env::var_os("INVOCATION_ID").is_some();
-    // If we have a container-ostree repo format, then we'll assume we're
-    // running in a container unless there's strong evidence not (we detect
-    // we're part of a systemd unit or are in a booted ostree system).
-    let maybe_container = running_in_container() || (!running_in_systemd && !ostree_booted()?);
-    Ok(is_container_ostree && maybe_container)
+    Ok(ContainerSignals::read()?.is_ostree_container())
 }
 
 /// Returns an error unless the current filesystem is an ostree-based container
@@ -103,4 +156,89 @@ pub fn require_ostree_container() -> Result<()> {
         anyhow::bail!("Not in an ostree-based container environment");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_ostree_container() {
+        let layout = ContainerSignals {
+            ostree_layout: true,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                "booted host, leaked container=",
+                ContainerSignals {
+                    ostree_booted: true,
+                    container_markers: true,
+                    systemd_booted: true,
+                    ..layout
+                },
+                false,
+            ),
+            (
+                "booted host, systemd unit",
+                ContainerSignals {
+                    ostree_booted: true,
+                    in_systemd_unit: true,
+                    systemd_booted: true,
+                    ..layout
+                },
+                false,
+            ),
+            (
+                "booted non-ostree host",
+                ContainerSignals {
+                    systemd_booted: true,
+                    ..layout
+                },
+                false,
+            ),
+            (
+                "ostree container",
+                ContainerSignals {
+                    container_markers: true,
+                    ..layout
+                },
+                true,
+            ),
+            (
+                "ostree container running systemd",
+                ContainerSignals {
+                    container_markers: true,
+                    systemd_booted: true,
+                    ..layout
+                },
+                true,
+            ),
+            ("BuildKit build root", layout, true),
+            (
+                "build root in a systemd unit",
+                ContainerSignals {
+                    in_systemd_unit: true,
+                    ..layout
+                },
+                false,
+            ),
+            (
+                "plain container",
+                ContainerSignals {
+                    container_markers: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            ("plain build root", ContainerSignals::default(), false),
+        ];
+        for (name, signals, expected) in cases {
+            assert_eq!(
+                signals.is_ostree_container(),
+                expected,
+                "{name}: {signals:?}"
+            );
+        }
+    }
 }
