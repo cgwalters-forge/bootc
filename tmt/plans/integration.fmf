@@ -331,4 +331,12 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-52-install-composefs-native:
+  summary: Test that composefs-native images default to the composefs backend
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-52-install-composefs-native
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
