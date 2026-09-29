@@ -397,19 +397,24 @@ pub(crate) struct InstallConfigOpts {
 
 #[derive(Debug, Default, Clone, clap::Parser, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstallComposefsOpts {
-    /// If true, composefs backend is used, else ostree backend is used
+    /// If true, composefs backend is used, else ostree backend is used.
+    ///
+    /// Images with a UKI always use it, and so do images that ship
+    /// /usr/lib/composefs/setup-root-conf.toml but no ostree prepare-root.conf.
     #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) composefs_backend: bool,
 
     /// Make fs-verity validation optional in case the filesystem doesn't support it
-    #[clap(long, default_value_t, requires = "composefs_backend")]
+    /// (composefs backend only)
+    #[clap(long, default_value_t)]
     #[serde(default)]
     pub(crate) allow_missing_verity: bool,
 
     /// Name of the UKI addons to install without the ".efi.addon" suffix.
-    /// This option can be provided multiple times if multiple addons are to be installed.
-    #[clap(long, requires = "composefs_backend")]
+    /// This option can be provided multiple times if multiple addons are to be installed
+    /// (composefs backend only).
+    #[clap(long)]
     #[serde(default)]
     pub(crate) uki_addon: Option<Vec<String>>,
 }
@@ -1720,13 +1725,54 @@ async fn prepare_install(
 
     tracing::debug!("Composefs required: {composefs_required}");
 
-    if composefs_required {
-        composefs_options.composefs_backend = true;
+    // ostree's prepare-root.conf is read from the running root even with
+    // --source-imgref, like the install configuration: tools such as
+    // bootc-image-builder run bootc from the image they install. Convert the
+    // keyfile to a hashmap because GKeyFile isnt Send for probably bad reasons.
+    let prepareroot_config = ostree_prepareroot::load_config_from_root(&rootfs)?
+        .map(|kf| -> Result<HashMap<String, String>> {
+            let mut r = HashMap::new();
+            for grp in kf.groups() {
+                for key in kf.keys(&grp)? {
+                    let key = key.as_str();
+                    let value = kf.value(&grp, key)?;
+                    r.insert(format!("{grp}.{key}"), value.to_string());
+                }
+            }
+            Ok(r)
+        })
+        .transpose()?;
+
+    // A UKI requires the composefs backend, and a composefs-native image
+    // without ostree's configuration defaults to it.
+    let composefs_default = crate::bootc_composefs::image::defaults_to_composefs_backend(
+        &rootfs,
+        prepareroot_config.is_some(),
+    )?;
+    tracing::debug!("Composefs default: {composefs_default}");
+    let composefs_explicit = composefs_options.composefs_backend;
+    composefs_options.composefs_backend |= composefs_required || composefs_default;
+    if !composefs_options.composefs_backend {
+        anyhow::ensure!(
+            !composefs_options.allow_missing_verity,
+            "--allow-missing-verity requires the composefs backend"
+        );
+        anyhow::ensure!(
+            composefs_options.uki_addon.is_none(),
+            "--uki-addon requires the composefs backend"
+        );
     }
 
     if composefs_options.composefs_backend
         && matches!(config_opts.bootloader, Some(Bootloader::None))
     {
+        if !composefs_explicit && !composefs_required {
+            anyhow::bail!(
+                "Bootloader set to none is not supported with the composefs backend, which this image selects \
+                 because it has {} and no ostree prepare-root.conf",
+                bootc_initramfs_setup::SETUP_ROOT_CONF_PATH
+            );
+        }
         anyhow::bail!("Bootloader set to none is not supported with the composefs backend");
     }
 
@@ -1831,18 +1877,15 @@ async fn prepare_install(
         }
     }
 
-    // Convert the keyfile to a hashmap because GKeyFile isnt Send for probably bad reasons.
-    let prepareroot_config = {
-        let kf = ostree_prepareroot::require_config_from_root(&rootfs)?;
-        let mut r = HashMap::new();
-        for grp in kf.groups() {
-            for key in kf.keys(&grp)? {
-                let key = key.as_str();
-                let value = kf.value(&grp, key)?;
-                r.insert(format!("{grp}.{key}"), value.to_string());
-            }
-        }
-        r
+    // Only the ostree backend uses prepare-root.conf, and composefs-native
+    // images needn't have one.
+    let prepareroot_config = match prepareroot_config {
+        Some(c) => c,
+        None if composefs_options.composefs_backend => HashMap::new(),
+        None => anyhow::bail!(
+            "Failed to find {} in /usr/lib or /etc",
+            ostree_prepareroot::CONF_PATH
+        ),
     };
 
     // Eagerly read the file now to ensure we error out early if e.g. it doesn't exist,
