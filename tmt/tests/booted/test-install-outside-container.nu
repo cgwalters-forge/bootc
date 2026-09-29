@@ -262,6 +262,59 @@ if not (tap is_composefs) {
     assert (not ($deployment | path join etc/transient-sentinel | path exists)) "transient /etc writes must not persist"
 }
 
+# --latest follows the default boot entry rather than counting deployments.
+let esp = "/var/mnt/install-mount-esp"
+mkdir $esp
+mount (discover_target_partitions $loop).esp $esp
+if (tap is_composefs) {
+    # Point every boot entry at a deployment that does not exist: the mount
+    # must then fail, naming it, whichever bootloader reads which entries.
+    let id = ($deployment | path basename)
+    let missing = ($id | str replace -a -r "." "f")
+    let entries = ([
+        (glob $"($sysroot)/boot/loader/entries/*.conf")
+        (glob $"($sysroot)/boot/grub2/user.cfg")
+        (glob $"($esp)/loader/entries/*.conf")
+    ] | flatten)
+    assert (($entries | length) > 0) "the installation must have boot entries"
+    for f in $entries { open --raw $f | into binary | decode utf-8 | str replace -a $id $missing | save -f $f }
+    let result = (do { ^bootc install mount --sysroot $sysroot --esp $esp --latest $dest } | complete)
+    assert ($result.exit_code != 0) "install mount must follow the default boot entry"
+    assert ($result.stderr | str contains $missing) $"unexpected error: ($result.stderr)"
+    for f in $entries { open --raw $f | into binary | decode utf-8 | str replace -a $missing $id | save -f $f }
+    bootc install mount --sysroot $sysroot --esp $esp --latest $dest
+    assert equal (open ($dest | path join etc/sentinel)) "etc sentinel"
+    umount -R $dest
+} else {
+    # --latest must pick OSTree's default deployment. Use more than ten, so
+    # that sorting the entries by file name (ostree-10 before ostree-9) would
+    # pick the wrong one.
+    # Drop the etc.transient config from above, so /etc is the persistent
+    # copy again and can carry a marker per deployment.
+    rm ($deployment | path join etc/ostree/prepare-root.conf)
+    let csum = ($deployment | path basename | split row "." | first)
+    for _ in 1..10 {
+        ostree admin deploy --sysroot $sysroot --os default --retain $csum
+    }
+    let deployments = (ls ($sysroot | path join $state.deployments) | where type == dir | get name)
+    assert equal ($deployments | length) 11
+    # Each deployment of the same commit is told apart by its serial; the
+    # newest (serial 10) is the default until set-default moves another one
+    # (index 5 in newest-first order, serial 5) to the front.
+    for d in $deployments {
+        $d | path basename | split row "." | last | save -f ($d | path join etc/which)
+    }
+    for case in [[default expected]; [null "10"] [5 "5"]] {
+        if $case.default != null {
+            ostree admin set-default --sysroot $sysroot $case.default
+        }
+        bootc install mount --sysroot $sysroot --latest $dest
+        assert equal (open ($dest | path join etc/which)) $case.expected
+        umount -R $dest
+    }
+}
+umount $esp
+
 umount $sysroot
 losetup -d $loop
 
