@@ -331,4 +331,16 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-58-selinux-policy-finalize:
+  summary: Local SELinux policy modules survive an upgrade with a new policy
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-58-selinux-policy-finalize
+  adjust:
+  - when: running_env != image_mode
+    enabled: false
+    because: these tests require features only available in image mode
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
