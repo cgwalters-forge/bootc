@@ -44,7 +44,30 @@ journalctl -u bootc-finalize-staged.service -b -1
 As of a recent OSTree with [this commit](https://github.com/ostreedev/ostree/commit/08487091256b93493f8d692e37ab3d892c758da1)
 it is possible to configure the boot loader entry counting.
 
-At the current time, the composefs backend does not configure boot entry counting, this is likely to be added in the future.
+With systemd-boot, the composefs backend supports
+[boot counting](https://uapi-group.org/specifications/specs/boot_loader_specification/#boot-counting).
+As with `kernel-install`, it is enabled by writing the number of boot attempts
+to `/etc/kernel/tries`; `0` or no file turns it off. The file is read from the
+booted system when a deployment is staged, so when it is shipped in the
+container image, the first deployment of an image with it isn't counted yet.
+The boot entry of a staged deployment then gets that many attempts
+(e.g. `bootc_fedora-42-1+3.conf`), and once the new deployment reaches
+`boot-complete.target`, `systemd-bless-boot.service` marks it good. If it fails
+to get there on every attempt, systemd-boot boots the previous deployment
+instead, and `bootc status` shows the failed deployment as the rollback. Units
+that must succeed for a boot to count as good can be ordered before
+`boot-complete.target`; see
+[Automatic Boot Assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/).
+The target image must ship `systemd-bless-boot`. The initial deployment written
+by `bootc install`, and entries rewritten by `bootc rollback`, are not counted.
+
+Note that the SELinux policy in current Fedora and CentOS Stream releases does not
+allow `systemd-bless-boot` (running as `init_t`) to rename entries on the ESP
+(`dosfs_t`), so without a local policy module granting that, new deployments
+are never marked good, and after N boots systemd-boot falls back to the
+previous deployment.
+
+GRUB has no support for boot counting, so it is not enabled there.
 
 ## See Also
 
