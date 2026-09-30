@@ -49,7 +49,9 @@ pub(crate) async fn switch_composefs(
     };
 
     if new_spec == host.spec {
-        println!("Image specification is unchanged.");
+        do_upgrade_opts
+            .prog
+            .info("Image specification is unchanged.");
         if opts.apply && host.status.staged.is_some() {
             crate::reboot::reboot()?;
         }
@@ -106,7 +108,9 @@ pub(crate) async fn switch_composefs(
 
         match action {
             UpdateAction::Skip => {
-                println!("No changes in image: {target_imgref:#}");
+                do_upgrade_opts
+                    .prog
+                    .info(format!("No changes in image: {target_imgref:#}"));
                 return Ok(());
             }
 

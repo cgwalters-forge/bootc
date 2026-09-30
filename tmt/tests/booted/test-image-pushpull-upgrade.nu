@@ -110,6 +110,15 @@ RUN echo test content > /usr/share/blah.txt
 
 # This just does some basic verification of the progress JSON
 def sanity_check_switch_progress_json [data] {
+    # Status messages (e.g. "Queued for next boot") are interleaved with
+    # the progress events; check them separately.
+    let messages = $data | where type == "Message"
+    assert (($messages | length) > 0)
+    for m in $messages {
+        assert ($m.level in ["info", "warning"])
+        assert (($m.text | str length) > 0)
+    }
+    let data = $data | where type != "Message"
     let event_count = $data | length
     # The first one should always be a start event
     let first = $data.0;

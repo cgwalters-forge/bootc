@@ -18,6 +18,8 @@ use ostree::glib;
 use ostree_ext::container::SignatureSource;
 use ostree_ext::ostree;
 
+use crate::progress_jsonl::{Event, MessageLevel, ProgressWriter};
+
 /// Try to look for keys injected by e.g. rpm-ostree requesting machine-local
 /// changes; if any are present, return `true`.
 pub(crate) fn origin_has_rpmostree_stuff(kf: &glib::KeyFile) -> bool {
@@ -167,12 +169,23 @@ pub(crate) fn sigpolicy_from_opt(enforce_container_verification: bool) -> Signat
 
 /// Output a warning message that we want to be quite visible.
 /// The process (thread) execution will be delayed for a short time.
-pub(crate) fn medium_visibility_warning(s: &str) {
+///
+/// Unlike [`ProgressWriter::message`], this highlights the warning on
+/// the terminal; it is sent to any progress fd as a regular warning.
+#[expect(
+    clippy::disallowed_macros,
+    reason = "colored output for the terminal; also sent as a Message event below"
+)]
+pub(crate) fn medium_visibility_warning(prog: &ProgressWriter, s: &str) {
     anstream::eprintln!(
         "{}{s}{}",
         anstyle::AnsiColor::Red.render_fg(),
         anstyle::Reset.render()
     );
+    prog.send(Event::Message {
+        level: MessageLevel::Warning,
+        text: s.into(),
+    });
     // When warning, add a sleep to ensure it's seen
     std::thread::sleep(std::time::Duration::from_secs(1));
 }
@@ -181,6 +194,10 @@ pub(crate) fn medium_visibility_warning(s: &str) {
 /// with an automatic spinner to show that we're not blocked.
 /// Note that generally the called function should not output
 /// anything to stderr as this will interfere with the spinner.
+#[expect(
+    clippy::print_stderr,
+    reason = "fallback when the progress bar is hidden (no tty)"
+)]
 pub(crate) async fn async_task_with_spinner<F, T>(msg: &str, f: F) -> T
 where
     F: Future<Output = T>,

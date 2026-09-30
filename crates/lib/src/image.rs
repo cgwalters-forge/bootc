@@ -13,6 +13,8 @@
 //! for environments like ext4 where podman access to the OS image matters
 //! more than disk efficiency.
 
+use std::io::Write;
+
 use anyhow::{Context, Result, bail};
 use bootc_utils::CommandRunExt;
 use cap_std_ext::cap_std::{self, fs::Dir};
@@ -26,6 +28,7 @@ use crate::{
     boundimage::query_bound_images,
     cli::{ImageListFormat, ImageListType},
     podstorage::CStorage,
+    progress_jsonl::ProgressWriter,
     spec::Host,
     store::Storage,
     utils::async_task_with_spinner,
@@ -175,7 +178,7 @@ pub(crate) async fn list_entrypoint(
                 table.add_row([image.image, image.image_type.to_string()]);
             }
 
-            println!("{table}");
+            writeln!(std::io::stdout(), "{table}")?;
         }
         ImageListFormat::Json => {
             let mut stdout = std::io::stdout();
@@ -248,10 +251,11 @@ pub(crate) async fn push_entrypoint(
 
     let mut opts = ostree_ext::container::store::ExportToOCIOpts::default();
     opts.progress_to_stdout = true;
-    println!("Copying local image {source} to {target} ...");
+    let prog = ProgressWriter::default();
+    prog.info(format!("Copying local image {source} to {target} ..."));
     let r = ostree_ext::container::store::export(repo, &source, &target, Some(opts)).await?;
 
-    println!("Pushed: {target} {r}");
+    prog.info(format!("Pushed: {target} {r}"));
     Ok(())
 }
 
@@ -277,7 +281,7 @@ pub(crate) async fn set_unified_entrypoint() -> Result<()> {
     let storage = crate::cli::get_storage().await?;
 
     if let crate::store::BootedStorageKind::Composefs(booted_cfs) = storage.kind()? {
-        return set_unified_composefs(&storage, &booted_cfs).await;
+        return set_unified_composefs(&storage, &booted_cfs, &ProgressWriter::default()).await;
     }
 
     // Initialize floating c_storage early - needed for container operations
@@ -293,6 +297,7 @@ pub(crate) async fn set_unified_entrypoint() -> Result<()> {
 async fn set_unified_composefs(
     storage: &crate::store::Storage,
     booted_cfs: &crate::store::BootedComposefs,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     use crate::bootc_composefs::status::get_composefs_status;
 
@@ -321,7 +326,10 @@ async fn set_unified_composefs(
     // Check if the image is already in bootc storage
     let img_transport = imgref.to_transport_image()?;
     if imgstore.exists(&img_transport).await? {
-        println!("Image {} is already in bootc storage.", imgref.image);
+        prog.info(format!(
+            "Image {} is already in bootc storage.",
+            imgref.image
+        ));
         tracing::info!(
             message_id = SET_UNIFIED_CFS_JOURNAL_ID,
             bootc.status = "already_unified",
@@ -371,7 +379,7 @@ async fn set_unified_composefs(
         bootc.status = "set_unified_complete",
         "Unified storage set. Future upgrade/switch will use zero-copy path automatically.",
     );
-    println!("Unified storage enabled for {}.", imgref.image);
+    prog.info(format!("Unified storage enabled for {}.", imgref.image));
     Ok(())
 }
 

@@ -15,6 +15,7 @@ use crate::{
         TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED, USER_CFG_STAGED,
     },
     parsers::bls_config::{BLSConfigType, EFIKey, parse_bls_config},
+    progress_jsonl::ProgressWriter,
     spec::{BootEntry, BootloaderKind, DeploymentEntry},
     status::Slot,
     store::{BootedComposefs, Storage},
@@ -247,7 +248,7 @@ pub(crate) async fn delete_composefs_deployment(
 
     // Unqueue rollback. This makes it easier to delete boot entries later on
     if matches!(depl_to_del.ty, Some(Slot::Rollback)) && host.status.rollback_queued {
-        composefs_rollback(storage, booted_cfs).await?;
+        composefs_rollback(storage, booted_cfs, &ProgressWriter::default()).await?;
     }
 
     let kind = if depl_to_del.pinned {

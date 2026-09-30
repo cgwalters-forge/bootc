@@ -1,6 +1,13 @@
 // The internals docs are built with --document-private-items, so allow
 // linking to private items from module documentation.
 #![allow(rustdoc::private_intra_doc_links)]
+// Library code should not write to stdout/stderr behind the caller's back,
+// as that bypasses --progress-fd and can corrupt machine-readable output.
+// Use `ProgressWriter::message()` for status output meant for the user,
+// `tracing` for diagnostics, or write a command's results to an explicit
+// `impl Write`. The anstream equivalents are covered by disallowed-macros
+// in clippy.toml.
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::disallowed_macros)]
 
 //! # Bootable container tool
 //!

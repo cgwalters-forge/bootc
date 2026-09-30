@@ -4,6 +4,7 @@ use crate::{
         status::{build_composefs_karg, get_composefs_status},
     },
     cli::SoftRebootMode,
+    progress_jsonl::ProgressWriter,
     store::{BootedComposefs, Storage},
 };
 use anyhow::{Context, Result};
@@ -23,7 +24,7 @@ use std::{fs::create_dir_all, os::unix::process::CommandExt, path::PathBuf, proc
 const NEXTROOT: &str = "/run/nextroot";
 
 #[context("Resetting soft reboot state")]
-pub(crate) fn reset_soft_reboot() -> Result<()> {
+pub(crate) fn reset_soft_reboot(prog: &ProgressWriter) -> Result<()> {
     // NOTE: By default bootc runs in an unshared mount namespace;
     // this sets up our /runto actually be the same as the host/run
     // so the umount (at the end of this function) actually affects the host
@@ -40,7 +41,7 @@ pub(crate) fn reset_soft_reboot() -> Result<()> {
 
     let Some(nextroot) = nextroot else {
         tracing::debug!("Nextroot does not exist");
-        println!("No deployment staged for soft rebooting");
+        prog.info("No deployment staged for soft rebooting");
         return Ok(());
     };
 
@@ -50,13 +51,13 @@ pub(crate) fn reset_soft_reboot() -> Result<()> {
 
     if !nextroot_mounted {
         tracing::debug!("Nextroot is not a mountpoint");
-        println!("No deployment staged for soft rebooting");
+        prog.info("No deployment staged for soft rebooting");
         return Ok(());
     }
 
     unmount(NEXTROOT, UnmountFlags::DETACH).context("Unmounting nextroot")?;
 
-    println!("Cleared soft reboot queued state");
+    prog.info("Cleared soft reboot queued state");
 
     Ok(())
 }
@@ -70,6 +71,7 @@ pub(crate) async fn prepare_soft_reboot_composefs(
     deployment_id: Option<&str>,
     soft_reboot_mode: SoftRebootMode,
     reboot: bool,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     if !systemd_has_soft_reboot() {
         anyhow::bail!("System does not support soft reboots")
@@ -133,7 +135,7 @@ pub(crate) async fn prepare_soft_reboot_composefs(
 
     setup_root(args)?;
 
-    println!("Soft reboot setup complete");
+    prog.info("Soft reboot setup complete");
 
     if reboot {
         // Replacing the current process should be fine as we restart userspace anyway
