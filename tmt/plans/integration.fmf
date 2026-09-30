@@ -331,4 +331,11 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-54-install-composefs-on-ostree:
+  summary: Reject install to-existing-root --composefs-backend on an ostree host
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-54-install-composefs-on-ostree
 # END GENERATED PLANS
