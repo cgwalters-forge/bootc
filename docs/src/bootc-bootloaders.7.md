@@ -18,6 +18,14 @@ NOTE: systemd-boot is only supported for Composefs Backend and not for Ostree
 If bootupd is not present in the input container image, then systemd-boot will be used
 by default (except on s390x).
 
+systemd-boot itself is installed on the ESP. If the disk holding the ESP also has an
+[XBOOTLDR](https://uapi-group.org/specifications/specs/boot_loader_specification/)
+partition formatted as FAT (the only filesystem systemd-boot can read in practice), bootc
+puts the boot entries, kernels and UKIs there instead of on the ESP, as the Boot Loader
+Specification describes. An existing system keeps its entries where they were installed.
+Only the first ESP is used; on systems with several ESPs (for example one per disk of a
+RAID1 root), the others are left alone.
+
 ## s390x
 
 bootc uses `zipl`.

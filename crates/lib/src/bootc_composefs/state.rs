@@ -35,7 +35,7 @@ use crate::{
     composefs_consts::{
         COMPOSEFS_STAGED_DEPLOYMENT_FNAME, COMPOSEFS_TRANSIENT_STATE_DIR, ORIGIN_KEY_BOOT,
         ORIGIN_KEY_BOOT_DIGEST, ORIGIN_KEY_BOOT_TYPE, ORIGIN_KEY_IMAGE, ORIGIN_KEY_MANIFEST_DIGEST,
-        SHARED_VAR_PATH, STATE_DIR_RELATIVE,
+        SHARED_VAR_PATH, STATE_DIR_RELATIVE, TYPE1_ENT_PATH,
     },
     parsers::bls_config::BLSConfig,
     spec::ImageReference,
@@ -65,6 +65,16 @@ pub(crate) fn read_origin(sysroot: &Dir, deployment_id: &str) -> Result<Option<t
 }
 
 pub(crate) fn get_booted_bls(boot_dir: &Dir, booted_cfs: &BootedComposefs) -> Result<BLSConfig> {
+    find_bls_for_digest(boot_dir, &booted_cfs.cmdline.digest)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No boot entry for the booted deployment in {TYPE1_ENT_PATH} (on the XBOOTLDR partition if bootc uses one, otherwise on the ESP)"
+        )
+    })
+}
+
+/// Find the Type #1 entry in `boot_dir` for the deployment with the composefs
+/// digest `digest`.
+pub(crate) fn find_bls_for_digest(boot_dir: &Dir, digest: &str) -> Result<Option<BLSConfig>> {
     let sorted_entries = get_sorted_type1_boot_entries(boot_dir, true)?;
 
     for entry in sorted_entries {
@@ -73,8 +83,8 @@ pub(crate) fn get_booted_bls(boot_dir: &Dir, booted_cfs: &BootedComposefs) -> Re
                 let path = match key {
                     EFIKey::Efi(path) | EFIKey::Uki(path) => path,
                 };
-                if path.as_str().contains(&*booted_cfs.cmdline.digest) {
-                    return Ok(entry);
+                if path.as_str().contains(digest) {
+                    return Ok(Some(entry));
                 }
             }
 
@@ -86,8 +96,8 @@ pub(crate) fn get_booted_bls(boot_dir: &Dir, booted_cfs: &BootedComposefs) -> Re
                 let cfs_cmdline = ComposefsCmdline::find_in_cmdline(&Cmdline::from(opts))?
                     .ok_or_else(|| anyhow::anyhow!("composefs param not found in cmdline"))?;
 
-                if cfs_cmdline.digest == booted_cfs.cmdline.digest {
-                    return Ok(entry);
+                if &*cfs_cmdline.digest == digest {
+                    return Ok(Some(entry));
                 }
             }
 
@@ -95,7 +105,7 @@ pub(crate) fn get_booted_bls(boot_dir: &Dir, booted_cfs: &BootedComposefs) -> Re
         };
     }
 
-    Err(anyhow::anyhow!("Booted BLS not found"))
+    Ok(None)
 }
 
 /// Mounts an EROFS image and copies the pristine /etc and /var to the deployment's /etc and /var.

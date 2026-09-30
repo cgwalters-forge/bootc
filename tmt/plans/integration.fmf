@@ -331,4 +331,13 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-55-composefs-xbootldr:
+  summary: Test composefs with systemd-boot entries on an XBOOTLDR partition
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-55-composefs-xbootldr
+  extra-skip_if_ostree: true
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
