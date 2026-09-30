@@ -39,8 +39,35 @@ use crate::{
     },
     progress_jsonl::ProgressWriter,
     spec::{Host, ImageReference},
+    status::Slot,
     store::{BootedComposefs, ComposefsRepository, Storage},
 };
+
+/// The error for a target image whose fs-verity digest matches the existing
+/// deployment in `slot`, saying what to do instead where there is something.
+fn digest_collision_error(host: &Host, slot: Option<Slot>) -> anyhow::Error {
+    const PREFIX: &str = "Target image has the same fs-verity digest as the existing";
+    match slot {
+        Some(Slot::Rollback) if host.status.rollback_queued => anyhow::anyhow!(
+            "{PREFIX} rollback deployment, which is already queued for the next boot"
+        ),
+        Some(Slot::Rollback) => anyhow::anyhow!(
+            "{PREFIX} rollback deployment; to boot it again, use `bootc rollback` \
+             (or set `spec.bootOrder: rollback` with `bootc edit`)"
+        ),
+        Some(Slot::Booted) if host.status.staged.is_some() => anyhow::anyhow!(
+            "{PREFIX} booted deployment, so there is nothing to stage; \
+             the staged deployment is still queued for the next boot"
+        ),
+        Some(Slot::Booted) => {
+            anyhow::anyhow!("{PREFIX} booted deployment, which is already running")
+        }
+        Some(Slot::Staged) => {
+            anyhow::anyhow!("{PREFIX} staged deployment, which is queued for the next boot")
+        }
+        None => anyhow::anyhow!("{PREFIX} pinned deployment"),
+    }
+}
 
 /// Checks if a container image has been pulled to the local composefs repository.
 ///
@@ -173,10 +200,7 @@ pub(crate) fn validate_update(
             // from different sources can produce identical composefs roots and we
             // cannot safely reuse an existing state directory seeded from a
             // different image.
-            anyhow::bail!(
-                "Target image has the same fs-verity digest as the existing {:?} deployment.",
-                collision.ty,
-            );
+            return Err(digest_collision_error(host, collision.ty));
         }
         // For `bootc upgrade`, matching the booted deployment means nothing to
         // do; matching a non-booted deployment (staged/rollback) means skip.
@@ -300,10 +324,7 @@ pub(crate) async fn do_upgrade(
         .iter()
         .find(|d| d.deployment.verity == id.to_hex())
     {
-        anyhow::bail!(
-            "Target image has the same fs-verity digest as the existing {:?} deployment.",
-            collision.ty,
-        );
+        return Err(digest_collision_error(host, collision.ty));
     }
 
     let Some(entry) = entries.iter().next() else {
@@ -634,4 +655,38 @@ pub(crate) async fn upgrade_composefs(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_digest_collision_error() {
+        let parse = |s: &str| -> Host { serde_yaml::from_str(s).unwrap() };
+        let staged = parse(include_str!("../fixtures/spec-staged-rollback.yaml"));
+        let only_booted = parse(include_str!("../fixtures/spec-only-booted.yaml"));
+        let mut rollback_queued = staged.clone();
+        rollback_queued.status.rollback_queued = true;
+        let cases = [
+            (&staged, Some(Slot::Rollback), "use `bootc rollback`"),
+            (
+                &rollback_queued,
+                Some(Slot::Rollback),
+                "already queued for the next boot",
+            ),
+            (
+                &staged,
+                Some(Slot::Booted),
+                "staged deployment is still queued",
+            ),
+            (&only_booted, Some(Slot::Booted), "already running"),
+            (&staged, Some(Slot::Staged), "queued for the next boot"),
+            (&staged, None, "pinned deployment"),
+        ];
+        for (host, slot, expected) in cases {
+            let msg = digest_collision_error(host, slot).to_string();
+            assert!(msg.contains(expected), "{slot:?}: {msg}");
+        }
+    }
 }
