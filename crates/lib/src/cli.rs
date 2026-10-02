@@ -8,6 +8,7 @@ use std::io::{BufWriter, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -973,6 +974,30 @@ impl InternalsOpts {
     const GENERATOR_BIN: &'static str = "bootc-systemd-generator";
 }
 
+/// Include compiled-in library features in the long version output.
+/// Keep the list in sync with `[features]` in `crates/lib/Cargo.toml`.
+fn long_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let features = [
+            ("install-to-disk", cfg!(feature = "install-to-disk")),
+            ("rhsm", cfg!(feature = "rhsm")),
+            ("selinux", cfg!(feature = "selinux")),
+            ("docgen", cfg!(feature = "docgen")),
+        ]
+        .into_iter()
+        .filter_map(|(name, enabled)| enabled.then_some(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+        let features = if features.is_empty() {
+            "none"
+        } else {
+            &features
+        };
+        format!("{}\nFeatures: {features}", clap::crate_version!())
+    })
+}
+
 /// Deploy and transactionally in-place with bootable container images.
 ///
 /// The `bootc` project currently uses ostree-containers as a backend
@@ -983,7 +1008,7 @@ impl InternalsOpts {
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[clap(name = "bootc")]
 #[clap(rename_all = "kebab-case")]
-#[clap(version,long_version=clap::crate_version!())]
+#[clap(version, long_version = long_version())]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Opt {
     /// Download and queue an updated container image to apply.
@@ -2773,6 +2798,26 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_version_features() {
+        let short = format!("bootc {}\n", clap::crate_version!());
+        let long_prefix = format!("bootc {}\nFeatures: ", clap::crate_version!());
+        for flag in ["--version", "-V"] {
+            let err = Opt::try_parse_from(["bootc", flag]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(!err.use_stderr());
+            let out = err.to_string();
+            if flag == "-V" {
+                assert_eq!(out, short);
+            } else {
+                assert!(out.starts_with(&long_prefix), "{out:?}");
+                // The line must reflect how this binary was built
+                assert_eq!(out.contains("selinux"), cfg!(feature = "selinux"));
+                assert_eq!(out.contains("rhsm"), cfg!(feature = "rhsm"));
+            }
+        }
+    }
 
     #[test]
     fn test_callname() {
