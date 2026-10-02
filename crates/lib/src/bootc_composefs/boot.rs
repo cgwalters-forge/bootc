@@ -2087,13 +2087,15 @@ fn get_secureboot_keys(fs: &Dir, p: &str) -> Result<Option<SecurebootKeys>> {
     }));
 }
 
+/// Deploy the pulled image and set up the bootloader, returning the new
+/// deployment's id and the bootloader that was used.
 #[context("Setting up composefs boot")]
 pub(crate) async fn setup_composefs_boot(
     root_setup: &RootSetup,
     state: &State,
     pull_result: &composefs_oci::PullResult<Sha512HashValue>,
     allow_missing_fsverity: bool,
-) -> Result<()> {
+) -> Result<(String, Bootloader)> {
     const COMPOSEFS_BOOT_SETUP_JOURNAL_ID: &str = "1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5";
 
     tracing::info!(
@@ -2261,7 +2263,7 @@ pub(crate) async fn setup_composefs_boot(
     )
     .await?;
 
-    Ok(())
+    Ok((deploy_id.to_hex(), postfetch.detected_bootloader))
 }
 
 /// Associate every accepted boot image with its EROFS serialization format.
