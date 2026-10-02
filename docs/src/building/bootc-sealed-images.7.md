@@ -52,7 +52,7 @@ which instead makes fs-verity on the root filesystem optional.
 
 ### Build Pattern: Split the Kernel, Then Generate the UKI in a Separate Stage
 
-Building a sealed image involves three stages: build the rootfs, split the kernel and initramfs out of it, and generate the signed UKI from the split rootfs in a tools stage:
+Building a sealed image involves four stages: build the rootfs, split the kernel and initramfs out of it, drop the extracted copy to get the rootfs that gets sealed, and generate the signed UKI for that rootfs in a tools stage:
 
 ```dockerfile
 # Build your rootfs with all packages and configuration
@@ -65,9 +65,15 @@ RUN apt|dnf|zypper install ... && bootc container lint --fatal-warnings
 FROM rootfs as split
 RUN mkdir /kernel && bootc container split-kernel-and-rootfs --rootfs / --output /kernel
 
+# The rootfs to seal: the split rootfs without the extracted /kernel. The
+# UKI embeds the composefs digest of this exact tree, so it must also be
+# the base of the final image.
+FROM split as sealed-rootfs
+RUN rm -rf /kernel
+
 # Generate the sealed UKI in a tools stage
 FROM <tools-image> as sealed-uki
-RUN --mount=type=bind,from=split,target=/target \
+RUN --mount=type=bind,from=sealed-rootfs,target=/target \
     --mount=type=bind,from=split,source=/kernel,target=/kernel \
     --mount=type=secret,id=secureboot_key \
     --mount=type=secret,id=secureboot_cert <<EORUN
@@ -90,16 +96,16 @@ bootc container ukify \
   --secureboot-certificate /run/secrets/secureboot_cert
 EORUN
 
-# Final image: the split rootfs (kernel/initramfs already removed) plus the signed UKI
-FROM split
+# Final image: the rootfs that was sealed plus the signed UKI
+FROM sealed-rootfs
 COPY --from=sealed-uki /out/*.efi /boot/EFI/Linux/
 ```
 
 This pattern works because:
 
-1. `bootc container split-kernel-and-rootfs` removes the raw kernel and initramfs from the rootfs ahead of time, so the final image never carries a duplicate copy of them (they end up embedded in the UKI instead)
+1. `bootc container split-kernel-and-rootfs` moves the raw kernel and initramfs out of the rootfs ahead of time, and the `sealed-rootfs` stage drops that extracted copy, so the deployed root filesystem doesn't carry a second copy of them (they end up embedded in the UKI instead)
 2. `bootc container ukify` handles computing the composefs digest and assembling the kernel command line, so you only need to pass `ukify`-specific options (like signing) after `--`
-3. The final stage copies the signed UKI into the already-split rootfs
+3. The final stage is the same tree the digest was computed from, plus the signed UKI
 
 ### The `bootc container ukify` Command
 
