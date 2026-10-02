@@ -138,6 +138,10 @@ and may change or be removed:
   backend yet, so for now a system has to be reinstalled. We fully intend to
   support moving to composefs without a reinstall; see
   [Future work](#future-work).
+- `bootc-fetch-apply-updates.timer` (see [Upgrades](bootc-upgrades.7.md#the-bootc-upgrade-verb))
+  and `bootc-status-updated.target` only run on ostree systems, so they don't
+  do anything on the composefs backend; see
+  [#2437](https://github.com/bootc-dev/bootc/pull/2437).
 - `--bootloader=none` is not supported.
 - `--soft-reboot=auto` doesn't fall back to a regular reboot when the new
   deployment can't be soft rebooted into; see
