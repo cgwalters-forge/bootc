@@ -1,0 +1,234 @@
+# Reverse dependency testing: run the bootc-operator end-to-end suite
+# (https://github.com/bootc-dev/bootc-operator) against bootc built from
+# this tree.
+#
+# The operator's e2e tests boot Kubernetes nodes as bink
+# (https://github.com/bootc-dev/bink) VMs and drive `bootc switch`/
+# `bootc upgrade` on them. We build RPMs from this tree, layer them onto
+# the bink node image the operator tests with, turn that into a bink disk
+# image (so the PR's bootc also does the install), and then run the
+# operator's own Makefile targets against it.
+#
+# This is slow (roughly 1.5 hours) and depends on another repository, so it
+# is opt-in: add the `ci/operator` label to a PR, or run it manually.
+#
+# Note this is coupled to internals of the operator (its Makefile targets,
+# the `localhost:5000/node:latest` registry convention, BINK_COMMIT in its
+# CI workflow) and of bink (its node-images Makefile). A more robust design
+# would be for the operator to expose its e2e job as a reusable
+# (workflow_call) workflow that takes an RPM artifact.
+name: bootc-operator revdep
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      operator-ref:
+        description: bootc-operator git ref to test
+        default: main
+  schedule:
+    - cron: "30 4 * * 1"  # Weekly, Monday 04:30 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  OPERATOR_REF: ${{ inputs.operator-ref || 'main' }}
+  # The operator tests with Fedora-based bink node images
+  TEST_OS: fedora-44
+  # The node image that ends up containing the bootc under test
+  NODE_IMAGE: localhost:5000/node:latest
+  NODE_DISK_IMAGE: localhost/bink-node-bootc:disk
+
+concurrency:
+  # PR events that the jobs' `if` skips (e.g. adding some other label, or a
+  # push racing with adding the label) get their own group, so they can't
+  # cancel a real run. Keep this condition in sync with the `package` job's.
+  group: >-
+    ${{ github.workflow }}-${{
+      (github.event_name != 'pull_request'
+       || (github.event.action == 'labeled'
+           && github.event.label.name == 'ci/operator'
+           || github.event.action != 'labeled'
+           && contains(github.event.pull_request.labels.*.name, 'ci/operator')))
+      && (github.event.pull_request.number || github.ref)
+      || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    # For PRs: run when the label is added, and on later pushes while it
+    # is present, but not when some other label is added.
+    if: >-
+      (github.event_name == 'schedule' && github.repository_owner == 'bootc-dev')
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request'
+          && (github.event.action == 'labeled'
+              && github.event.label.name == 'ci/operator'
+              || github.event.action != 'labeled'
+              && contains(github.event.pull_request.labels.*.name, 'ci/operator')))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+      - name: Build packages
+        run: |
+          BOOTC_base="$(just pullspec-for-os base "$TEST_OS")"
+          BOOTC_buildroot_base="$(just pullspec-for-os buildroot-base "$TEST_OS")"
+          export BOOTC_base BOOTC_buildroot_base
+          just package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: operator-revdep-packages
+          path: target/packages/*.rpm
+          retention-days: 1
+
+  e2e:
+    needs: package
+    # Match the operator's own CI runner and host setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout bootc-operator
+        uses: actions/checkout@v7
+        with:
+          repository: bootc-dev/bootc-operator
+          ref: ${{ env.OPERATOR_REF }}
+          path: operator
+          persist-credentials: false
+
+      - name: Find operator test inputs
+        working-directory: operator
+        run: |
+          set -euo pipefail
+          # The operator pins the bink it tests with in its CI workflow
+          bink_commit=$(yq -e '.env.BINK_COMMIT' .github/workflows/ci.yaml)
+          kube_minor=$(make -s print-var-DEFAULT_KUBE_MINOR)
+          disk_image=$(make -s print-var-BINK_NODE_DISK_IMAGE)
+          base_image=$(skopeo inspect --format '{{index .Labels "bink.bootc-image"}}' "docker://${disk_image}")
+          {
+            echo "BINK_COMMIT=${bink_commit}"
+            echo "KUBE_MINOR=${kube_minor}"
+            echo "NODE_BASE_IMAGE=${base_image}"
+          } | tee -a "$GITHUB_ENV"
+
+      - name: Checkout bink
+        uses: actions/checkout@v7
+        with:
+          repository: bootc-dev/bink
+          ref: ${{ env.BINK_COMMIT }}
+          path: bink
+          persist-credentials: false
+
+      - name: Free up disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman libgpgme-dev libbtrfs-dev libdevmapper-dev pkg-config
+
+      - name: Set up Go for bink
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: bink/go.mod
+          cache: false
+
+      - name: Build bink
+        run: |
+          make -C bink build-bink
+          sudo install -m 0755 bink/bink /usr/local/bin/bink
+
+      # The following host setup mirrors the operator's e2e job
+      - name: Set up KVM and KSM
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sh -c 'echo 1 > /sys/kernel/mm/ksm/run'
+          sudo sh -c 'echo 5000 > /sys/kernel/mm/ksm/pages_to_scan'
+
+      - name: Configure kernel
+        run: |
+          # The host-loaded passt AppArmor profile blocks passt's
+          # self-sandboxing inside bink node containers.
+          sudo systemctl disable --now apparmor 2>/dev/null || true
+          sudo aa-teardown 2>/dev/null || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Configure podman
+        run: |
+          systemctl --user start podman.socket
+          sudo tee /etc/containers/registries.conf > /dev/null <<'EOF'
+          unqualified-search-registries = ["docker.io"]
+          EOF
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: operator-revdep-packages
+          path: packages
+
+      - name: Build node image with bootc under test
+        run: |
+          set -euo pipefail
+          bink registry start
+          # rpm -F only upgrades installed packages; check it did upgrade bootc
+          cat > packages/Containerfile <<'EOF'
+          ARG base
+          FROM ${base}
+          COPY *.rpm /tmp/rpms/
+          RUN rpm -Fvh --oldpackage /tmp/rpms/*.rpm \
+            && test "$(rpm -q bootc)" = "$(rpm -qp /tmp/rpms/bootc-[0-9]*.rpm)" \
+            && rm -rf /tmp/rpms && bootc --version
+          EOF
+          sudo podman build --build-arg base="${NODE_BASE_IMAGE}" -t "${NODE_IMAGE}" packages
+          # Round-trip through the registry so the local digest matches the
+          # one the nodes will see; the operator e2e tests compare them.
+          sudo podman push --tls-verify=false "${NODE_IMAGE}"
+          sudo podman rmi "${NODE_IMAGE}"
+          sudo podman pull --tls-verify=false "${NODE_IMAGE}"
+          podman pull --tls-verify=false "${NODE_IMAGE}"
+
+      - name: Build node disk image
+        run: |
+          set -euo pipefail
+          sudo make -C bink/node-images/fedora build-disk-image \
+            KUBE_MINOR="${KUBE_MINOR}" BOOTC_IMAGE="${NODE_IMAGE}" NODE_IMAGE="${NODE_DISK_IMAGE}"
+          sudo podman save "${NODE_DISK_IMAGE}" | podman load
+          sudo podman rmi -a -f
+          df -h /
+
+      - name: Set up Go for bootc-operator
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: operator/go.mod
+          cache: false
+
+      - name: Build operator image
+        run: make -C operator buildimg
+
+      # seed-node-image would pull the stock node image; we pushed our own
+      # to the bink registry above instead.
+      - name: Start bink cluster and deploy operator
+        run: make -C operator -o seed-node-image deploy-bink BINK_NODE_DISK_IMAGE="${NODE_DISK_IMAGE}"
+
+      - name: Run e2e tests
+        run: make -C operator e2e V=1 BINK_NODE_DISK_IMAGE="${NODE_DISK_IMAGE}"
+
+      - name: Gather logs
+        if: failure()
+        run: make -C operator gather-bink
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: operator-revdep-logs
+          path: operator/_output/logs/
+          if-no-files-found: ignore
