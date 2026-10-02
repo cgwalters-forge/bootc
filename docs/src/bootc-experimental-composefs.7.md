@@ -92,7 +92,8 @@ the repository it stages into:
 
 The `test-49-composefs-1-16-bridge` TMT test covers installs by 1.16.0 (sealed
 and `--allow-missing-verity` UKIs) and by 1.16.4 (sealed UKI and BLS),
-including rollback and garbage collection. 1.16.3, and 1.16.4-1.16.14
+including rollback and garbage collection (with 1.16.0, also a full GC
+while the V2 deployment is the rollback of a V1 one). 1.16.3, and 1.16.4-1.16.14
 staging on a system installed by 1.16.0-1.16.3, are not tested.
 
 ## Storage and repository structure

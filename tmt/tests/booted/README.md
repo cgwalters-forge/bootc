@@ -75,8 +75,17 @@ and expects the stager's format after the switch and after the rollback,
 and V1 after the upgrade. On UKIs it also checks the dual-format arguments,
 including the `?` marker in the unsealed case; on BLS, that the booted digest
 is on the kernel command line. `/etc` and `/var` sentinels must survive
-throughout. Rollback and `composefs-gc --assert-no-op` run only with current
-bootc; no old 1.16 rollback or GC command is assumed.
+throughout. Rollback and GC run only with current bootc; no old 1.16
+rollback or GC command is assumed.
+
+Before rolling back, with the upgrade (V1) booted and the stager's deployment
+as the rollback (V2 with 1.16.0), the test runs a full
+`composefs-gc --prune-repo`, the GC upgrades run, and checks that it kept
+the rollback's boot entry, deployment state and EROFS image, and that
+`cfsctl fsck` (every image's objects) and `cfsctl oci fsck` of the rollback's
+bootc tag (its manifest, config and layers) pass. The rollback that follows
+proves it still boots. After it, `composefs-gc --prune-repo --assert-no-op`
+must find nothing to collect.
 
 This intentionally does not cover stale initramfs or old-initramfs-mode. The
 test is disabled by default in the plan, so the regular test-integration

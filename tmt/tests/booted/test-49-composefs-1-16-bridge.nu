@@ -216,6 +216,9 @@ def stage [image: string, save_as: string] {
 
 const BRIDGE_IDENTITY = "/var/composefs-bridge-identity"
 const UPGRADE_IDENTITY = "/var/composefs-bridge-upgrade-identity"
+# bootc tags each deployment's manifest in the composefs repository as this
+# prefix plus the manifest digest (BOOTC_TAG_PREFIX).
+const BOOTC_TAG_PREFIX = "localhost/bootc-"
 
 def old_stager_boot0 [] {
     tap begin $"bootc (stager-version) stager to current bridge \((bridge-mode)\)"
@@ -239,12 +242,40 @@ def old_stager_boot1 [] {
     tmt-reboot
 }
 
+# With the upgrade booted, the bridge deployment is the rollback, and with
+# the 1.16.0 stager it boots from a V2 image while the booted deployment and
+# every image current bootc writes are V1.  A full GC (which upgrades also
+# run) must keep everything the rollback needs: its EROFS image, the objects
+# that image references, its deployment state and boot entry, and the OCI
+# metadata under its bootc tag.  The rollback in the next boot then proves
+# it still boots.
+def assert-gc-keeps-rollback [] {
+    let bridge = (open $BRIDGE_IDENTITY | str trim)
+    let before = (bootc status --json | from json).status.rollback
+    assert equal $before.composefs.verity $bridge "the bridge deployment must be the rollback"
+    assert equal (image-format $bridge) (stager-format) "rollback image has the wrong EROFS format"
+    let tag = $"($BOOTC_TAG_PREFIX)($before.image.imageDigest)"
+
+    bootc internals composefs-gc --prune-repo
+
+    let after = (bootc status --json | from json).status.rollback
+    assert equal $after.composefs.verity $bridge "GC must keep the rollback boot entry"
+    assert ($"/sysroot/composefs/images/($bridge)" | path exists) "GC must keep the rollback EROFS image"
+    assert equal (image-format $bridge) (stager-format) "rollback image has the wrong EROFS format after GC"
+    assert ($"/sysroot/state/deploy/($bridge)" | path exists) "GC must keep the rollback deployment state"
+    # Checks that every image's objects are still present.
+    bootc internals cfs --system fsck --metadata-only
+    # Checks the rollback's manifest, config and layers.
+    bootc internals cfs --system oci fsck $tag
+}
+
 def old_stager_boot2 [] {
     assert-booted-image (upgrade-image)
     assert-current-bootc
     let selected = assert-selected-format v1
     assert equal $selected (open $UPGRADE_IDENTITY | str trim)
     assert-sentinels
+    assert-gc-keeps-rollback
     bootc rollback
     assert equal ((bootc status --json | from json).status.rollbackQueued) true
     tmt-reboot
@@ -256,7 +287,8 @@ def old_stager_boot3 [] {
     assert equal $selected (open $BRIDGE_IDENTITY | str trim)
     assert-sentinels
     assert equal ((bootc status --json | from json).status.rollbackQueued) false
-    bootc internals composefs-gc --assert-no-op
+    # Without --prune-repo, GC only looks at boot binaries.
+    bootc internals composefs-gc --prune-repo --assert-no-op
     tap ok
 }
 
