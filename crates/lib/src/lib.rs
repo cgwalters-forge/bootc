@@ -18,6 +18,8 @@
 //! (`crates/cli`) is a thin wrapper that delegates to [`cli::run_from_iter`].
 //!
 //! The API is internal and not stable for external consumption.
+//! [`install_api`] is an experimental interface for installer applications,
+//! exposed to gather feedback.
 //!
 //! # Module Index
 //!
@@ -28,6 +30,7 @@
 //! - [`store`] - Storage backend abstraction (OSTree and Composefs)
 //! - [`spec`] - Core types: [`spec::Host`], [`spec::HostSpec`], [`spec::BootEntry`]
 //! - [`install`] - System installation (`bootc install to-disk`)
+//! - [`install_api`] - Experimental library interface for installer applications
 //! - [`status`] - Status reporting (`bootc status`)
 //!
 //! ## Container and Image Handling
@@ -78,6 +81,7 @@ pub(crate) mod generator;
 mod glyph;
 mod image;
 mod install;
+pub use install::api as install_api;
 pub(crate) mod journal;
 mod k8sapitypes;
 mod kernel;

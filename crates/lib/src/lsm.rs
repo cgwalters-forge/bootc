@@ -73,7 +73,7 @@ fn get_current_security_context() -> Result<String> {
 /// gated under `mac_admin` (admin control over SELinux state), and in the Fedora
 /// policy at least it's part of `install_t`.
 #[context("Testing install_t")]
-fn test_install_t() -> Result<bool> {
+pub(crate) fn test_install_t() -> Result<bool> {
     let tmpf = tempfile::NamedTempFile::new()?;
     // Our implementation here writes a label which is always unknown to the current policy
     // to verify that we have the capability to do so.

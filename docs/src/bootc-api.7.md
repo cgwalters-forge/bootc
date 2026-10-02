@@ -28,3 +28,13 @@ the Rust source code available here: [host-v1.schema.json](host-v1.schema.json).
 A common way to use this is to run a code generator such as
 [go-jsonschema](https://github.com/omissis/go-jsonschema) on the
 input schema.
+
+## Installing from Rust (experimental)
+
+Installers written in Rust can drive `bootc install to-filesystem` as a
+library through the `install_api` module of the `bootc-lib` crate (not
+published on crates.io; use a git dependency). It reports progress to a
+callback, returns the deployment's paths (e.g. its `/etc` and `/var`), and
+returns typed errors. This interface is experimental and may change in any
+release; see [bootc#542](https://github.com/bootc-dev/bootc/issues/542).
+The `install-to-loopback` example in `crates/lib/examples` shows its use.
