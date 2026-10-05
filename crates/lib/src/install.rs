@@ -1213,49 +1213,12 @@ async fn install_container(
         sysroot.repo().reload_config(None::<&gio::Cancellable>)?;
     }
 
-    // Keep this in sync with install/completion.rs for the Anaconda fixups
-    let install_config_kargs = state.install_config.as_ref().and_then(|c| c.kargs.as_ref());
-    let install_config_karg_deletes = state
-        .install_config
-        .as_ref()
-        .and_then(|c| c.karg_deletes.as_ref());
-
-    // Final kargs, in order:
-    // - root filesystem kargs
-    // - install config kargs
-    // - kargs.d from container image
-    // - args specified on the CLI
-    let mut kargs = Cmdline::new();
-    let mut karg_deletes = Vec::<&str>::new();
-
-    kargs.extend(&root_setup.kargs);
-
-    if let Some(install_config_kargs) = install_config_kargs {
-        for karg in install_config_kargs {
-            kargs.extend(&Cmdline::from(karg.as_str()));
-        }
-    }
-
-    kargs.extend(&kargsd);
-
-    // delete kargs before processing cli kargs, so cli kargs can override all other configs
-    if let Some(install_config_karg_deletes) = install_config_karg_deletes {
-        for karg_delete in install_config_karg_deletes {
-            karg_deletes.push(karg_delete);
-        }
-    }
-    if let Some(deletes) = state.config_opts.karg_delete.as_ref() {
-        for karg_delete in deletes {
-            karg_deletes.push(karg_delete);
-        }
-    }
-    delete_kargs(&mut kargs, &karg_deletes);
-
-    if let Some(cli_kargs) = state.config_opts.karg.as_ref() {
-        for karg in cli_kargs {
-            kargs.extend(karg);
-        }
-    }
+    let kargs = compute_install_kargs(
+        &root_setup.kargs,
+        state.install_config.as_ref(),
+        &kargsd,
+        &state.config_opts,
+    );
 
     // Finally map into &[&str] for ostree_container
     let kargs_strs: Vec<&str> = kargs.iter_str().collect();
@@ -1334,6 +1297,41 @@ async fn install_container(
         &state.selinux_state,
     )?;
     Ok((deployment, aleph))
+}
+
+/// Combine root, install configuration, and image kargs, apply deletions, then
+/// append CLI kargs so they can override deletions from any source.
+pub(crate) fn compute_install_kargs(
+    root_kargs: &Cmdline,
+    install_config: Option<&config::InstallConfiguration>,
+    image_kargs: &Cmdline,
+    config_opts: &InstallConfigOpts,
+) -> CmdlineOwned {
+    // Keep this in sync with install/completion.rs for the Anaconda fixups.
+    let mut kargs = Cmdline::new();
+    kargs.extend(root_kargs);
+    if let Some(config_kargs) = install_config.and_then(|c| c.kargs.as_ref()) {
+        for karg in config_kargs {
+            kargs.extend(&Cmdline::from(karg.as_str()));
+        }
+    }
+    kargs.extend(image_kargs);
+
+    let deletes: Vec<&str> = install_config
+        .and_then(|c| c.karg_deletes.as_ref())
+        .into_iter()
+        .flatten()
+        .chain(config_opts.karg_delete.iter().flatten())
+        .map(String::as_str)
+        .collect();
+    delete_kargs(&mut kargs, &deletes);
+
+    if let Some(cli_kargs) = &config_opts.karg {
+        for karg in cli_kargs {
+            kargs.extend(karg);
+        }
+    }
+    kargs
 }
 
 pub(crate) fn delete_kargs(existing: &mut Cmdline, deletes: &Vec<&str>) {
@@ -3130,6 +3128,66 @@ pub(crate) async fn install_finalize(target: &Utf8Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_install_kargs() {
+        // Config additions, config deletes, CLI deletes, CLI additions, expected.
+        let cases: &[(Option<&str>, &[&str], &[&str], &str, &str)] = &[
+            (
+                None,
+                &[],
+                &[],
+                "",
+                "root=UUID=test rw image=1 foo=one foo=two",
+            ),
+            (
+                Some("config=1 quiet"),
+                &[],
+                &[],
+                "cli=1",
+                "root=UUID=test rw config=1 quiet image=1 foo=one foo=two cli=1",
+            ),
+            (
+                Some("config=1"),
+                &["config=1", "foo=one"],
+                &[],
+                "",
+                "root=UUID=test rw image=1 foo=two",
+            ),
+            (
+                None,
+                &[],
+                &["foo", "absent"],
+                "",
+                "root=UUID=test rw image=1",
+            ),
+            (
+                Some("config=1"),
+                &["foo", "rw"],
+                &["config", "image=1"],
+                "foo=cli image=1",
+                "root=UUID=test foo=cli image=1",
+            ),
+        ];
+        for &(config_kargs, config_deletes, cli_deletes, cli_kargs, expected) in cases {
+            let install_config = config_kargs.map(|kargs| config::InstallConfiguration {
+                kargs: Some(vec![kargs.into()]),
+                karg_deletes: Some(config_deletes.iter().map(|s| (*s).into()).collect()),
+                ..Default::default()
+            });
+            let mut opts: InstallConfigOpts =
+                serde_json::from_value(serde_json::json!({})).unwrap();
+            opts.karg_delete = Some(cli_deletes.iter().map(|s| (*s).into()).collect());
+            opts.karg = Some(vec![Cmdline::from(cli_kargs)]);
+            let kargs = compute_install_kargs(
+                &Cmdline::from("root=UUID=test rw"),
+                install_config.as_ref(),
+                &Cmdline::from("image=1 foo=one foo=two"),
+                &opts,
+            );
+            assert_eq!(kargs.to_string(), expected);
+        }
+    }
 
     #[test]
     fn test_composefs_opts_validate() {
