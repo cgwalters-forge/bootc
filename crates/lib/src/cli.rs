@@ -911,6 +911,10 @@ pub(crate) enum BlockdevOpts {
     LsFilesystem {
         /// Filesystem path (e.g. /sysroot)
         path: Utf8PathBuf,
+        /// Print `null` instead of failing when the filesystem is not
+        /// backed by a block device (e.g. tmpfs, overlayfs, virtiofs).
+        #[clap(long)]
+        optional: bool,
     },
 }
 
@@ -2668,10 +2672,15 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             }
             InternalsOpts::Blockdev(opts) => {
                 let dev = match opts {
-                    BlockdevOpts::Ls { device } => crate::blockdev::list_dev(&device)?,
-                    BlockdevOpts::LsFilesystem { path } => {
-                        let dir = Dir::open_ambient_dir(&path, cap_std::ambient_authority())?;
-                        crate::blockdev::list_dev_by_dir(&dir)?
+                    BlockdevOpts::Ls { device } => Some(crate::blockdev::list_dev(&device)?),
+                    BlockdevOpts::LsFilesystem { path, optional } => {
+                        let dir = Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+                            .with_context(|| format!("Opening {path}"))?;
+                        if optional {
+                            crate::blockdev::list_dev_by_dir_optional(&dir)?
+                        } else {
+                            Some(crate::blockdev::list_dev_by_dir(&dir)?)
+                        }
                     }
                 };
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &dev)?;
