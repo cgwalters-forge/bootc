@@ -235,14 +235,28 @@ impl Display for SealState {
     }
 }
 
+/// VM provisioning path for local tmt runs.
+#[derive(Debug, Default, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum TmtProvision {
+    #[default]
+    Bcvk,
+    /// Stock Fedora/CentOS Stream guest, then in-place reinstall (tmt >= 1.79
+    /// with provision-virtual, libvirt and QEMU; ostree/BLS only)
+    Reinstall,
+}
+
 /// Arguments for run-tmt command.
 ///
 /// The composefs-related fields can be set via CLI flags or via the standard
-/// `BOOTC_*` environment variables used by the Justfile.  `BOOTC_variant=composefs`
+/// `BOOTC_*` environment variables used by the Justfile. `BOOTC_variant=composefs`
 /// selects the composefs plans, but doesn't pass `--composefs-backend` to bcvk:
 /// those test images select the composefs backend themselves.
 #[derive(Debug, Args)]
 pub(crate) struct RunTmtArgs {
+    /// Boot the image directly, or reinstall it onto a stock testcloud guest
+    #[arg(long, value_enum, default_value = "bcvk")]
+    pub(crate) provision: TmtProvision,
+
     /// Image name (e.g., "localhost/bootc")
     pub(crate) image: String,
 

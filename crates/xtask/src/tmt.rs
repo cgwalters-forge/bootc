@@ -40,7 +40,7 @@ const DISTRO_CENTOS_9: &str = "centos-9";
 
 // Import the argument types from xtask.rs
 use crate::bcvk::BcvkInstallOpts;
-use crate::{RunTmtArgs, SealState, TmtProvisionArgs, out_of_sync_error};
+use crate::{RunTmtArgs, SealState, TmtProvision, TmtProvisionArgs, out_of_sync_error};
 
 /// Generate a random alphanumeric suffix for VM names
 fn generate_random_suffix() -> String {
@@ -83,14 +83,36 @@ fn boot_context(boot_type: &crate::BootType, seal_state: Option<&SealState>) -> 
 
 /// Check that required dependencies are available
 #[context("Checking dependencies")]
-fn check_dependencies(sh: &Shell) -> Result<()> {
-    for tool in ["bcvk", "tmt", "rsync", "podman"] {
+fn check_dependencies(sh: &Shell, provision: TmtProvision) -> Result<()> {
+    let tools = ["tmt", "rsync", "podman"];
+    for tool in tools
+        .into_iter()
+        .chain((provision == TmtProvision::Bcvk).then_some("bcvk"))
+    {
         cmd!(sh, "which {tool}")
             .ignore_stdout()
             .run()
             .with_context(|| format!("{} is not available in PATH", tool))?;
     }
     Ok(())
+}
+
+fn cloud_image(distro: &str) -> Result<String> {
+    if let Some(version) = distro.strip_prefix("centos-") {
+        return Ok(format!("centos-stream-{version}"));
+    }
+    if distro.starts_with("fedora-") {
+        return Ok(distro.to_string());
+    }
+    anyhow::bail!("Reinstall provisioning supports Fedora and CentOS Stream, not {distro}")
+}
+
+fn reinstall_rpm(name: &str, package: &str) -> bool {
+    name.strip_prefix(package)
+        .and_then(|s| s.strip_prefix('-'))
+        .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        && name.ends_with(".rpm")
+        && !name.ends_with(".src.rpm")
 }
 
 /// Detect distro from container image by reading os-release
@@ -365,12 +387,23 @@ fn parse_plan_metadata(
     Ok(plan_metadata)
 }
 
-/// Run TMT tests using bcvk for VM management
+/// Run TMT tests using bcvk or testcloud with in-place reprovisioning.
 /// This spawns a separate VM per test plan to avoid state leakage between tests.
 #[context("Running TMT tests")]
 pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     // Check dependencies first
-    check_dependencies(sh)?;
+    check_dependencies(sh, args.provision)?;
+
+    let reinstall = args.provision == TmtProvision::Reinstall;
+    if reinstall
+        && (args.composefs
+            || !matches!(args.boot_type, crate::BootType::Bls)
+            || !args.karg.is_empty())
+    {
+        anyhow::bail!(
+            "Reinstall provisioning currently supports ostree/BLS images without custom kernel arguments"
+        );
+    }
 
     let image = &args.image;
     let filter_args = &args.filters;
@@ -380,12 +413,25 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     // Detect VARIANT_ID from the image
     // As this can not be empty value in context, use "unknown" instead
     let variant_id = detect_variantid_from_image(sh, image)?.unwrap_or("unknown".to_string());
+    let cloud_image = if reinstall {
+        if variant_id == "coreos" {
+            anyhow::bail!(
+                "Reinstall provisioning requires a package-based cloud image, not CoreOS"
+            );
+        }
+        Some(cloud_image(&distro)?)
+    } else {
+        None
+    };
+    let running_env = if reinstall { "reinstall" } else { "image_mode" };
 
     let context = args
         .context
         .iter()
         .map(|v| format!("--context={}", v))
-        .chain(std::iter::once(format!("--context=running_env=image_mode")))
+        .chain(std::iter::once(format!(
+            "--context=running_env={running_env}"
+        )))
         .chain(std::iter::once(format!("--context=distro={}", distro)))
         .chain(std::iter::once(format!(
             "--context=VARIANT_ID={variant_id}"
@@ -394,7 +440,10 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         .collect::<Vec<_>>();
     let preserve_vm = args.preserve_vm;
 
-    println!("Using bcvk image: {}", image);
+    println!(
+        "Using {:?} provisioning for image: {}",
+        args.provision, image
+    );
     println!("Detected distro: {}", distro);
     println!("Detected VARIANT_ID: {variant_id}");
 
@@ -418,6 +467,42 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     cmd!(sh, "rsync -a --delete --force .fmf tmt {workdir}/")
         .run()
         .with_context(|| format!("Copying tmt files to {}", workdir))?;
+
+    // Do not transfer a stale reinstall payload on subsequent bcvk runs.
+    let payload = workdir.join("reinstall");
+    sh.remove_path(&payload)?;
+    if reinstall {
+        sh.create_dir(payload.join("packages"))?;
+        let mut packages = std::collections::HashSet::new();
+        for entry in
+            std::fs::read_dir("target/packages").context("Reading RPMs; run just package first")?
+        {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            for package in ["bootc", "system-reinstall-bootc"] {
+                if reinstall_rpm(name, package) {
+                    std::fs::copy(&path, payload.join("packages").join(name))?;
+                    packages.insert(package);
+                }
+            }
+        }
+        anyhow::ensure!(
+            packages.len() == 2,
+            "Missing bootc or system-reinstall-bootc RPM; run just package first"
+        );
+        cmd!(sh, "podman save -q -o {payload}/bootc.tar {image}").run()?;
+        sh.copy_file(
+            "hack/provision-reinstall-local.sh",
+            payload.join("provision.sh"),
+        )?;
+        sh.copy_file(
+            "hack/system-reinstall-bootc.exp",
+            payload.join("system-reinstall-bootc.exp"),
+        )?;
+    }
 
     // Workaround for https://github.com/bootc-dev/bcvk/issues/174
     // Save the container image to tar, this will be synced to tested OS
@@ -517,11 +602,12 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
     // Probe whether this bcvk supports --log-dir (added in bcvk 0.17).
     // Older installs silently lack it; we skip the flag rather than hard-failing.
-    let bcvk_has_log_dir = cmd!(sh, "bcvk libvirt run --help")
-        .ignore_stderr()
-        .read()
-        .map(|help| help.contains("--log-dir"))
-        .unwrap_or(false);
+    let bcvk_has_log_dir = !reinstall
+        && cmd!(sh, "bcvk libvirt run --help")
+            .ignore_stderr()
+            .read()
+            .map(|help| help.contains("--log-dir"))
+            .unwrap_or(false);
 
     // Generate a random suffix for VM names
     let random_suffix = generate_random_suffix();
@@ -545,6 +631,38 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
         // Reset plan-specific environment variables
         tmt_env_vars.clear();
+
+        if let Some(cloud_image) = &cloud_image {
+            let context = context.clone();
+            let env = [
+                "TMT_SCRIPTS_DIR=/var/lib/tmt/scripts".to_string(),
+                format!("BOOTC_REINSTALL_IMAGE={image}"),
+            ]
+            .into_iter()
+            .chain(args.env.iter().cloned())
+            .flat_map(|v| ["--environment".to_string(), v]);
+            // Stop before guest cleanup when preserving a testcloud guest.
+            let steps = if preserve_vm {
+                vec!["--until", "report"]
+            } else {
+                vec!["--all"]
+            };
+            let result = cmd!(sh, "tmt {context...} run --id {vm_name} {steps...} {env...} provision --how=virtual --image {cloud_image} --memory=4096 plan --name {plan}").run();
+            match result {
+                Ok(()) => test_results.push((plan.to_string(), true, Some(vm_name.clone()))),
+                Err(e) => {
+                    eprintln!("Plan {plan} failed: {e:#}");
+                    all_passed = false;
+                    test_results.push((plan.to_string(), false, Some(vm_name.clone())));
+                }
+            }
+            if preserve_vm {
+                println!(
+                    "Guest preserved: tmt run -i {vm_name} login; cleanup: tmt run -i {vm_name} cleanup"
+                );
+            }
+            continue;
+        }
 
         // Get bcvk-opts based on plan metadata and distro support
         let plan_bcvk_opts = {
@@ -1432,6 +1550,39 @@ fn generate_integration() -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reinstall_rpm() {
+        for (name, package, expected) in [
+            ("bootc-1.17.1-1.fc44.x86_64.rpm", "bootc", true),
+            (
+                "system-reinstall-bootc-1.17.1-1.fc44.x86_64.rpm",
+                "system-reinstall-bootc",
+                true,
+            ),
+            ("bootc-debuginfo-1.17.1-1.fc44.x86_64.rpm", "bootc", false),
+            ("bootc-1.17.1-1.fc44.src.rpm", "bootc", false),
+            (
+                "system-reinstall-bootc-1.17.1-1.fc44.x86_64.rpm",
+                "bootc",
+                false,
+            ),
+        ] {
+            assert_eq!(reinstall_rpm(name, package), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_cloud_image() {
+        for (distro, expected) in [
+            ("centos-9", "centos-stream-9"),
+            ("centos-10", "centos-stream-10"),
+            ("fedora-44", "fedora-44"),
+        ] {
+            assert_eq!(super::cloud_image(distro).unwrap(), expected);
+        }
+        assert!(super::cloud_image("rhel-10.0").is_err());
+    }
 
     #[test]
     fn test_boot_context_values() {

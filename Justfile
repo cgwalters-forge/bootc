@@ -192,6 +192,11 @@ test-tmt *ARGS: build
     @just _build-upgrade-image
     @just test-tmt-nobuild {{ARGS}}
 
+# Boot a stock cloud guest and reinstall in place (ostree readonly reproducer).
+[group('core')]
+test-tmt-reinstall *ARGS: build
+    @just test-tmt-nobuild --provision=reinstall {{ARGS}}
+
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
 # CI runs this once per OS (in the `package` job) instead of once per test-integration
