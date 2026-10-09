@@ -193,6 +193,11 @@ test-tmt *ARGS: build
     @just _build-upgrade-image
     @just test-tmt-nobuild {{ARGS}}
 
+# Boot a stock cloud guest and reinstall in place (ostree readonly reproducer).
+[group('core')]
+test-tmt-reinstall *ARGS: build
+    @just test-tmt-nobuild --provision=reinstall {{ARGS}}
+
 [group('testing')]
 build-ukiboot-test-image: build
     podman build {{_nocache_arg}} --build-arg=base={{base_img}} -f tmt/tests/Dockerfile.ukiboot -t {{ukiboot_img}}:v1 .

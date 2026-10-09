@@ -31,14 +31,26 @@ prepare:
       # Work around https://github.com/bootc-dev/bootc/issues/1896
       - cd bootc && rpm2cpio *.src.rpm > pkg.cpio && cpio -idmv < pkg.cpio && rm pkg.cpio && rm -f *-vendor.tar.zstd && zstd -d *.tar.zstd && tar -xvf *.tar -C . --strip-components=1 && ls -al
       - pwd && ls -al && cd bootc/hack && ./provision-packit.sh
-    when: running_env != image_mode
+    when: running_env != image_mode and running_env != reinstall
+  - how: shell
+    order: 98
+    script:
+      - bash reinstall/provision.sh
+    when: running_env == reinstall
+  - how: shell
+    order: 99
+    script:
+      # Prepare shell re-runs this script after reboot (tmt >= 1.79).
+      - if [ "${TMT_REBOOT_COUNT:-0}" = 0 ]; then tmt-reboot; fi
+    when: running_env == reinstall
+  # Keep the existing Testing Farm reboot mechanism.
   # tmt-reboot and reboot do not work in this case
   # reboot in ansible is the only way to reboot in tmt prepare
   - how: ansible
     order: 99
     playbook:
       - https://github.com/bootc-dev/bootc/raw/refs/heads/main/hack/packit-reboot.yml
-    when: running_env != image_mode
+    when: running_env != image_mode and running_env != reinstall
 execute:
   how: tmt
 
