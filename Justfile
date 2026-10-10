@@ -197,6 +197,13 @@ test-tmt *ARGS: build
 test-tmt-reinstall *ARGS: build
     @just test-tmt-nobuild --provision=reinstall {{ARGS}}
 
+# Run the readonly tests via bcvk and then via in-place reinstall, with one
+# summary. The reinstall path is ostree-only, so composefs runs just bcvk.
+[group('core')]
+test-tmt-readonly *ARGS: build
+    @just _build-upgrade-image
+    @just test-tmt-nobuild --provision={{ if variant == "ostree" { "bcvk,reinstall" } else { "bcvk" } }} readonly {{ARGS}}
+
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
 # CI runs this once per OS (in the `package` job) instead of once per test-integration

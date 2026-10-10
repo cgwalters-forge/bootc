@@ -387,15 +387,28 @@ fn parse_plan_metadata(
     Ok(plan_metadata)
 }
 
+/// The outcome of one plan: its name, whether it passed, and its tmt run ID.
+type PlanResult = (String, bool, Option<String>);
+
 /// Run TMT tests using bcvk or testcloud with in-place reprovisioning.
 /// This spawns a separate VM per test plan to avoid state leakage between tests.
+/// With several provisioning paths, the plans run through each in turn and
+/// one summary covers all of them.
 #[context("Running TMT tests")]
 pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
-    // Check dependencies first
-    check_dependencies(sh, args.provision)?;
+    let mut provisions: Vec<TmtProvision> = Vec::new();
+    for &provision in &args.provision {
+        if !provisions.contains(&provision) {
+            provisions.push(provision);
+        }
+    }
+    let multiple = provisions.len() > 1;
 
-    let reinstall = args.provision == TmtProvision::Reinstall;
-    if reinstall
+    // Check every path's prerequisites before running any of them
+    for &provision in &provisions {
+        check_dependencies(sh, provision)?;
+    }
+    if provisions.contains(&TmtProvision::Reinstall)
         && (args.composefs
             || !matches!(args.boot_type, crate::BootType::Bls)
             || !args.karg.is_empty())
@@ -405,6 +418,94 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         );
     }
 
+    let mut test_results: Vec<PlanResult> = Vec::new();
+    for &provision in &provisions {
+        match run_tmt_provision(sh, args, provision) {
+            Ok(results) if multiple => test_results.extend(
+                results
+                    .into_iter()
+                    .map(|(plan, passed, id)| (format!("{plan} ({provision})"), passed, id)),
+            ),
+            Ok(results) => test_results.extend(results),
+            // Still run (and report) the other paths
+            Err(e) if multiple => {
+                eprintln!("{provision} provisioning failed: {e:#}");
+                test_results.push((format!("{provision} provisioning"), false, None));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // `tmt run -i <id> report` loads the plans from the copied tree
+    let _dir = sh.push_dir("target/tmt-workdir");
+
+    // Print summary
+    println!("\n========================================");
+    println!("Test Summary");
+    println!("========================================");
+    for (plan, passed, _) in &test_results {
+        let status = if *passed { "PASSED" } else { "FAILED" };
+        println!("{}: {}", plan, status);
+    }
+    println!("========================================\n");
+
+    // Print detailed error reports for failed tests
+    let failed_tests: Vec<_> = test_results
+        .iter()
+        .filter(|(_, passed, _)| !passed)
+        .collect();
+
+    if !failed_tests.is_empty() {
+        println!("\n========================================");
+        println!("Detailed Error Reports");
+        println!("========================================\n");
+
+        for (plan, _, run_id) in failed_tests {
+            println!("----------------------------------------");
+            println!("Plan: {}", plan);
+            println!("----------------------------------------");
+
+            if let Some(id) = run_id {
+                println!("Run ID: {}\n", id);
+
+                // Run tmt with the specific run ID and generate verbose report
+                let report_result = cmd!(sh, "tmt run -i {id} report -vvv")
+                    .ignore_status()
+                    .run();
+
+                match report_result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to generate detailed report for {}: {:#}",
+                            plan, e
+                        );
+                    }
+                }
+            } else {
+                println!("Run ID not available - cannot generate detailed report");
+            }
+
+            println!("\n");
+        }
+
+        println!("========================================\n");
+    }
+
+    if test_results.iter().any(|(_, passed, _)| !passed) {
+        anyhow::bail!("Some test plans failed");
+    }
+
+    Ok(())
+}
+
+/// Run the plans through one provisioning path, returning their results.
+fn run_tmt_provision(
+    sh: &Shell,
+    args: &RunTmtArgs,
+    provision: TmtProvision,
+) -> Result<Vec<PlanResult>> {
+    let reinstall = provision == TmtProvision::Reinstall;
     let image = &args.image;
     let filter_args = &args.filters;
 
@@ -440,10 +541,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         .collect::<Vec<_>>();
     let preserve_vm = args.preserve_vm;
 
-    println!(
-        "Using {:?} provisioning for image: {}",
-        args.provision, image
-    );
+    println!("Using {:?} provisioning for image: {}", provision, image);
     println!("Detected distro: {}", distro);
     println!("Detected VARIANT_ID: {variant_id}");
 
@@ -584,7 +682,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
     if plans.is_empty() {
         println!("No test plans found");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     println!("Found {} test plan(s): {:?}", plans.len(), plans);
@@ -612,9 +710,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     // Generate a random suffix for VM names
     let random_suffix = generate_random_suffix();
 
-    // Track overall success/failure
-    let mut all_passed = true;
-    let mut test_results: Vec<(String, bool, Option<String>)> = Vec::new();
+    let mut test_results: Vec<PlanResult> = Vec::new();
 
     // Environment variables to pass to tmt (in addition to args.env)
     let mut tmt_env_vars = Vec::new();
@@ -652,7 +748,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
                 Ok(()) => test_results.push((plan.to_string(), true, Some(vm_name.clone()))),
                 Err(e) => {
                     eprintln!("Plan {plan} failed: {e:#}");
-                    all_passed = false;
                     test_results.push((plan.to_string(), false, Some(vm_name.clone())));
                 }
             }
@@ -771,7 +866,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             Err(e) => {
                 eprintln!("Failed to get VM info for plan {}: {:#}", plan, e);
                 cleanup_vm();
-                all_passed = false;
                 test_results.push((plan.to_string(), false, None));
                 continue;
             }
@@ -787,7 +881,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             Err(e) => {
                 eprintln!("Failed to create SSH key file for plan {}: {:#}", plan, e);
                 cleanup_vm();
-                all_passed = false;
                 test_results.push((plan.to_string(), false, None));
                 continue;
             }
@@ -801,7 +894,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             Err(e) => {
                 eprintln!("Failed to convert key path for plan {}: {:#}", plan, e);
                 cleanup_vm();
-                all_passed = false;
                 test_results.push((plan.to_string(), false, None));
                 continue;
             }
@@ -810,7 +902,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         if let Err(e) = std::fs::write(&key_path, ssh_key) {
             eprintln!("Failed to write SSH key for plan {}: {:#}", plan, e);
             cleanup_vm();
-            all_passed = false;
             test_results.push((plan.to_string(), false, None));
             continue;
         }
@@ -822,7 +913,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             if let Err(e) = std::fs::set_permissions(&key_path, perms) {
                 eprintln!("Failed to set key permissions for plan {}: {:#}", plan, e);
                 cleanup_vm();
-                all_passed = false;
                 test_results.push((plan.to_string(), false, None));
                 continue;
             }
@@ -839,7 +929,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
                 );
             }
             cleanup_vm();
-            all_passed = false;
             test_results.push((plan.to_string(), false, None));
             continue;
         }
@@ -884,7 +973,6 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             }
             Err(e) => {
                 eprintln!("Plan {} failed: {:#}", plan, e);
-                all_passed = false;
                 test_results.push((plan.to_string(), false, Some(run_id)));
             }
         }
@@ -914,64 +1002,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         }
     }
 
-    // Print summary
-    println!("\n========================================");
-    println!("Test Summary");
-    println!("========================================");
-    for (plan, passed, _) in &test_results {
-        let status = if *passed { "PASSED" } else { "FAILED" };
-        println!("{}: {}", plan, status);
-    }
-    println!("========================================\n");
-
-    // Print detailed error reports for failed tests
-    let failed_tests: Vec<_> = test_results
-        .iter()
-        .filter(|(_, passed, _)| !passed)
-        .collect();
-
-    if !failed_tests.is_empty() {
-        println!("\n========================================");
-        println!("Detailed Error Reports");
-        println!("========================================\n");
-
-        for (plan, _, run_id) in failed_tests {
-            println!("----------------------------------------");
-            println!("Plan: {}", plan);
-            println!("----------------------------------------");
-
-            if let Some(id) = run_id {
-                println!("Run ID: {}\n", id);
-
-                // Run tmt with the specific run ID and generate verbose report
-                let report_result = cmd!(sh, "tmt run -i {id} report -vvv")
-                    .ignore_status()
-                    .run();
-
-                match report_result {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to generate detailed report for {}: {:#}",
-                            plan, e
-                        );
-                    }
-                }
-            } else {
-                println!("Run ID not available - cannot generate detailed report");
-            }
-
-            println!("\n");
-        }
-
-        println!("========================================\n");
-    }
-
-    if !all_passed {
-        anyhow::bail!("Some test plans failed");
-    }
-
-    Ok(())
+    Ok(test_results)
 }
 
 /// Provision a VM for manual tmt testing
