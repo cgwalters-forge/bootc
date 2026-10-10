@@ -245,6 +245,15 @@ pub(crate) enum TmtProvision {
     Reinstall,
 }
 
+impl Display for TmtProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TmtProvision::Bcvk => f.write_str("bcvk"),
+            TmtProvision::Reinstall => f.write_str("reinstall"),
+        }
+    }
+}
+
 /// Arguments for run-tmt command.
 ///
 /// The composefs-related fields can be set via CLI flags or via the standard
@@ -253,9 +262,11 @@ pub(crate) enum TmtProvision {
 /// those test images select the composefs backend themselves.
 #[derive(Debug, Args)]
 pub(crate) struct RunTmtArgs {
-    /// Boot the image directly, or reinstall it onto a stock testcloud guest
-    #[arg(long, value_enum, default_value = "bcvk")]
-    pub(crate) provision: TmtProvision,
+    /// Boot the image directly, or reinstall it onto a stock testcloud guest.
+    /// Repeat (or comma-separate) to run the plans through each path in turn,
+    /// with one summary and exit status for all of them.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "bcvk")]
+    pub(crate) provision: Vec<TmtProvision>,
 
     /// Image name (e.g., "localhost/bootc")
     pub(crate) image: String,
@@ -929,6 +940,34 @@ mod tests {
         assert_eq!(parse_cli_bool("false"), Ok(false));
         assert!(parse_cli_bool("").is_err());
         assert!(parse_cli_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn test_run_tmt_provision() {
+        let provision = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["xtask", "run-tmt"]
+                    .iter()
+                    .chain(args)
+                    .chain(&["localhost/bootc", "readonly"]),
+            )
+            .unwrap();
+            let Commands::RunTmt(args) = cli.command else {
+                panic!("expected run-tmt");
+            };
+            args.provision
+        };
+        use TmtProvision::*;
+        assert_eq!(provision(&[]), [Bcvk]);
+        assert_eq!(provision(&["--provision=reinstall"]), [Reinstall]);
+        assert_eq!(
+            provision(&["--provision=bcvk,reinstall"]),
+            [Bcvk, Reinstall]
+        );
+        assert_eq!(
+            provision(&["--provision=bcvk", "--provision=reinstall"]),
+            [Bcvk, Reinstall]
+        );
     }
 
     #[test]
