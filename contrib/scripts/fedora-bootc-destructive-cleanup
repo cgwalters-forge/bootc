@@ -3,12 +3,65 @@
 
 set -xeuo pipefail
 
+# The previous OS may have had /var on a separate filesystem, e.g. the
+# "var" btrfs subvolume of Fedora Cloud images. Only its root filesystem
+# is at /sysroot after the reinstall, so mount its /var there too: package
+# scriptlets run chrooted in /sysroot and need state like /var/lib/alternatives.
+# This unit uses PrivateMounts=true, so the mount is not visible outside it.
+# Every way out that leaves the previous /var unmounted says why, since the
+# package removal and the container prune below then work without it.
+mount_old_var() {
+    local fstab=/sysroot/etc/fstab
+    if [ ! -f "${fstab}" ]; then
+        echo "previous system has no /etc/fstab, not mounting a separate /var" 1>&2
+        return 0
+    fi
+    if mountpoint -q /sysroot/var; then
+        echo "/sysroot/var is already a mount point, leaving it as is" 1>&2
+        return 0
+    fi
+    local source
+    if ! source=$(findmnt --fstab --tab-file "${fstab}" --mountpoint /var --evaluate --noheadings --output SOURCE); then
+        echo "no /var entry found in the previous fstab, not mounting a separate /var" 1>&2
+        return 0
+    fi
+    # e.g. a UUID= or LABEL= that matches no device in the new system
+    if [ -z "${source}" ]; then
+        echo "warning: source of /var in the previous fstab could not be resolved, not mounting it" 1>&2
+        return 0
+    fi
+    # Only handle block devices; e.g. a bind mount source would be resolved
+    # against the new root, not the previous one.
+    if [ ! -b "${source}" ]; then
+        echo "warning: not mounting previous /var from '${source}': not a block device" 1>&2
+        return 0
+    fi
+    if ! mount --fstab "${fstab}" --target-prefix /sysroot /var; then
+        echo "warning: failed to mount previous /var from '${source}'" 1>&2
+        return 0
+    fi
+    # The previous /var must be a filesystem of its own: neither the previous
+    # root (a mistaken fstab entry) nor the one the new system uses as /var.
+    local dev
+    dev=$(stat -c %d /sysroot/var)
+    if [ "${dev}" = "$(stat -c %d /sysroot)" ] || [ "${dev}" = "$(stat -c %d /var)" ]; then
+        echo "warning: previous /var from '${source}' is not a separate filesystem, not using it" 1>&2
+        umount /sysroot/var
+    fi
+}
+
 # Remove all RPMs installed in the physical root (i.e. the previous OS)
 mount -o remount,rw /sysroot
+mount_old_var
 rpm -qa --root=/sysroot --dbpath=/usr/lib/sysimage/rpm | xargs -r rpm -e --root=/sysroot --dbpath=/usr/lib/sysimage/rpm
 
 # Remove all container images (including the one that was used to install)
 # Note that this does not remove stopped containers, and so some storage
 # may leak. This may change in the future.
-mount --bind -o rw /sysroot/var/lib/containers /var/lib/containers
-podman system prune --all -f
+# The previous /var may not be available (see above).
+if [ -d /sysroot/var/lib/containers ]; then
+    mount --bind -o rw /sysroot/var/lib/containers /var/lib/containers
+    podman system prune --all -f
+else
+    echo "warning: not pruning container images: /sysroot/var/lib/containers does not exist (the previous system had no container storage, or its /var could not be mounted)" 1>&2
+fi

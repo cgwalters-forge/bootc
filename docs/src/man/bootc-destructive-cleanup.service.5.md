@@ -25,9 +25,19 @@ derivatives).
 On Fedora derivatives, the cleanup script performs the following actions:
 
 - Remounts `/sysroot` as read-write
+- If the previous OS's `/etc/fstab` mounts `/var` from a separate block
+  device or btrfs subvolume, mounts it at `/sysroot/var`, visible only to
+  the service, so that package scriptlets find the previous OS's state
 - Removes all RPM packages installed in the physical root (the previous OS)
 - Removes all container images from `/sysroot/var/lib/containers` using
-  `podman system prune --all -f`
+  `podman system prune --all -f`, if that directory exists
+
+Whenever the script leaves the previous `/var` unmounted (for example
+because the previous `/etc/fstab` has no `/var` entry, its source cannot be
+resolved or is not a block device, or the mount fails) or skips the container
+image prune, it prints one line saying why. Look for these in the journal of
+the unit (`journalctl -u bootc-destructive-cleanup.service`) if storage of the
+previous OS was not reclaimed.
 
 **Note:** The cleanup script does not remove stopped containers, so some storage
 may remain. This behavior may change in the future.
@@ -49,6 +59,7 @@ at `/sysroot` (the "physical root"). Previous mount points or subvolumes will
 not be automatically mounted in the new system; for example, a btrfs subvolume
 for /home will not be automatically mounted to /sysroot/home. These filesystems
 persist and can be handled manually or defined as mount points in the bootc image.
+The cleanup service mounts the previous `/var` only for its own duration.
 
 # SEE ALSO
 
