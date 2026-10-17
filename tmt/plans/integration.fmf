@@ -351,6 +351,13 @@ execute:
     test:
       - /tmt/tests/tests/test-52-install-repart
 
+/plan-54-install-composefs-on-ostree:
+  summary: Reject install to-existing-root --composefs-backend on an ostree host
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-54-install-composefs-on-ostree
+
 /plan-57-composefs-separate-boot:
   summary: Test composefs with GRUB and a separate /boot partition
   discover:
