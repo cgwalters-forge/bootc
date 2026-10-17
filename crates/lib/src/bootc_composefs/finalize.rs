@@ -1,8 +1,7 @@
-use std::path::Path;
-
 use crate::bootc_composefs::boot::BootType;
 use crate::bootc_composefs::gc::{GCOpts, composefs_gc};
 use crate::bootc_composefs::rollback::{rename_exchange_bls_entries, rename_exchange_user_cfg};
+use crate::bootc_composefs::selinux::finalize_selinux_policy;
 use crate::bootc_composefs::status::get_composefs_status;
 use crate::composefs_consts::STATE_DIR_ABS;
 use crate::install::BOOT;
@@ -11,6 +10,7 @@ use crate::store::{BootedComposefs, Storage};
 use anyhow::{Context, Result};
 use bootc_initramfs_setup::mount_composefs_image;
 use bootc_mount::tempmount::TempMount;
+use camino::Utf8Path;
 use cap_std_ext::cap_std::{ambient_authority, fs::Dir};
 use cap_std_ext::dirext::CapStdExtDirExt;
 use composefs::generic_tree::{FileSystem, Stat};
@@ -111,11 +111,11 @@ pub(crate) async fn composefs_backend_finalize(
         Dir::open_ambient_dir(erofs_tmp_mnt.dir.path().join("etc"), ambient_authority())?;
     let current_etc = Dir::open_ambient_dir("/etc", ambient_authority())?;
 
-    let new_etc_path = Path::new(STATE_DIR_ABS)
+    let new_etc_path = Utf8Path::new(STATE_DIR_ABS)
         .join(&staged_composefs.verity)
         .join("etc");
 
-    let new_etc = Dir::open_ambient_dir(new_etc_path, ambient_authority())?;
+    let new_etc = Dir::open_ambient_dir(&new_etc_path, ambient_authority())?;
 
     let (pristine_files, current_files, new_files) =
         traverse_etc(&pristine_etc, &current_etc, Some(&new_etc))?;
@@ -135,6 +135,15 @@ pub(crate) async fn composefs_backend_finalize(
 
     // Unmount EROFS
     drop(erofs_tmp_mnt);
+
+    // The merge may have kept a locally rebuilt policy over the new image's;
+    // bring it in line with the merged module store.
+    finalize_selinux_policy(
+        &sysroot_fd,
+        &staged_composefs.verity,
+        booted_cfs.cmdline.allow_missing_fsverity,
+        &new_etc_path,
+    )?;
 
     let boot_dir = storage.require_boot_dir()?;
 

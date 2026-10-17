@@ -360,6 +360,18 @@ execute:
   extra-skip_if_ostree: true
   extra-fixme_skip_if_uki: true
 
+/plan-58-selinux-policy-finalize:
+  summary: Local SELinux policy modules survive an upgrade with a new policy
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-58-selinux-policy-finalize
+  adjust:
+  - when: running_env != image_mode
+    enabled: false
+    because: these tests require features only available in image mode
+  extra-fixme_skip_if_uki: true
+
 /plan-60-install-composefs-native:
   summary: Test that composefs-native images default to the composefs backend
   discover:
