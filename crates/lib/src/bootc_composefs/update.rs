@@ -288,6 +288,7 @@ pub(crate) async fn do_upgrade(
         opts.use_unified,
         opts.quiet,
         opts.prog.clone(),
+        manifest.layers().iter().map(|layer| layer.size()).sum(),
     )
     .await?;
 

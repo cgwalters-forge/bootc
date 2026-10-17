@@ -63,10 +63,11 @@ struct ActiveComponent {
 pub(crate) fn spawn(
     quiet: bool,
     prog: ProgressWriter,
+    bytes_total: u64,
 ) -> (SharedReporter, JoinHandle<ProgressWriter>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let reporter: SharedReporter = std::sync::Arc::new(ChannelReporter { tx });
-    let handle = tokio::spawn(drive_progress(rx, quiet, prog));
+    let handle = tokio::spawn(drive_progress(rx, quiet, prog, bytes_total));
     (reporter, handle)
 }
 
@@ -97,20 +98,16 @@ fn bar_style(unit: ProgressUnit) -> ProgressStyle {
 /// [`ProgressUnit::Items`] components only drive the terminal UI).
 fn json_subtasks<'a>(
     active: &'a HashMap<ComponentId, ActiveComponent>,
+    bytes_completed: u64,
+    bytes_total: u64,
 ) -> (Vec<SubTaskBytes<'a>>, u64, u64) {
-    let mut bytes_fetched = 0u64;
-    let mut bytes_total = 0u64;
-    let mut total_known = true;
+    let mut bytes_fetched = bytes_completed;
     let mut subtasks = Vec::new();
     for (id, comp) in active {
         if comp.unit != ProgressUnit::Bytes {
             continue;
         }
         bytes_fetched = bytes_fetched.saturating_add(comp.fetched);
-        match comp.total {
-            Some(total) => bytes_total = bytes_total.saturating_add(total),
-            None => total_known = false,
-        }
         let label = short_id(id);
         subtasks.push(SubTaskBytes {
             subtask: "composefs_layer".into(),
@@ -128,11 +125,6 @@ fn json_subtasks<'a>(
             bytes_total: comp.total.unwrap_or(0),
         });
     }
-    // `bytes_total == 0` is the protocol's way of saying "unspecified"; only
-    // report a real aggregate when every in-flight component's size is known.
-    if !total_known {
-        bytes_total = 0;
-    }
     (subtasks, bytes_fetched, bytes_total)
 }
 
@@ -142,6 +134,7 @@ async fn drive_progress(
     mut rx: mpsc::UnboundedReceiver<ProgressEvent>,
     quiet: bool,
     prog: ProgressWriter,
+    bytes_total: u64,
 ) -> ProgressWriter {
     let multi = MultiProgress::new();
     if quiet {
@@ -156,6 +149,9 @@ async fn drive_progress(
     // done now, `steps_cached` counts work a prior run already did.
     let mut steps_done: u64 = 0;
     let mut steps_cached: u64 = 0;
+    // Retain finished transfers when their per-layer bars are removed, so
+    // completing one of several parallel downloads cannot lower progress.
+    let mut bytes_completed = 0u64;
     // Whether any component has actually started, finished, or been skipped
     // yet. Used instead of `!subtasks.is_empty()` to decide whether to emit
     // a JSON-Lines update: gating on "a `Bytes`-unit component is currently
@@ -164,6 +160,21 @@ async fn drive_progress(
     // update during a purely `Items`-unit pull (e.g. a containers-storage
     // zero-copy import), which never populates `subtasks` at all.
     let mut any_activity = false;
+
+    // Publish the manifest total before processing any layer byte events.
+    let initial = Event::ProgressBytes {
+        task: "pulling".into(),
+        description: "Pulling composefs image".into(),
+        id: "composefs-pull".into(),
+        bytes_cached: 0,
+        bytes: 0,
+        bytes_total,
+        steps_cached: 0,
+        steps: 0,
+        steps_total: 0,
+        subtasks: Vec::new(),
+    };
+    prog.send(initial).await;
 
     while let Some(event) = rx.recv().await {
         // `Done`/`Skipped` are discrete, one-shot milestones (a component's
@@ -210,7 +221,10 @@ async fn drive_progress(
             ProgressEvent::Done { id, transferred } => {
                 if let Some(comp) = active.remove(&id) {
                     comp.bar.finish_and_clear();
-                    let _ = transferred;
+                    if comp.unit == ProgressUnit::Bytes {
+                        bytes_completed =
+                            bytes_completed.saturating_add(transferred.max(comp.fetched));
+                    }
                 }
                 steps_done = steps_done.saturating_add(1);
                 any_activity = true;
@@ -232,7 +246,7 @@ async fn drive_progress(
             _ => {}
         }
 
-        let (subtasks, bytes, bytes_total) = json_subtasks(&active);
+        let (subtasks, bytes, bytes_total) = json_subtasks(&active, bytes_completed, bytes_total);
         let event = Event::ProgressBytes {
             task: "pulling".into(),
             description: "Pulling composefs image".into(),
@@ -243,10 +257,6 @@ async fn drive_progress(
             // have been, so this can't be anything but 0 for now.
             bytes_cached: 0,
             bytes,
-            // Total across all in-flight components is inherently a
-            // moving target since composefs-rs does not report an
-            // upfront count of components; report 0 ("unspecified")
-            // unless every in-flight component has a known size.
             bytes_total,
             steps_cached,
             steps: steps_done,
@@ -298,7 +308,7 @@ mod tests {
             ComponentId::from("objects"),
             active_component(ProgressUnit::Items, 5, Some(10)),
         );
-        let (subtasks, bytes, bytes_total) = json_subtasks(&active);
+        let (subtasks, bytes, bytes_total) = json_subtasks(&active, 0, 0);
         assert!(
             subtasks.is_empty(),
             "Items-unit components have no bytes subtask"
@@ -318,14 +328,14 @@ mod tests {
             ComponentId::from("layer-b"),
             active_component(ProgressUnit::Bytes, 50, Some(300)),
         );
-        let (subtasks, bytes, bytes_total) = json_subtasks(&active);
+        let (subtasks, bytes, bytes_total) = json_subtasks(&active, 0, 500);
         assert_eq!(subtasks.len(), 2);
         assert_eq!(bytes, 150);
         assert_eq!(bytes_total, 500);
     }
 
     #[test]
-    fn test_json_subtasks_unknown_total_is_unspecified() {
+    fn test_json_subtasks_keeps_manifest_total() {
         let mut active = HashMap::new();
         active.insert(
             ComponentId::from("layer-a"),
@@ -336,17 +346,108 @@ mod tests {
             // Total isn't known yet for this component.
             active_component(ProgressUnit::Bytes, 10, None),
         );
-        let (subtasks, bytes, bytes_total) = json_subtasks(&active);
+        let (subtasks, bytes, bytes_total) = json_subtasks(&active, 0, 500);
         assert_eq!(subtasks.len(), 2);
         assert_eq!(bytes, 110);
-        // Since one component's total is unknown, the aggregate must be
-        // reported as unspecified (0) rather than an understated value.
-        assert_eq!(bytes_total, 0);
+        assert_eq!(bytes_total, 500);
+    }
+
+    #[tokio::test]
+    async fn test_pull_bytes_are_monotonic_across_parallel_layers() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (send, recv) = tokio::net::unix::pipe::pipe().expect("create pipe");
+        let prog: ProgressWriter = send.into();
+        let (reporter, handle) = spawn(true, prog, 500);
+        for (id, total, fetched) in [("layer-a", 200, 100), ("layer-b", 300, 50)] {
+            reporter.report(ProgressEvent::Started {
+                id: id.into(),
+                total: Some(total),
+                unit: ProgressUnit::Bytes,
+            });
+            reporter.report(ProgressEvent::Progress {
+                id: id.into(),
+                fetched,
+                total: Some(total),
+            });
+        }
+        for (id, transferred) in [("layer-a", 200), ("layer-b", 300)] {
+            reporter.report(ProgressEvent::Done {
+                id: id.into(),
+                transferred,
+            });
+        }
+        drop(reporter);
+        handle.await.expect("progress task should not panic");
+
+        let mut lines = BufReader::new(recv).lines();
+        let mut counts = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read line") {
+            if let Event::ProgressBytes {
+                bytes, bytes_total, ..
+            } = serde_json::from_str(&line).expect("valid progress event")
+            {
+                assert_eq!(bytes_total, 500);
+                counts.push(bytes);
+            }
+        }
+        assert_eq!(counts.first(), Some(&0), "total precedes layer progress");
+        assert!(counts.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(counts.contains(&250), "completed A plus in-flight B");
+        assert_eq!(counts.last(), Some(&500), "completed bytes are retained");
+    }
+
+    #[tokio::test]
+    async fn test_uncompressed_and_cached_layer_bytes() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        // cstor has no known compressed-byte total; a skipped layer has no
+        // byte size at all in the composefs API, even for a registry pull.
+        for (total, layer_total, transferred, cached) in
+            [(0, None, 1000, false), (500, Some(100), 100, true)]
+        {
+            let (send, recv) = tokio::net::unix::pipe::pipe().expect("create pipe");
+            let (reporter, handle) = spawn(true, send.into(), total);
+            if cached {
+                reporter.report(ProgressEvent::Skipped {
+                    id: "cached-layer".into(),
+                });
+            }
+            reporter.report(ProgressEvent::Started {
+                id: "layer".into(),
+                total: layer_total,
+                unit: ProgressUnit::Bytes,
+            });
+            reporter.report(ProgressEvent::Done {
+                id: "layer".into(),
+                transferred,
+            });
+            drop(reporter);
+            handle.await.expect("progress task should not panic");
+
+            let mut lines = BufReader::new(recv).lines();
+            let mut last = None;
+            while let Some(line) = lines.next_line().await.expect("read line") {
+                if let Event::ProgressBytes {
+                    bytes,
+                    bytes_total,
+                    bytes_cached,
+                    steps_cached,
+                    ..
+                } = serde_json::from_str(&line).expect("valid progress event")
+                {
+                    assert_eq!(bytes_total, total);
+                    assert_eq!(bytes_cached, 0);
+                    last = Some((bytes, steps_cached));
+                }
+            }
+            assert_eq!(last, Some((transferred, u64::from(cached))));
+        }
     }
 
     #[tokio::test]
     async fn test_drive_progress_runs_to_completion_on_channel_close() {
-        let (reporter, handle) = spawn(true, ProgressWriter::default());
+        let (reporter, handle) = spawn(true, ProgressWriter::default(), 100);
         reporter.report(ProgressEvent::Started {
             id: "layer-a".into(),
             total: Some(100),
@@ -401,7 +502,7 @@ mod tests {
     async fn test_drive_progress_reports_steps_cached_separately() {
         let (send, recv) = tokio::net::unix::pipe::pipe().expect("create pipe");
         let prog: ProgressWriter = send.try_into().expect("ProgressWriter from pipe");
-        let (reporter, handle) = spawn(true, prog);
+        let (reporter, handle) = spawn(true, prog, 100);
 
         reporter.report(ProgressEvent::Started {
             id: "layer-fetched".into(),
@@ -435,7 +536,7 @@ mod tests {
     async fn test_drive_progress_flushes_final_event_after_last_component_finishes() {
         let (send, recv) = tokio::net::unix::pipe::pipe().expect("create pipe");
         let prog: ProgressWriter = send.try_into().expect("ProgressWriter from pipe");
-        let (reporter, handle) = spawn(true, prog);
+        let (reporter, handle) = spawn(true, prog, 100);
 
         reporter.report(ProgressEvent::Started {
             id: "layer-a".into(),
@@ -467,7 +568,7 @@ mod tests {
     async fn test_drive_progress_reports_steps_for_items_only_pull() {
         let (send, recv) = tokio::net::unix::pipe::pipe().expect("create pipe");
         let prog: ProgressWriter = send.try_into().expect("ProgressWriter from pipe");
-        let (reporter, handle) = spawn(true, prog);
+        let (reporter, handle) = spawn(true, prog, 0);
 
         reporter.report(ProgressEvent::Started {
             id: "objects".into(),
