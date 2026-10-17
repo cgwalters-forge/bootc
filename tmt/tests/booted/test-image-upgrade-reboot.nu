@@ -13,6 +13,7 @@
 # bootc image copy-to-storage
 # podman build <from that image>
 # bootc switch <into that image> (stage only)
+# bootc switch --apply <same image> with a shutdown inhibitor held (must fail)
 # bootc switch --apply <same image> (spec unchanged, must still reboot)
 # Verify we boot into the new image
 #
@@ -93,6 +94,36 @@ def initial_build [] {
     # staged deployments.
     print $"Staging ($imgsrc)"
     bootc switch --transport containers-storage ($imgsrc)
+
+    # A block mode shutdown inhibitor must make --apply fail rather than reboot.
+    # nushell has no &, so hold the inhibitor from a transient unit.
+    let inhibit_unit = "test-bootc-inhibit"
+    systemd-run -q -u $inhibit_unit -- systemd-inhibit --what=shutdown --mode=block --who=bootc-test --why=testing sleep infinity
+    # Wait for the inhibitor to actually be taken
+    mut inhibited = false
+    for _ in 0..30 {
+        if (systemd-inhibit --list --no-legend | str contains "bootc-test") {
+            $inhibited = true
+            break
+        }
+        sleep 1sec
+    }
+    assert $inhibited "inhibitor should be active"
+    print "Running --apply with an inhibitor held (should fail, not reboot)"
+    let r = do { bootc switch --apply --transport containers-storage ($imgsrc) } | complete
+    systemctl stop $inhibit_unit
+    print $r.stderr
+    assert ($r.exit_code != 0) "bootc switch --apply should fail while a shutdown inhibitor is held"
+    assert ($r.stderr | str contains "shutdown inhibitor") "error should mention the inhibitor"
+    assert ($r.stderr | str contains "bootc-test") "error should name the inhibitor holder"
+    # logind notices the inhibitor going away asynchronously
+    for _ in 0..30 {
+        if not (systemd-inhibit --list --no-legend | str contains "bootc-test") {
+            break
+        }
+        sleep 1sec
+    }
+
     print "Re-running with --apply (spec unchanged, should still reboot)"
     tmt-reboot -c $"bootc switch --apply --transport containers-storage ($imgsrc)"
 }
