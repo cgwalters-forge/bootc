@@ -294,7 +294,7 @@ pub(crate) async fn pull_install_composefs_repository(
     } else {
         // Direct path: pull directly into composefs via skopeo, without
         // containers-storage as intermediary.
-        pull_composefs_direct(&repo, &imgref, false, ProgressWriter::default()).await?
+        pull_composefs_direct(&repo, &imgref, false, ProgressWriter::default(), 0).await?
     };
 
     Ok(pull_result)
@@ -403,6 +403,7 @@ async fn pull_composefs_direct(
     imgref: &containers_image_proxy::ImageReference,
     quiet: bool,
     prog: ProgressWriter,
+    bytes_total: u64,
 ) -> Result<PullResult<Sha512HashValue>> {
     let imgref_str = imgref.to_string();
     tracing::info!("Direct pull: fetching {imgref_str} into composefs repository");
@@ -410,7 +411,14 @@ async fn pull_composefs_direct(
     let mut config = crate::deploy::new_proxy_config();
     ostree_ext::container::merge_default_container_proxy_opts(&mut config)?;
 
-    let (reporter, prog_task) = progress::spawn(quiet, prog);
+    // containers-storage is read uncompressed by the proxy, unlike the
+    // compressed layer sizes in its manifest.
+    let bytes_total = if imgref.transport == containers_image_proxy::Transport::ContainerStorage {
+        0
+    } else {
+        bytes_total
+    };
+    let (reporter, prog_task) = progress::spawn(quiet, prog, bytes_total);
 
     let pull_result = composefs_oci::pull(
         repo,
@@ -484,7 +492,9 @@ async fn pull_composefs_unified(
     tracing::info!("Unified pull: importing from {cstor_imgref_str} (zero-copy)");
 
     let storage = std::path::Path::new(storage_path);
-    let (reporter, prog_task) = progress::spawn(quiet, prog);
+    // cstor reports newly stored uncompressed object bytes, not compressed
+    // layer transfer bytes. The manifest sizes cannot be used as its total.
+    let (reporter, prog_task) = progress::spawn(quiet, prog, 0);
     let pull_opts = PullOptions {
         // The image is already in bootc-owned containers-storage at this point
         // (placed there by Stage 1 of the unified pull). Use ZeroCopy so we
@@ -524,6 +534,7 @@ pub(crate) async fn pull_composefs_repo(
     use_unified: bool,
     quiet: bool,
     prog: ProgressWriter,
+    bytes_total: u64,
 ) -> Result<PullRepoResult> {
     const COMPOSEFS_PULL_JOURNAL_ID: &str = "4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8";
 
@@ -576,7 +587,7 @@ pub(crate) async fn pull_composefs_repo(
 
         pull_composefs_unified(&imgstore, &storage_path, &repo, &imgref, quiet, prog).await?
     } else {
-        pull_composefs_direct(&repo, &imgref, quiet, prog).await?
+        pull_composefs_direct(&repo, &imgref, quiet, prog, bytes_total).await?
     };
 
     // Tag the manifest as a bootc-owned GC root.
