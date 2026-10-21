@@ -44,6 +44,47 @@ Docker got started.
 There's not much special to this that doesn't also apply
 to application containers; but see below.
 
+### Cleaning up `/run` and `/tmp`
+
+Package managers and build scripts commonly leave files in `/run`
+(e.g. lock or state directories) and `/tmp`. These directories are
+mounted as `tmpfs` on a booted system, so anything the image ships
+there is masked and just takes up space; the `nonempty-run-tmp` check
+of [bootc container lint](../man/bootc-container-lint.8.md) warns about
+it (and fails the build with `--fatal-warnings`).
+
+The simplest fix is to never write them into the image, by mounting a
+`tmpfs` over them in each `RUN` step that would, for example
+`RUN --mount=type=tmpfs,target=/tmp ...`. If content is already present
+in a lower layer, remove it in a later `RUN` step that does *not* mount
+a `tmpfs` over the directory. Note that you cannot simply `rm -rf /run/*`:
+during `RUN`, the container runtime bind-mounts files and directories
+under `/run` (and possibly `/tmp`), such as `/run/.containerenv` or
+secrets, and removing those fails with `EBUSY`. Instead, skip mount
+points and leave directories that still contain them:
+
+```bash
+for dir in /run /tmp; do
+    find "${dir}" -xdev -mindepth 1 -depth -print0 |
+        while IFS= read -r -d '' entry; do
+            if mountpoint -q "${entry}"; then
+                continue
+            fi
+            if [[ -d "${entry}" && ! -L "${entry}" ]]; then
+                # Fails (harmlessly) if a mount point is still inside
+                rmdir "${entry}" 2>/dev/null || true
+            else
+                rm -f "${entry}"
+            fi
+        done
+done
+```
+
+Those mount points don't end up in the image, and the lint ignores them.
+For content in `/var`, see [filesystem](../bootc-filesystem.7.md); in
+short, `/var` should also be effectively empty in the image, with
+directories created via `tmpfiles.d`.
+
 ### Nesting OCI containers in bootc containers
 
 The [OCI format](https://github.com/opencontainers/image-spec/blob/main/spec.md) uses
