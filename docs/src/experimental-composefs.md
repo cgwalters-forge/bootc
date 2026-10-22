@@ -207,12 +207,23 @@ The composefs backend is experimental; on-disk formats are subject to change.
 
 ### Stability blockers
 
-- [Dual EROFS v1/v2 generation](https://github.com/bootc-dev/bootc/pull/2248) and https://github.com/bootc-dev/bootc/pull/2353
+- [SELinux policy finalization](https://github.com/bootc-dev/bootc/issues/2511): Policy changes in a new image can be lost after the `/etc` merge when local policy modules are installed. The composefs backend does not yet refresh the merged policy during deployment finalization; `semodule -B` is a reported workaround until the next policy update.
+- [usroverlay with fsverity](https://github.com/bootc-dev/bootc/issues/2507): Enabling usroverlay on composefs systems with fsverity causes verification errors and can break the running system. Avoid usroverlay in this configuration.
+- [Corrupted deployment state](https://github.com/bootc-dev/bootc/issues/2422): Missing OCI manifest streams can prevent `status`, `upgrade`, and `switch` from working, even after booting a different deployment. [Garbage collection also depends on readable deployment state and origin files](https://github.com/bootc-dev/bootc/issues/2442), limiting recovery from corrupted state.
 
 ### Important
 
-- Extended install APIs: Ability to cleanly implement anaconda %post and osbuild post mutations and general post-install pre-reboot; right now some tools just mount the deployment directory (note this one also relates to [APIs in general](https://github.com/bootc-dev/bootc/issues/522))
-- [zstd:chunked pull failures](https://github.com/bootc-dev/bootc/issues/2408): Images pushed with `--compression-format zstd:chunked` currently fail to pull on the composefs backend ("unexpected EOF reading tar entry"). A [decode fix](https://github.com/composefs/composefs-rs/pull/381) is in flight in composefs-rs and reaches bootc with the next composefs-rs update; until then publishers should use plain zstd (or gzip).
+- Install feature parity: Reports reproduced with bootc 1.16.13 show that composefs installs can succeed without applying options or copying required content:
+  - [`--root-ssh-authorized-keys`](https://github.com/bootc-dev/bootc/issues/2535) is silently ignored, so the requested root SSH keys are not installed.
+  - [Install configuration `kargs`, `karg-deletes`, and CLI `--karg-delete`](https://github.com/bootc-dev/bootc/issues/2539) are silently ignored on the BLS install path. This does not affect CLI `--karg` or image `kargs.d` additions.
+  - [Logically bound images](https://github.com/bootc-dev/bootc/issues/2540) are not copied during installation, so they are not available at first boot.
+  - [`.bootc-aleph.json`](https://github.com/bootc-dev/bootc/issues/2541) is not written, leaving the documented installation metadata unavailable.
+  - [`--stateroot`](https://github.com/bootc-dev/bootc/issues/2542) is silently ignored; composefs uses `state/os/default` regardless of the requested name.
+- Extended install APIs: Ability to cleanly implement anaconda %post and osbuild post mutations and general post-install pre-reboot; right now some tools just mount the deployment directory (note this one also relates to [APIs in general](https://github.com/bootc-dev/bootc/issues/522)). In particular, installers lack a [stable, parseable way to discover the deployment ID or path created by an install invocation](https://github.com/bootc-dev/bootc/issues/2513) for configuring `/etc` before first boot.
+- [Btrfs fsverity errors](https://github.com/bootc-dev/bootc/issues/2471): Systems have reported intermittent `FILE CORRUPTED` kernel messages. Investigation points to a kernel readahead issue on btrfs; reproduced cases had valid object digests and successful reads on retry. These messages alone do not establish that repository objects are corrupted; the kernel issue remains under investigation.
+- [Download progress reporting](https://github.com/bootc-dev/bootc/issues/2484): `--progress-fd` initially reports zero `bytes_total` and reports bytes separately for parallel layer downloads, so consumers cannot calculate overall download progress as they do with the ostree backend.
+- Older-client compatibility: [Dual EROFS v1/v2 generation](https://github.com/bootc-dev/bootc/pull/2248) has merged, superseding [the earlier digest-matching proposal](https://github.com/bootc-dev/bootc/pull/2353). Older clients can still fail UKI updates when their generated composefs digest differs from the target image's; temporarily using a newer bootc on the client may be necessary.
+- [zstd:chunked pull failures on older clients](https://github.com/bootc-dev/bootc/issues/2408): The report is closed and current main includes the [multi-frame decode fix](https://github.com/composefs/composefs-rs/pull/381), but bootc 1.16.10 and older affected clients fail to pull these images ("unexpected EOF reading tar entry"). Publishers supporting those clients should continue to use plain zstd (or gzip).
 
 ## Related issues
 
