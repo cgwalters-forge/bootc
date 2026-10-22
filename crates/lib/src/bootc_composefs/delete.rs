@@ -177,30 +177,37 @@ pub(crate) fn delete_state_dir(sysroot: &Dir, deployment_id: &str, dry_run: bool
         .with_context(|| format!("Removing dir {state_dir:?}"))
 }
 
+/// Remove the staged deployment marker if the staged deployment is in `cleanup_list`.
+///
+/// Returns whether the marker was (or in dry-run mode, would be) removed.
 #[fn_error_context::context("Deleting staged deployment")]
 pub(crate) fn delete_staged(
     staged: &Option<BootEntry>,
     cleanup_list: &Vec<&String>,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(staged_depl) = staged else {
         tracing::debug!("No staged deployment");
-        return Ok(());
+        return Ok(false);
     };
 
     if !cleanup_list.contains(&&staged_depl.require_composefs()?.verity) {
         tracing::debug!("Staged deployment not in cleanup list");
-        return Ok(());
+        return Ok(false);
     }
 
     let file = Path::new(COMPOSEFS_TRANSIENT_STATE_DIR).join(COMPOSEFS_STAGED_DEPLOYMENT_FNAME);
 
-    if !dry_run && file.exists() {
+    if !file.exists() {
+        return Ok(false);
+    }
+
+    if !dry_run {
         tracing::debug!("Deleting staged deployment file: {file:?}");
         std::fs::remove_file(file).context("Removing staged file")?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[fn_error_context::context("Deleting composefs deployment {}", deployment_id)]

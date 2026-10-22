@@ -217,6 +217,51 @@ pub(crate) struct GCOpts {
     pub(crate) prune_repo: bool,
 }
 
+/// What [`composefs_gc`] removed, or in dry-run mode, would have removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComposefsGcResult {
+    /// Objects/symlinks from the composefs repository, including `/boot`
+    /// objects of orphaned deployments that are unlinked directly.
+    pub(crate) repo: GcResult,
+    /// Unreferenced Type1 kernel/initrd directories and UKIs.
+    pub(crate) boot_binaries_removed: u64,
+    /// State directories of orphaned deployments.
+    pub(crate) state_dirs_removed: u64,
+    /// Whether the staged deployment was orphaned and its marker removed.
+    pub(crate) staged_removed: bool,
+    /// bootc-owned OCI tags that no longer reference a live deployment.
+    pub(crate) tags_removed: u64,
+}
+
+impl ComposefsGcResult {
+    /// Returns true if nothing was (or would be) removed.
+    pub(crate) fn is_noop(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl std::fmt::Display for ComposefsGcResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let GcResult {
+            objects_removed,
+            objects_bytes,
+            images_pruned,
+            streams_pruned,
+        } = &self.repo;
+        write!(
+            f,
+            "{objects_removed} object(s) ({objects_bytes} bytes), \
+             {images_pruned} image symlink(s), {streams_pruned} stream symlink(s), \
+             {} boot artifact(s), {} state dir(s), {} tag(s)",
+            self.boot_binaries_removed, self.state_dirs_removed, self.tags_removed
+        )?;
+        if self.staged_removed {
+            write!(f, ", staged deployment")?;
+        }
+        Ok(())
+    }
+}
+
 /// 1. List all bootloader entries
 /// 2. List all EROFS images
 /// 3. List all state directories
@@ -238,7 +283,7 @@ pub(crate) async fn composefs_gc(
     storage: &Storage,
     booted_cfs: &BootedComposefs,
     gc_opts: GCOpts,
-) -> Result<GcResult> {
+) -> Result<ComposefsGcResult> {
     const COMPOSEFS_GC_JOURNAL_ID: &str = "3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7";
 
     tracing::info!(
@@ -306,6 +351,8 @@ pub(crate) async fn composefs_gc(
         )
     }
 
+    let mut result = ComposefsGcResult::default();
+
     for (ty, verity) in unreferenced_boot_binaries {
         match ty {
             BootType::Bls => {
@@ -313,10 +360,11 @@ pub(crate) async fn composefs_gc(
             }
             BootType::Uki => delete_uki(storage, verity, gc_opts.dry_run)?,
         }
+        result.boot_binaries_removed += 1;
     }
 
     if !gc_opts.prune_repo {
-        return Ok(GcResult::default());
+        return Ok(result);
     }
 
     // Identify orphaned deployments: state dirs or bootloader entries
@@ -353,15 +401,16 @@ pub(crate) async fn composefs_gc(
         )
     }
 
+    result.staged_removed = delete_staged(staged, &all_orphans, gc_opts.dry_run)?;
+
     for verity in &orphaned_state_dirs {
         tracing::debug!("Cleaning up orphaned state dir: {verity}");
-        delete_staged(staged, &all_orphans, gc_opts.dry_run)?;
         delete_state_dir(&sysroot, verity, gc_opts.dry_run)?;
+        result.state_dirs_removed += 1;
     }
 
     for verity in &orphaned_boot_entries {
         tracing::debug!("Cleaning up orphaned bootloader entry: {verity}");
-        delete_staged(staged, &all_orphans, gc_opts.dry_run)?;
     }
 
     // Collect the set of manifest digests referenced by live deployments,
@@ -480,6 +529,7 @@ pub(crate) async fn composefs_gc(
                 composefs_oci::untag_image(&*booted_cfs.repo, tag_name)
                     .with_context(|| format!("Removing tag {tag_name}"))?;
             }
+            result.tags_removed += 1;
         }
     }
 
@@ -571,16 +621,16 @@ pub(crate) async fn composefs_gc(
                 },
             );
 
-            if gc_opts.dry_run {
-                continue;
-            }
-
             // Get file size before removing
             if let Ok(stat) = statat(&objects_dir, path.as_ref(), AtFlags::empty()) {
                 objects_bytes += stat.st_size as u64;
             }
 
             objects_removed += 1;
+
+            if gc_opts.dry_run {
+                continue;
+            }
 
             unlinkat(&objects_dir, path.as_ref(), AtFlags::empty())
                 .with_context(|| format!("Unlinking object {path:?}"))?;
@@ -596,16 +646,16 @@ pub(crate) async fn composefs_gc(
     // first action. Callers must ensure no other `Repository` handle on that
     // same underlying file is still alive when this runs, or it will deadlock
     // (see update.rs's do_upgrade() for an example of getting this wrong).
-    let mut gc_result = if gc_opts.dry_run {
+    result.repo = if gc_opts.dry_run {
         booted_cfs.repo.gc_dry_run(&additional_roots)?
     } else {
         booted_cfs.repo.gc(&additional_roots)?
     };
 
-    gc_result.objects_bytes += objects_bytes;
-    gc_result.objects_removed += objects_removed;
+    result.repo.objects_bytes += objects_bytes;
+    result.repo.objects_removed += objects_removed;
 
-    Ok(gc_result)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1100,5 +1150,35 @@ mod tests {
         assert_eq!(unreferenced[0].1, digest_a);
 
         Ok(())
+    }
+
+    /// Every kind of removal must make the result a non-no-op, so that
+    /// `--assert-no-op` catches it.
+    #[test]
+    fn test_gc_result_is_noop() {
+        assert!(ComposefsGcResult::default().is_noop());
+        assert_eq!(
+            ComposefsGcResult::default().to_string(),
+            "0 object(s) (0 bytes), 0 image symlink(s), 0 stream symlink(s), \
+             0 boot artifact(s), 0 state dir(s), 0 tag(s)"
+        );
+
+        type Mutate = fn(&mut ComposefsGcResult);
+        let cases: [(Mutate, &str); 7] = [
+            (|r| r.repo.objects_removed = 1, "1 object(s)"),
+            (|r| r.repo.images_pruned = 1, "1 image symlink(s)"),
+            (|r| r.repo.streams_pruned = 1, "1 stream symlink(s)"),
+            (|r| r.boot_binaries_removed = 1, "1 boot artifact(s)"),
+            (|r| r.state_dirs_removed = 1, "1 state dir(s)"),
+            (|r| r.tags_removed = 1, "1 tag(s)"),
+            (|r| r.staged_removed = true, "staged deployment"),
+        ];
+        for (mutate, expected) in cases {
+            let mut r = ComposefsGcResult::default();
+            mutate(&mut r);
+            assert!(!r.is_noop(), "{r:?} should not be a no-op");
+            let s = r.to_string();
+            assert!(s.contains(expected), "{s:?} should contain {expected:?}");
+        }
     }
 }
