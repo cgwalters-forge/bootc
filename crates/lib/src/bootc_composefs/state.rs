@@ -27,7 +27,7 @@ use rustix::{
 
 use crate::bootc_composefs::boot::BootType;
 use crate::bootc_composefs::status::{
-    ComposefsCmdline, StagedDeployment, get_sorted_type1_boot_entries,
+    ComposefsCmdline, ImgConfigManifest, StagedDeployment, get_sorted_type1_boot_entries,
 };
 use crate::parsers::bls_config::{BLSConfigType, EFIKey};
 use crate::store::{BootedComposefs, Storage};
@@ -42,6 +42,168 @@ use crate::{
     spec::{FilesystemOverlay, FilesystemOverlayAccessMode, FilesystemOverlayPersistence},
     utils::path_relative_to,
 };
+
+const CACHED_UPDATE_FNAME: &str = ".cached-update";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CachedUpdate {
+    pub(crate) origin: ImageReference,
+    pub(crate) candidate: ImageReference,
+    pub(crate) image: ImgConfigManifest,
+    pub(crate) manifest_digest: String,
+}
+
+pub(crate) fn write_cached_update(
+    storage: &Storage,
+    deployment_id: &str,
+    cached: &CachedUpdate,
+) -> Result<()> {
+    let state_dir = storage
+        .physical_root
+        .open_dir(Path::new(STATE_DIR_RELATIVE).join(deployment_id))?;
+    let data = serde_json::to_vec(cached).context("Serializing cached update")?;
+    state_dir
+        .atomic_write(format!("{deployment_id}{CACHED_UPDATE_FNAME}"), &data)
+        .context("Writing cached update")
+}
+
+pub(crate) fn clear_cached_update(storage: &Storage, deployment_id: &str) -> Result<()> {
+    let state_dir = storage
+        .physical_root
+        .open_dir(Path::new(STATE_DIR_RELATIVE).join(deployment_id))?;
+    state_dir
+        .remove_file_optional(format!("{deployment_id}{CACHED_UPDATE_FNAME}"))
+        .context("Removing cached update")
+        .map(|_| ())
+}
+
+pub(crate) fn read_cached_update(
+    storage: &Storage,
+    deployment_id: &str,
+    origin: &ImageReference,
+) -> Result<Option<CachedUpdate>> {
+    let Some(state_dir) = storage
+        .physical_root
+        .open_dir_optional(Path::new(STATE_DIR_RELATIVE).join(deployment_id))?
+    else {
+        return Ok(None);
+    };
+    read_cached_update_from_dir(&state_dir, deployment_id, origin)
+}
+
+fn read_cached_update_from_dir(
+    state_dir: &Dir,
+    deployment_id: &str,
+    origin: &ImageReference,
+) -> Result<Option<CachedUpdate>> {
+    let Some(raw) =
+        state_dir.read_to_string_optional(format!("{deployment_id}{CACHED_UPDATE_FNAME}"))?
+    else {
+        return Ok(None);
+    };
+    match parse_cached_update(&raw, origin) {
+        Ok(cached) => Ok(Some(cached)),
+        Err(e) => {
+            tracing::warn!(deployment_id, error = %e, "Ignoring invalid composefs cached update");
+            Ok(None)
+        }
+    }
+}
+
+fn parse_cached_update(raw: &str, origin: &ImageReference) -> Result<CachedUpdate> {
+    let cached = serde_json::from_str::<CachedUpdate>(raw).context("Parsing cached update")?;
+    anyhow::ensure!(
+        cached.origin == *origin,
+        "cached update origin does not match booted image"
+    );
+    Ok(cached)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_cache(origin: ImageReference) -> CachedUpdate {
+        CachedUpdate {
+            origin: origin.clone(),
+            candidate: ImageReference {
+                image: "example/os:v2".into(),
+                transport: "registry".into(),
+                signature: None,
+            },
+            image: ImgConfigManifest {
+                config: serde_json::from_value(json!({
+                    "architecture": "amd64", "os": "linux",
+                    "rootfs": {"type": "layers", "diff_ids": []},
+                    "config": {"Labels": {"org.opencontainers.image.version": "2"}}
+                }))
+                .unwrap(),
+                manifest: serde_json::from_value(json!({
+                    "schemaVersion": 2,
+                    "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1},
+                    "layers": []
+                }))
+                .unwrap(),
+                manifest_digest: Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+            },
+            manifest_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        }
+    }
+
+    #[test]
+    fn cached_update_roundtrip_and_origin_validation() {
+        let origin = ImageReference {
+            image: "example/os:v1".into(),
+            transport: "registry".into(),
+            signature: None,
+        };
+        let cache = sample_cache(origin.clone());
+        let raw = serde_json::to_string(&cache).unwrap();
+        let decoded = parse_cached_update(&raw, &origin).unwrap();
+        assert_eq!(decoded.candidate.image, "example/os:v2");
+        assert_eq!(decoded.image.config.architecture().to_string(), "amd64");
+        assert!(
+            parse_cached_update(
+                &raw,
+                &ImageReference {
+                    image: "example/os:other".into(),
+                    ..origin.clone()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cached_update_malformed_or_missing_is_ignored() {
+        let origin = ImageReference {
+            image: "example/os:v1".into(),
+            transport: "registry".into(),
+            signature: None,
+        };
+        assert!(parse_cached_update("{}", &origin).is_err());
+        assert!(parse_cached_update("not json", &origin).is_err());
+
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(ambient_authority()).unwrap();
+        tempdir.create_dir_all("deploy/booted").unwrap();
+        let deploy = tempdir.open_dir("deploy/booted").unwrap();
+        assert!(
+            read_cached_update_from_dir(&deploy, "booted", &origin)
+                .unwrap()
+                .is_none()
+        );
+        deploy
+            .atomic_write("booted.cached-update", "not json")
+            .unwrap();
+        assert!(
+            read_cached_update_from_dir(&deploy, "booted", &origin)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
 
 /// Read and parse the `.origin` INI file for a deployment.
 ///
