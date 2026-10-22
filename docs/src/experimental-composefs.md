@@ -7,12 +7,27 @@ do provide feedback on them.
 
 The composefs backend is an experimental alternative storage backend that uses [composefs-rs](https://github.com/composefs/composefs-rs) instead of ostree for storing and managing bootc system deployments.
 
-**Status**: Experimental, but close to stabilization! We are committed to in-place upgrades from all systems deployed since bootc 1.16.0.
+**Status**: Experimental, but close to stabilization. The migration described
+below is verified for the tested `bootc` 1.16.0 UKI fixture. It is not a claim
+about every historical bootc release or every BLS layout.
 
-The composefs backend supports two distinct levels of integrity guarantee, controlled by whether fsverity is strictly enforced on the root filesystem (i.e. whether the image was built with `--allow-missing-verity`):
+The composefs backend has two independent integrity properties:
 
-- **Sealed**: The composefs digest is baked into the kernel command line of a UKI and *required* to match at boot.
-- **Unsealed**: fsverity enforcement is optional, so composefs still provides content-addressed, deduplicated storage and garbage collection, but without a guarantee that the root filesystem matches what was signed. Unsealed composefs most commonly boots via a traditional `vmlinuz`/`initramfs.img` and a BLS boot entry, but a UKI built with `--allow-missing-verity` is *also* unsealed in this sense — packaging as a UKI is a boot convenience here, not by itself a security boundary. See [Bootloader Support](#bootloader-support) below.
+- **Secure Boot provenance**: A signed UKI lets firmware authenticate the
+  kernel, initramfs, and command line it contains. This is what is meant by a
+  sealed UKI. A traditional BLS entry is not cryptographically sealed and does
+  not provide equivalent provenance or root authenticity, even when it carries
+  a composefs digest.
+- **fsverity strictness**: composefs can require fsverity on filesystems that
+  support it. The composefs digest is checked against the mounted root in this
+  mode. The `?` marker in the composefs command line (selected by
+  `--allow-missing-verity`) permits missing fsverity; it does not add Secure
+  Boot provenance. This setting applies to BLS boots as well as UKI boots.
+
+Thus, a BLS deployment can enforce fsverity on a supported filesystem without
+being a cryptographically sealed image. Conversely, putting an image in a UKI
+does not by itself make fsverity strict: Secure Boot provenance and fsverity
+strictness must be evaluated separately.
 
 ## Storage and repository structure
 
@@ -34,6 +49,44 @@ There is no `/ostree/repo`; the composefs backend doesn't use the ostree reposit
 
 Transient, not-yet-finalized deployment state (used while staging an update before reboot) lives under `/run/composefs/staged-deployment` and is never persisted to disk.
 
+## Migrating an existing deployment
+
+The supported migration procedure is to update the image builder first. Add
+the current `bootc` to the image, regenerate its initramfs, and, for a sealed
+image, regenerate the UKI and sign it again. Do not deploy a new image while
+still relying on an initramfs produced by an older image builder; that is not a
+supported migration mode.
+
+On the machine, use the existing (older) `bootc` to stage the new image, then
+reboot into it. For example, replace the placeholders with the image reference
+you built and the registry transport appropriate to your deployment:
+
+```console
+# Run on the existing deployment, before rebooting:
+bootc switch --transport <TRANSPORT> <NEW-IMAGE-REFERENCE>
+systemctl reboot
+```
+
+After the first boot into the new image, perform a normal subsequent update:
+
+```console
+bootc upgrade
+systemctl reboot
+```
+
+The verified bridge preserved `/etc` and `/var`, allowed rollback, and allowed
+garbage collection. It migrated an old EROFS V2 repository while the current
+boot used V2, fell back to the current V2 reader, and then handled a subsequent
+current V1 repository. Both the unsealed (`?`) and strict fsverity policies
+were tested independently. An unsealed UKI (`?`) is not the same thing as a
+strict, unsigned UKI: `?` permits missing fsverity, while strict mode requires
+it; neither statement supplies Secure Boot provenance.
+
+The exact UKI migration test covered the `bootc` 1.16.0 fixture only. BLS
+initial-policy behavior has been tested and is documented by the independent
+fsverity policy description above, but historical BLS migration remains
+pending additional evidence.
+
 ## How Sealed Images Work
 
 A sealed image is a cryptographically signed and verified bootc image that provides end-to-end integrity protection. This is achieved through:
@@ -41,6 +94,12 @@ A sealed image is a cryptographically signed and verified bootc image that provi
 - **Unified Kernel Images (UKIs)**: Combining kernel, initramfs, and boot parameters into a single signed binary
 - **Composefs integration**: Using composefs with fsverity for content-addressed filesystem verification
 - **Secure Boot**: Cryptographic signatures on both the UKI and systemd-boot loader
+
+The Secure Boot signature authenticates the UKI and the command line it carries;
+fsverity strictness separately determines whether the mounted root must have
+the expected verity metadata. Both checks are needed for the full sealed-UKI
+chain described below, but neither check should be used as a substitute for
+the other.
 
 A sealed image includes:
 
@@ -81,12 +140,12 @@ valid use case is to temporarily disable it in order to test a change locally
 on e.g. one machine, then re-enable it later. However at the current time it
 is not yet streamlined to regenerate the UKI locally.
 
-Note this is a different, independent weakening from `--allow-missing-verity`
-(see [Overview](#overview) above): disabling Secure Boot only removes firmware
-verification of the UKI's own signature, while the fsverity digest of the root
-filesystem is still enforced. Building with `--allow-missing-verity` instead
-disables that digest enforcement itself, which is what actually makes an image
-unsealed regardless of whether Secure Boot is enabled.
+Note this is a different, independent weakening from
+`--allow-missing-verity` (see [Overview](#overview) above): disabling Secure
+Boot removes firmware verification of the UKI's signature, while the fsverity
+digest of the root filesystem can remain enforced. Building with
+`--allow-missing-verity` instead permits missing fsverity, including when
+Secure Boot remains enabled.
 
 ### Build Pattern: Split the Kernel, Then Generate the UKI in a Separate Stage
 
@@ -193,9 +252,18 @@ See [CONTRIBUTING.md](https://github.com/bootc-dev/bootc/blob/main/CONTRIBUTING.
 
 ## Bootloader Support
 
-Whenever the container image has a UKI, bootc automatically selects the composefs backend during installation (see [Prerequisites](#prerequisites) above for the currently-supported UKI + systemd-boot configuration for building sealed images). Note that having a UKI does not by itself make an install sealed — that also depends on whether fsverity enforcement is on, per [Overview](#overview) above.
+Whenever the container image has a UKI, bootc automatically selects the composefs backend during installation (see [Prerequisites](#prerequisites) above for the currently-supported UKI + systemd-boot configuration). A UKI can provide Secure Boot provenance, but having one does not by itself determine fsverity strictness; see [Overview](#overview).
 
-Composefs installs using a traditional `vmlinuz`/`initramfs.img` layout instead of a UKI are always unsealed, and can use either `bootupd` (GRUB) or systemd-boot, the same as the ostree backend. See [bootloaders.md](bootloaders.md) for the general bootloader selection rules. Under the hood, bootc writes standard BLS boot entries for both UKI and traditional kernels; see the [composefs boot module documentation](https://github.com/bootc-dev/bootc/blob/main/crates/lib/src/bootc_composefs/boot.rs) for details on how entry filenames and sort-keys are chosen to sort correctly on both GRUB and systemd-boot.
+Composefs installs using a traditional `vmlinuz`/`initramfs.img` layout use a
+BLS entry and are not cryptographically sealed like signed UKIs. They can
+nevertheless enforce fsverity on a supported filesystem; `?` explicitly
+permits missing fsverity. Such installs can use either `bootupd` (GRUB) or
+systemd-boot, the same as the ostree backend. See [bootloaders.md](bootloaders.md)
+for the general bootloader selection rules. Under the hood, bootc writes
+standard BLS boot entries for both UKI and traditional kernels; see the
+[composefs boot module documentation](https://github.com/bootc-dev/bootc/blob/main/crates/lib/src/bootc_composefs/boot.rs)
+for details on how entry filenames and sort-keys are chosen to sort correctly
+on both GRUB and systemd-boot.
 
 ## Installation
 

@@ -265,8 +265,10 @@ jobs:
 
       - name: Setup env
         run: |
-          BASE=$(just pullspec-for-os base ${{ matrix.test_os }})
-          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
+          BASE="$(just pullspec-for-os base "${{ matrix.test_os }}")"
+          echo "BOOTC_base=${BASE}" >> "$GITHUB_ENV"
+          BUILDROOT_BASE="$(just pullspec-for-os buildroot-base "${{ matrix.test_os }}")"
+          echo "BOOTC_buildroot_base=${BUILDROOT_BASE}" >> "$GITHUB_ENV"
 
       - name: Build packages (and verify build system)
         run: just check-buildsys
@@ -355,16 +357,18 @@ jobs:
 
       - name: Setup env
         run: |
-          BASE=$(just pullspec-for-os base ${{ matrix.test_os }})
-          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
-          echo "RUST_BACKTRACE=full" >> $GITHUB_ENV
-          echo "RUST_LOG=debug" >> $GITHUB_ENV
+          BASE="$(just pullspec-for-os base "${{ matrix.test_os }}")"
+          echo "BOOTC_base=${BASE}" >> "$GITHUB_ENV"
+          BUILDROOT_BASE="$(just pullspec-for-os buildroot-base "${{ matrix.test_os }}")"
+          echo "BOOTC_buildroot_base=${BUILDROOT_BASE}" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
+          echo "RUST_LOG=debug" >> "$GITHUB_ENV"
 
-          echo "BOOTC_variant=${{ matrix.variant }}" >> $GITHUB_ENV
-          echo "BOOTC_filesystem=${{ matrix.filesystem }}" >> $GITHUB_ENV
-          echo "BOOTC_bootloader=${{ matrix.bootloader }}" >> $GITHUB_ENV
-          echo "BOOTC_boot_type=${{ matrix.boot_type }}" >> $GITHUB_ENV
-          echo "BOOTC_seal_state=${{ matrix.seal_state }}" >> $GITHUB_ENV
+          echo "BOOTC_variant=${{ matrix.variant }}" >> "$GITHUB_ENV"
+          echo "BOOTC_filesystem=${{ matrix.filesystem }}" >> "$GITHUB_ENV"
+          echo "BOOTC_bootloader=${{ matrix.bootloader }}" >> "$GITHUB_ENV"
+          echo "BOOTC_boot_type=${{ matrix.boot_type }}" >> "$GITHUB_ENV"
+          echo "BOOTC_seal_state=${{ matrix.seal_state }}" >> "$GITHUB_ENV"
 
       - name: Download package artifacts
         uses: actions/download-artifact@v8
@@ -454,11 +458,13 @@ jobs:
 
       - name: Setup env
         run: |
-          BASE=$(just pullspec-for-os base ${{ matrix.test_os }})
-          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
-          echo "BOOTC_variant=${{ matrix.variant }}" >> $GITHUB_ENV
-          echo "BOOTC_SKIP_PACKAGE=1" >> $GITHUB_ENV
-          echo "RUST_BACKTRACE=full" >> $GITHUB_ENV
+          BASE="$(just pullspec-for-os base "${{ matrix.test_os }}")"
+          echo "BOOTC_base=${BASE}" >> "$GITHUB_ENV"
+          BUILDROOT_BASE="$(just pullspec-for-os buildroot-base "${{ matrix.test_os }}")"
+          echo "BOOTC_buildroot_base=${BUILDROOT_BASE}" >> "$GITHUB_ENV"
+          echo "BOOTC_variant=${{ matrix.variant }}" >> "$GITHUB_ENV"
+          echo "BOOTC_SKIP_PACKAGE=1" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
 
       - name: Download package artifacts
         uses: actions/download-artifact@v8
@@ -516,11 +522,13 @@ jobs:
 
       - name: Setup env
         run: |
-          BASE=$(just pullspec-for-os base ${{ matrix.test_os }})
-          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
-          echo "BOOTC_variant=composefs" >> $GITHUB_ENV
-          echo "BOOTC_baseconfigs=${{ matrix.baseconfigs }}" >> $GITHUB_ENV
-          echo "RUST_BACKTRACE=full" >> $GITHUB_ENV
+          BASE="$(just pullspec-for-os base "${{ matrix.test_os }}")"
+          echo "BOOTC_base=${BASE}" >> "$GITHUB_ENV"
+          BUILDROOT_BASE="$(just pullspec-for-os buildroot-base "${{ matrix.test_os }}")"
+          echo "BOOTC_buildroot_base=${BUILDROOT_BASE}" >> "$GITHUB_ENV"
+          echo "BOOTC_variant=composefs" >> "$GITHUB_ENV"
+          echo "BOOTC_baseconfigs=${{ matrix.baseconfigs }}" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
 
       - name: Download package artifacts
         uses: actions/download-artifact@v8

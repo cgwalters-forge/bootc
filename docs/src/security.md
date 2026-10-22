@@ -35,8 +35,12 @@ The composefs backend enables fsverity by default if available,
 but does not verify the composefs image (because there's nothing
 to verify it against by default).
 
-The composefs backend with sealed UKIs does verify the composefs
-mount. With composefs + sealed UKIs, it is a vulnerability if
+The composefs backend with strict fsverity does verify the composefs mount
+against its expected digest. A signed UKI additionally gives Secure Boot
+provenance for the kernel, initramfs, and command line. A BLS entry can use
+strict fsverity on a supported filesystem, but it is not cryptographically
+sealed and does not provide the same root-authenticity guarantee as a signed
+UKI. With composefs + sealed UKIs, it is a vulnerability if
 e.g. an attacker can mutate a file in the image store, have
 that persist across a re-mount without it resulting in an `EIO`
 error (default for Linux kernel fsverity).
