@@ -16,7 +16,7 @@ use crate::{
     bootc_composefs::{
         boot::BootType,
         selinux::are_selinux_policies_compatible,
-        state::{get_composefs_usr_overlay_status, read_origin},
+        state::{get_composefs_usr_overlay_status, read_cached_update, read_origin},
         utils::{compute_store_boot_digest_for_uki, get_uki_cmdline},
     },
     composefs_consts::{
@@ -45,6 +45,7 @@ use ostree_ext::containers_image_proxy::{ImageProxy, ImageReference};
 use ostree_ext::oci_spec;
 use ostree_ext::{container::deploy::ORIGIN_CONTAINER, oci_spec::image::ImageConfiguration};
 
+use ostree_ext::oci_spec::image::Digest;
 use ostree_ext::oci_spec::image::ImageManifest;
 use tokio::io::AsyncReadExt;
 
@@ -59,6 +60,44 @@ use crate::spec::Bootloader;
 pub(crate) struct ImgConfigManifest {
     pub(crate) config: ImageConfiguration,
     pub(crate) manifest: ImageManifest,
+    #[serde(default)]
+    pub(crate) manifest_digest: Option<String>,
+}
+
+fn create_cached_imagestatus(
+    image: crate::spec::ImageReference,
+    manifest_digest: &Digest,
+    config: &ImageConfiguration,
+) -> ImageStatus {
+    let labels = config.config().as_ref().and_then(|c| c.labels().as_ref());
+    let timestamp = labels
+        .and_then(|l| {
+            l.get(oci_spec::image::ANNOTATION_CREATED)
+                .map(|s| s.as_str())
+        })
+        .or_else(|| config.created().as_deref())
+        .and_then(try_deserialize_timestamp);
+    let version = ostree_container::version_for_config(config).map(ToOwned::to_owned);
+    ImageStatus {
+        image,
+        version,
+        timestamp,
+        image_digest: manifest_digest.to_string(),
+        architecture: config.architecture().to_string(),
+    }
+}
+
+/// Compare authoritative registry digests, falling back to decoded OCI metadata
+/// for deployments written by older bootc versions.
+pub(crate) fn fetched_image_matches_current(
+    current: &ImgConfigManifest,
+    fetched: &ImgConfigManifest,
+    fetched_digest: &str,
+) -> bool {
+    match current.manifest_digest.as_deref() {
+        Some(current_digest) => current_digest == fetched_digest,
+        None => current.manifest == fetched.manifest && current.config == fetched.config,
+    }
 }
 
 /// A parsed composefs command line
@@ -274,6 +313,15 @@ pub(crate) fn get_sorted_staged_type1_boot_entries(
     get_sorted_type1_boot_entries_helper(boot_dir, ascending, true, bootloader)
 }
 
+/// Return whether a Type 1 entry belongs to bootc's reserved BLS namespace.
+pub(crate) fn is_bootc_type1_entry(entry: &BLSConfig) -> bool {
+    entry
+        .sort_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("bootc-"))
+        || entry.get_verity().is_ok()
+}
+
 #[context("Getting sorted Type1 boot entries")]
 fn get_sorted_type1_boot_entries_helper(
     boot_dir: &Dir,
@@ -365,6 +413,7 @@ pub(crate) fn list_type1_entries(boot_dir: &Dir) -> Result<Vec<BootloaderEntry>>
     boot_entries
         .into_iter()
         .chain(staged_boot_entries)
+        .filter(is_bootc_type1_entry)
         .map(|entry| {
             Ok(BootloaderEntry {
                 fsverity: entry.get_verity()?,
@@ -434,7 +483,7 @@ pub(crate) async fn get_container_manifest_and_config(
         .await
         .with_context(|| format!("Opening image {imgref}"))?;
 
-    let (_, manifest) = proxy.fetch_manifest(&img).await?;
+    let (manifest_digest, manifest) = proxy.fetch_manifest(&img).await?;
     let (mut reader, driver) = proxy.get_descriptor(&img, manifest.config()).await?;
 
     let mut buf = Vec::with_capacity(manifest.config().size() as usize);
@@ -444,7 +493,11 @@ pub(crate) async fn get_container_manifest_and_config(
 
     let config: oci_spec::image::ImageConfiguration = serde_json::from_slice(&buf)?;
 
-    Ok(ImgConfigManifest { manifest, config })
+    Ok(ImgConfigManifest {
+        manifest,
+        config,
+        manifest_digest: Some(manifest_digest.to_string()),
+    })
 }
 
 /// Directory where BLS-compatible bootloaders expect Type 1 boot entries.
@@ -586,7 +639,14 @@ pub(crate) fn get_imginfo(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("OCI image has no config (artifact?)"))?;
 
-        return Ok((ImgConfigManifest { config, manifest }, manifest_digest_str));
+        return Ok((
+            ImgConfigManifest {
+                config,
+                manifest,
+                manifest_digest: Some(manifest_digest_str.clone()),
+            },
+            manifest_digest_str,
+        ));
     }
 
     // Fallback: read legacy .imginfo file for deployments created before
@@ -1008,6 +1068,29 @@ async fn composefs_deployment_status_from(
         };
 
         if verity_digest == booted_composefs_digest.as_ref() {
+            if let Some(image) = boot_entry.image.as_ref()
+                && let Some(cached) = read_cached_update(storage, &verity_digest, &image.image)?
+            {
+                let (current, _) = get_imginfo(storage, &verity_digest)?;
+                if fetched_image_matches_current(&current, &cached.image, &cached.manifest_digest) {
+                    host.status.booted = Some(boot_entry);
+                    continue;
+                }
+                match cached.manifest_digest.parse::<Digest>() {
+                    Ok(digest) => {
+                        boot_entry.cached_update = Some(create_cached_imagestatus(
+                            cached.candidate,
+                            &digest,
+                            &cached.image.config,
+                        ));
+                    }
+                    Err(e) => tracing::warn!(
+                        deployment_id = %verity_digest,
+                        error = %e,
+                        "Ignoring cached update with malformed manifest digest"
+                    ),
+                }
+            }
             host.status.booted = Some(boot_entry);
             continue;
         }
@@ -1046,7 +1129,10 @@ async fn composefs_deployment_status_from(
         match booted_cfs.bootloader.kind()? {
             BootloaderKind::GRUBClassic => match boot_type {
                 BootType::Bls => {
-                    let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?;
+                    let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?
+                        .into_iter()
+                        .filter(is_bootc_type1_entry)
+                        .collect::<Vec<_>>();
                     let bls_config = bls_configs
                         .first()
                         .ok_or_else(|| anyhow::anyhow!("First boot entry not found"))?;
@@ -1086,7 +1172,10 @@ async fn composefs_deployment_status_from(
 
             // We will have BLS stuff and the UKI stuff in the same DIR
             BootloaderKind::BLSCompatible => {
-                let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?;
+                let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?
+                    .into_iter()
+                    .filter(is_bootc_type1_entry)
+                    .collect::<Vec<_>>();
                 let bls_config = bls_configs
                     .first()
                     .ok_or(anyhow::anyhow!("First boot entry not found"))?;
@@ -1168,6 +1257,80 @@ mod tests {
     use crate::parsers::grub_menuconfig::MenuentryBody;
 
     use super::*;
+
+    fn test_imginfo(digest: Option<&str>, version: &str) -> ImgConfigManifest {
+        ImgConfigManifest {
+            config: serde_json::from_value(serde_json::json!({
+                "architecture": "amd64", "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": []},
+                "config": {"Labels": {"org.opencontainers.image.version": version}}
+            }))
+            .unwrap(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1},
+                "layers": []
+            }))
+            .unwrap(),
+            manifest_digest: digest.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn legacy_imginfo_compares_oci_metadata_not_synthetic_digest() {
+        let current = test_imginfo(None, "1");
+        let same = test_imginfo(Some("sha256:remote"), "1");
+        let changed = test_imginfo(Some("sha256:remote"), "2");
+        assert!(fetched_image_matches_current(
+            &current,
+            &same,
+            "sha256:remote"
+        ));
+        assert!(!fetched_image_matches_current(
+            &current,
+            &changed,
+            "sha256:remote"
+        ));
+    }
+
+    #[test]
+    fn authoritative_digest_wins_over_structural_equality() {
+        let current = test_imginfo(Some("sha256:old"), "1");
+        let fetched = test_imginfo(Some("sha256:new"), "1");
+        assert!(!fetched_image_matches_current(
+            &current,
+            &fetched,
+            "sha256:new"
+        ));
+    }
+
+    #[test]
+    fn cached_status_uses_oci_metadata() {
+        let config: ImageConfiguration = serde_json::from_str(
+            r#"{"architecture":"amd64","os":"linux","created":"2024-01-02T03:04:05Z","rootfs":{"type":"layers","diff_ids":[]},"config":{"Labels":{"org.opencontainers.image.version":"2.4"}}}"#,
+        )
+        .unwrap();
+        let digest: Digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .parse()
+                .unwrap();
+        let status = create_cached_imagestatus(
+            crate::spec::ImageReference {
+                image: "example/os:v2".into(),
+                transport: "registry".into(),
+                signature: None,
+            },
+            &digest,
+            &config,
+        );
+        assert_eq!(status.version.as_deref(), Some("2.4"));
+        assert_eq!(status.architecture, "amd64");
+        assert_eq!(
+            status.timestamp.unwrap().to_rfc3339(),
+            "2024-01-02T03:04:05+00:00"
+        );
+    }
 
     #[test]
     fn test_composefs_parsing() {

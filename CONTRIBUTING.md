@@ -62,6 +62,9 @@ next step is to get that binary into a bootc container image.
 Running `just` defaults to `just build` which will build a container
 from the current source code; the result will be named `localhost/bootc`.
 
+Set `BOOTC_image` to a unique image tag when running multiple worktrees so
+recursive build and test recipes use an isolated image name.
+
 ### Running an interactive shell in an environment from the container
 
 You can of course `podman run --rm -ti localhost/bootc bash` to get a shell,

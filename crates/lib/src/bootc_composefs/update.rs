@@ -19,17 +19,17 @@ use crate::spec::BootloaderKind;
 use crate::{
     bootc_composefs::{
         boot::{
-            BootSetupType, BootType, UKIDigestMismatch, print_uki_dumpfile_diff,
-            setup_composefs_bls_boot, setup_composefs_uki_boot,
+            BootSetupType, BootType, UKIDigestMismatch, accepted_boot_image_ids,
+            print_uki_dumpfile_diff, setup_composefs_bls_boot, setup_composefs_uki_boot,
         },
         gc::composefs_gc,
         repo::pull_composefs_repo,
         service::start_finalize_stated_svc,
         soft_reboot::prepare_soft_reboot_composefs,
-        state::write_composefs_state,
+        state::{CachedUpdate, clear_cached_update, write_cached_update, write_composefs_state},
         status::{
-            ImgConfigManifest, StagedDeployment, get_bootloader, get_composefs_status,
-            get_container_manifest_and_config, get_imginfo,
+            ImgConfigManifest, StagedDeployment, fetched_image_matches_current, get_bootloader,
+            get_composefs_status, get_container_manifest_and_config, get_imginfo,
         },
     },
     cli::{SoftRebootMode, UpgradeOpts},
@@ -340,7 +340,7 @@ pub(crate) async fn do_upgrade(
         Some(v1) => (v1.clone(), FormatVersion::V1),
         None => (id.clone(), repo.erofs_version()),
     };
-    let boot_ids: Vec<Sha512HashValue> = [boot_id_v1, boot_id_v2].into_iter().flatten().collect();
+    let boot_ids = accepted_boot_image_ids(boot_id_v1, boot_id_v2, &id);
 
     let (boot_digest, deploy_id) = match boot_type {
         BootType::Bls => (
@@ -548,6 +548,39 @@ pub(crate) async fn upgrade_composefs(
     let (img_pulled, mut img_config) = is_image_pulled(&repo, booted_imgref).await?;
     let booted_img_digest = img_config.manifest.config().digest().to_string();
 
+    // Handle checks before any staged-deployment or bootloader decision.
+    if opts.check {
+        let current_image = host
+            .status
+            .booted
+            .as_ref()
+            .and_then(|entry| entry.image.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("No booted image source specified"))?;
+        let manifest_digest = img_config
+            .manifest_digest
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Fetched image has no manifest digest"))?;
+        let (current_manifest, _) = get_imginfo(storage, &*composefs.cmdline.digest)?;
+        let diff = ManifestDiff::new(&current_manifest.manifest, &img_config.manifest);
+        diff.print();
+
+        if fetched_image_matches_current(&current_manifest, &img_config, &manifest_digest) {
+            clear_cached_update(storage, &composefs.cmdline.digest)?;
+        } else {
+            write_cached_update(
+                storage,
+                &composefs.cmdline.digest,
+                &CachedUpdate {
+                    origin: current_image.image.clone(),
+                    candidate: booted_imgref.clone(),
+                    image: img_config,
+                    manifest_digest,
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
     // Check if we already have this update staged
     // Or if we have another staged deployment with a different image
     let staged_image = host.status.staged.as_ref().and_then(|i| i.image.as_ref());
@@ -633,13 +666,6 @@ pub(crate) async fn upgrade_composefs(
                 .await;
             }
         }
-    }
-
-    if opts.check {
-        let (current_manifest, _) = get_imginfo(storage, &*composefs.cmdline.digest)?;
-        let diff = ManifestDiff::new(&current_manifest.manifest, &img_config.manifest);
-        diff.print();
-        return Ok(());
     }
 
     do_upgrade(
