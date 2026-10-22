@@ -233,3 +233,8 @@ check:
   summary: Test that composefs-native images default to the composefs backend
   duration: 45m
   test: nu booted/test-install-composefs-native.nu
+
+/test-61-enforce-container-sigpolicy:
+  summary: Enforce and persist --enforce-container-sigpolicy on switch and upgrade
+  duration: 30m
+  test: nu booted/test-enforce-container-sigpolicy.nu

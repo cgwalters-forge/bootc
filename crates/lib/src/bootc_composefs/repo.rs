@@ -71,6 +71,7 @@ use crate::install::{RootSetup, State};
 use crate::lsm;
 use crate::podstorage::CStorage;
 use crate::progress_jsonl::ProgressWriter;
+use crate::spec::ImageSignature;
 
 /// Create a composefs OCI tag name for the given manifest digest.
 ///
@@ -507,6 +508,35 @@ async fn pull_composefs_unified(
     Ok(pull_result)
 }
 
+/// Apply the signature verification setting recorded in `imgref` before
+/// fetching it, as ostree-ext does for the ostree backend.
+///
+/// Signatures themselves are verified by containers-image-proxy or podman
+/// according to `containers-policy.json`; what this adds for
+/// [`ImageSignature::ContainerPolicy`] (`--enforce-container-sigpolicy`) is
+/// refusing a policy whose default is `insecureAcceptAnything`, which would
+/// otherwise accept unsigned images. `root` is where the policy is looked up.
+pub(crate) fn check_image_sigverify(
+    root: &Dir,
+    imgref: &crate::spec::ImageReference,
+) -> Result<()> {
+    match &imgref.signature {
+        None | Some(ImageSignature::Insecure) => Ok(()),
+        Some(ImageSignature::ContainerPolicy) => {
+            ostree_ext::container::skopeo::ensure_container_policy_not_default_insecure(root)
+        }
+        Some(ImageSignature::OstreeRemote(remote)) => anyhow::bail!(
+            "Signature verification via ostree remote '{remote}' is not supported with the composefs backend"
+        ),
+    }
+}
+
+/// [`check_image_sigverify`] against the policy of the running system.
+pub(crate) fn check_host_image_sigverify(imgref: &crate::spec::ImageReference) -> Result<()> {
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    check_image_sigverify(&root, imgref)
+}
+
 /// Pulls an image into a composefs repository at /sysroot.
 ///
 /// When `use_unified` is true, the image is first pulled into bootc-owned
@@ -527,6 +557,9 @@ pub(crate) async fn pull_composefs_repo(
 ) -> Result<PullRepoResult> {
     const COMPOSEFS_PULL_JOURNAL_ID: &str = "4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8";
 
+    // Upgrade and switch already checked this in `is_image_pulled`; repeat it
+    // right before fetching so no pull path can skip it.
+    check_host_image_sigverify(spec_imgref)?;
     let imgref = spec_imgref.to_image_proxy_ref()?;
 
     tracing::info!(
@@ -624,6 +657,43 @@ pub(crate) async fn pull_composefs_repo(
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn test_check_image_sigverify() -> Result<()> {
+        const INSECURE_DEFAULT: &str = r#"{"default": [{"type": "insecureAcceptAnything"}]}"#;
+        const REJECT_DEFAULT: &str = r#"{"default": [{"type": "reject"}]}"#;
+
+        let imgref = |signature| crate::spec::ImageReference {
+            image: "quay.io/example/os:latest".into(),
+            transport: "registry".into(),
+            signature,
+        };
+        let enforced = imgref(Some(ImageSignature::ContainerPolicy));
+
+        let td = cap_tempfile::tempdir(ambient_authority())?;
+        td.create_dir_all("etc/containers")?;
+
+        td.write("etc/containers/policy.json", INSECURE_DEFAULT)?;
+        // Without enforcement, a permissive policy is fine.
+        check_image_sigverify(&td, &imgref(None))?;
+        check_image_sigverify(&td, &imgref(Some(ImageSignature::Insecure)))?;
+        let err = check_image_sigverify(&td, &enforced).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("insecureAcceptAnything"),
+            "unexpected error: {err:#}"
+        );
+
+        td.write("etc/containers/policy.json", REJECT_DEFAULT)?;
+        check_image_sigverify(&td, &enforced)?;
+
+        let err = check_image_sigverify(
+            &td,
+            &imgref(Some(ImageSignature::OstreeRemote("os".into()))),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not supported"));
+        Ok(())
+    }
 
     #[test]
     fn test_bootc_tag_for_manifest() {

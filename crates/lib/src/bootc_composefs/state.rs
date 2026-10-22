@@ -17,6 +17,7 @@ use composefs_ctl::composefs;
 use fn_error_context::context;
 use linux_kernel_cmdline::utf8::Cmdline;
 
+use ostree_ext::container::SignatureSource;
 use ostree_ext::container::deploy::ORIGIN_CONTAINER;
 use rustix::{
     fd::AsFd,
@@ -214,6 +215,22 @@ pub(crate) fn update_boot_digest_in_origin(
     )
 }
 
+/// The origin's container image reference for `imgref`, in the
+/// `<sigverify>:<transport>:<image>` form that the ostree backend also uses
+/// (e.g. `ostree-image-signed:docker://quay.io/example/os:latest`).
+///
+/// Recording the signature verification setting here is what makes a
+/// `--enforce-container-sigpolicy` choice stick across later upgrades.
+fn origin_container_ref(imgref: &ImageReference) -> Result<String> {
+    let sigverify = imgref
+        .signature
+        .clone()
+        .map(SignatureSource::from)
+        .unwrap_or(SignatureSource::ContainerPolicyAllowInsecure);
+    let imgref = imgref.to_image_proxy_ref()?;
+    Ok(format!("{sigverify}:{imgref}"))
+}
+
 /// Creates and populates the composefs state directory for a deployment.
 ///
 /// This function sets up the state directory structure and configuration files
@@ -275,13 +292,9 @@ pub(crate) async fn write_composefs_state(
         allow_missing_fsverity,
     )?;
 
-    let imgref = target_imgref.to_image_proxy_ref()?;
-
-    let mut config = tini::Ini::new().section("origin").item(
-        ORIGIN_CONTAINER,
-        // TODO (Johan-Liebert1): The image won't always be unverified
-        format!("ostree-unverified-image:{imgref}"),
-    );
+    let mut config = tini::Ini::new()
+        .section("origin")
+        .item(ORIGIN_CONTAINER, origin_container_ref(target_imgref)?);
 
     config = config
         .section(ORIGIN_KEY_BOOT)
@@ -373,5 +386,66 @@ pub(crate) fn get_usr_overlay_status() -> Result<Option<FilesystemOverlay>> {
         }))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use ostree_ext::container::OstreeImageReference;
+
+    use super::*;
+    use crate::spec::ImageSignature;
+
+    #[test]
+    fn origin_container_ref_preserves_signature() -> Result<()> {
+        let cases = [
+            (
+                "registry",
+                "quay.io/example/os:latest",
+                None,
+                "ostree-unverified-image:docker://quay.io/example/os:latest",
+            ),
+            (
+                "registry",
+                "quay.io/example/os:latest",
+                Some(ImageSignature::ContainerPolicy),
+                "ostree-image-signed:docker://quay.io/example/os:latest",
+            ),
+            (
+                "containers-storage",
+                "localhost/os:latest",
+                Some(ImageSignature::ContainerPolicy),
+                "ostree-image-signed:containers-storage:localhost/os:latest",
+            ),
+            (
+                "oci",
+                "/var/tmp/os",
+                Some(ImageSignature::Insecure),
+                "ostree-unverified-image:oci:/var/tmp/os",
+            ),
+        ];
+        for (transport, image, signature, expected) in cases {
+            let imgref = ImageReference {
+                image: image.into(),
+                transport: transport.into(),
+                signature,
+            };
+            let origin = origin_container_ref(&imgref)?;
+            assert_eq!(origin, expected);
+
+            // Reading the origin back (as composefs status does) must yield
+            // the same signature policy, so upgrades keep enforcing it.
+            let parsed = ImageReference::from(OstreeImageReference::from_str(&origin)?);
+            assert_eq!(parsed.image, imgref.image);
+            assert_eq!(parsed.transport, imgref.transport);
+            let expected_sig = match imgref.signature {
+                Some(ImageSignature::Insecure) => None,
+                s => s,
+            };
+            assert_eq!(parsed.signature, expected_sig);
+        }
+        Ok(())
     }
 }

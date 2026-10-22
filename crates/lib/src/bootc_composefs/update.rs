@@ -65,6 +65,9 @@ pub(crate) async fn is_image_pulled(
     repo: &ComposefsRepository,
     imgref: &ImageReference,
 ) -> Result<(Option<Sha512HashValue>, ImgConfigManifest)> {
+    // Check before contacting the registry, so that an unenforceable
+    // signature policy is reported even when there is nothing new to pull.
+    crate::bootc_composefs::repo::check_host_image_sigverify(imgref)?;
     let imgref_repr = imgref.to_image_proxy_ref()?;
     let img_config_manifest = get_container_manifest_and_config(&imgref_repr).await?;
 

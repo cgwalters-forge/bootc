@@ -367,4 +367,11 @@ execute:
     test:
       - /tmt/tests/tests/test-60-install-composefs-native
   extra-fixme_skip_if_uki: true
+
+/plan-61-enforce-container-sigpolicy:
+  summary: Enforce and persist --enforce-container-sigpolicy on switch and upgrade
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-61-enforce-container-sigpolicy
 # END GENERATED PLANS
