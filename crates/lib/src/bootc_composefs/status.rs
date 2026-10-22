@@ -274,6 +274,18 @@ pub(crate) fn get_sorted_staged_type1_boot_entries(
     get_sorted_type1_boot_entries_helper(boot_dir, ascending, true, bootloader)
 }
 
+/// Return whether a Type 1 entry belongs to bootc's reserved BLS namespace.
+/// Other operating systems commonly share `/boot/loader/entries`; their
+/// entries must not make composefs status fail while bootc is inspecting its
+/// own deployments.
+pub(crate) fn is_bootc_type1_entry(entry: &BLSConfig) -> bool {
+    entry
+        .sort_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("bootc-"))
+        || entry.get_verity().is_ok()
+}
+
 #[context("Getting sorted Type1 boot entries")]
 fn get_sorted_type1_boot_entries_helper(
     boot_dir: &Dir,
@@ -365,6 +377,7 @@ pub(crate) fn list_type1_entries(boot_dir: &Dir) -> Result<Vec<BootloaderEntry>>
     boot_entries
         .into_iter()
         .chain(staged_boot_entries)
+        .filter(is_bootc_type1_entry)
         .map(|entry| {
             Ok(BootloaderEntry {
                 fsverity: entry.get_verity()?,
@@ -1046,7 +1059,10 @@ async fn composefs_deployment_status_from(
         match booted_cfs.bootloader.kind()? {
             BootloaderKind::GRUBClassic => match boot_type {
                 BootType::Bls => {
-                    let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?;
+                    let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?
+                        .into_iter()
+                        .filter(is_bootc_type1_entry)
+                        .collect::<Vec<_>>();
                     let bls_config = bls_configs
                         .first()
                         .ok_or_else(|| anyhow::anyhow!("First boot entry not found"))?;
@@ -1086,7 +1102,10 @@ async fn composefs_deployment_status_from(
 
             // We will have BLS stuff and the UKI stuff in the same DIR
             BootloaderKind::BLSCompatible => {
-                let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?;
+                let bls_configs = get_sorted_type1_boot_entries(boot_dir, true)?
+                    .into_iter()
+                    .filter(is_bootc_type1_entry)
+                    .collect::<Vec<_>>();
                 let bls_config = bls_configs
                     .first()
                     .ok_or(anyhow::anyhow!("First boot entry not found"))?;
@@ -1669,6 +1688,8 @@ mod tests {
         tempdir.create_dir_all("loader/entries.staged")?;
         tempdir.atomic_write("loader/entries/active.conf", active_entry)?;
         tempdir.atomic_write("loader/entries.staged/staged.conf", staged_entry)?;
+        let foreign_entry = "title Other OS\nversion 1\nsort-key other-os-0\nlinux /vmlinuz\noptions root=/dev/vda\n";
+        tempdir.atomic_write("loader/entries/foreign.conf", foreign_entry)?;
 
         let result = list_type1_entries(&tempdir)?;
         assert_eq!(result.len(), 2);
@@ -1682,6 +1703,10 @@ mod tests {
         assert!(
             verity_set.contains(digest_staged.as_str()),
             "Should contain staged entry"
+        );
+        assert_eq!(
+            tempdir.read_to_string("loader/entries/foreign.conf")?,
+            foreign_entry
         );
 
         Ok(())
