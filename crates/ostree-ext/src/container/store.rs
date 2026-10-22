@@ -940,12 +940,8 @@ impl ImageImporter {
     #[context("Fetching manifest")]
     pub(crate) async fn prepare_internal(&mut self, verify_layers: bool) -> Result<PrepareResult> {
         match &self.imgref.sigverify {
-            SignatureSource::ContainerPolicy
-                if skopeo::container_policy_is_default_insecure(&self.root)? =>
-            {
-                return Err(anyhow!(
-                    "containers-policy.json specifies a default of `insecureAcceptAnything`; refusing usage"
-                ));
+            SignatureSource::ContainerPolicy => {
+                skopeo::ensure_container_policy_not_default_insecure(&self.root)?;
             }
             SignatureSource::OstreeRemote(_) if verify_layers => {
                 return Err(anyhow!(
@@ -1045,12 +1041,8 @@ impl ImageImporter {
         write_refs: bool,
     ) -> Result<()> {
         tracing::debug!("Fetching base");
-        if matches!(self.imgref.sigverify, SignatureSource::ContainerPolicy)
-            && skopeo::container_policy_is_default_insecure(&self.root)?
-        {
-            return Err(anyhow!(
-                "containers-policy.json specifies a default of `insecureAcceptAnything`; refusing usage"
-            ));
+        if matches!(self.imgref.sigverify, SignatureSource::ContainerPolicy) {
+            skopeo::ensure_container_policy_not_default_insecure(&self.root)?;
         }
         let remote = match &self.imgref.sigverify {
             SignatureSource::OstreeRemote(remote) => Some(remote.clone()),

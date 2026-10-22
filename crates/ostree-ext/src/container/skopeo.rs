@@ -128,7 +128,7 @@ impl ContainerPolicy {
     }
 }
 
-pub(crate) fn container_policy_is_default_insecure(root: &cap_std::fs::Dir) -> Result<bool> {
+fn container_policy_is_default_insecure(root: &cap_std::fs::Dir) -> Result<bool> {
     let root = &RootDir::new(root, ".").context("Opening RootDir")?;
     let f = resolve_policy_path(
         root,
@@ -142,6 +142,21 @@ pub(crate) fn container_policy_is_default_insecure(root: &cap_std::fs::Dir) -> R
     let r = std::io::BufReader::new(f);
     let policy: ContainerPolicy = serde_json::from_reader(r)?;
     Ok(policy.is_default_insecure())
+}
+
+/// Error out if `containers-policy.json` (resolved relative to `root`) has a
+/// top-level default of `insecureAcceptAnything`.
+///
+/// This is the best-effort guard behind [`super::SignatureSource::ContainerPolicy`]:
+/// signatures are verified by the policy itself, but a permissive default
+/// would silently accept unsigned images.
+pub fn ensure_container_policy_not_default_insecure(root: &cap_std::fs::Dir) -> Result<()> {
+    if container_policy_is_default_insecure(root)? {
+        anyhow::bail!(
+            "containers-policy.json specifies a default of `{INSECURE_ACCEPT_ANYTHING}`; refusing usage"
+        );
+    }
+    Ok(())
 }
 
 /// Create a Command builder for skopeo.
