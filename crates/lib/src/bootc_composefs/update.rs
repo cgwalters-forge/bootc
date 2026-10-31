@@ -300,6 +300,7 @@ async fn apply_upgrade(
             Some(depl_id),
             soft_reboot_mode,
             opts.apply,
+            &opts.prog,
         )
         .await;
     };
@@ -524,13 +525,13 @@ pub(crate) async fn do_upgrade(
         )?;
 
         if !pending.is_empty() {
-            println!(
+            opts.prog.info(
                 "notice: these global UKI addons are not provided by the new image and will be \
                  removed on a future update/switch unless re-added with \
-                 `bootc uki-addon add <name> global`:"
+                 `bootc uki-addon add <name> global`:",
             );
             for addon in &pending {
-                println!("  - {addon}");
+                opts.prog.info(format!("  - {addon}"));
             }
         }
     }
@@ -553,8 +554,9 @@ pub(crate) async fn apply_upgrade_from_downloaded(
 
     // Staged deployment exists, but it will be finalized
     if !staged.download_only {
-        println!("Staged deployment is present and not in download only mode.");
-        println!("Use `bootc update --apply` to apply the update.");
+        let prog = &do_upgrade_opts.prog;
+        prog.info("Staged deployment is present and not in download only mode.");
+        prog.info("Use `bootc update --apply` to apply the update.");
         return Ok(());
     }
 
@@ -688,7 +690,9 @@ pub(crate) async fn upgrade_composefs(
                 return crate::reboot::reboot();
             }
 
-            println!("Update already staged. To apply update run `bootc update --apply`");
+            do_upgrade_opts
+                .prog
+                .info("Update already staged. To apply update run `bootc update --apply`");
 
             return Ok(());
         }
@@ -713,7 +717,9 @@ pub(crate) async fn upgrade_composefs(
 
             match action {
                 UpdateAction::Skip => {
-                    println!("No changes in staged image: {booted_imgref:#}");
+                    do_upgrade_opts
+                        .prog
+                        .info(format!("No changes in staged image: {booted_imgref:#}"));
                     return Ok(());
                 }
 
@@ -745,7 +751,9 @@ pub(crate) async fn upgrade_composefs(
 
         match action {
             UpdateAction::Skip => {
-                println!("No changes in: {booted_imgref:#}");
+                do_upgrade_opts
+                    .prog
+                    .info(format!("No changes in: {booted_imgref:#}"));
                 return Ok(());
             }
 

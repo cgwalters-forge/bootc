@@ -2,6 +2,7 @@
 //!
 //! This module handles the TOML configuration file for `bootc install`.
 
+use crate::progress_jsonl::ProgressWriter;
 use crate::spec::Bootloader;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -289,7 +290,7 @@ impl InstallConfiguration {
 
 #[context("Loading configuration")]
 /// Load the install configuration, merging all found configuration files.
-pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
+pub(crate) fn load_config(prog: &ProgressWriter) -> Result<Option<InstallConfiguration>> {
     let env = EnvProperties {
         sys_arch: std::env::consts::ARCH.to_string(),
     };
@@ -305,7 +306,7 @@ pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
         })
         .with_context(|| format!("Parsing {path:?}"))?;
         for key in unused {
-            eprintln!("warning: {path:?}: Unknown key {key}");
+            prog.warning(format!("warning: {path:?}: Unknown key {key}"));
         }
         if let Some(config) = config.as_mut() {
             if let Some(install) = c.install {

@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -17,6 +17,7 @@ use ostree_ext::{
 };
 
 use crate::bootc_composefs::boot::STAGED_GLOBAL_UKI_ADDONS_DIR;
+use crate::progress_jsonl::ProgressWriter;
 use crate::spec::Host;
 use crate::{
     bootc_composefs::{
@@ -101,6 +102,7 @@ pub(crate) fn handle_addon_cli_cmd(
     booted_cfs: &BootedComposefs,
     host: &Host,
     opts: &UkiAddonCliOpts,
+    prog: &ProgressWriter,
 ) -> Result<()> {
     let Ok(esp) = storage.require_esp() else {
         anyhow::bail!("ESP not found");
@@ -122,17 +124,18 @@ pub(crate) fn handle_addon_cli_cmd(
                     .context("Writing JSON output");
             }
 
+            let mut stdout = std::io::stdout().lock();
             if addons.is_empty() {
-                println!("No UKI addons installed");
+                writeln!(stdout, "No UKI addons installed")?;
                 return Ok(());
             }
 
             for (i, addon) in addons.iter().enumerate() {
                 // Separate addon blocks with a blank line.
                 if i > 0 {
-                    println!();
+                    writeln!(stdout)?;
                 }
-                println!("{addon}");
+                writeln!(stdout, "{addon}")?;
             }
         }
         UkiAddonCliOpts::Remove {
@@ -198,7 +201,7 @@ pub(crate) fn handle_addon_cli_cmd(
                         .remove_file(&addon_path)
                         .with_context(|| format!("Failed to remove addon {addon_name}"))?;
 
-                    println!("Removed addon {addon_name}");
+                    prog.info(format!("Removed addon {addon_name}"));
 
                     let addons_dir = addon_path
                         .parent()
@@ -218,7 +221,7 @@ pub(crate) fn handle_addon_cli_cmd(
                             format!("Removing addons dir: {}", addons_dir.display())
                         })?;
 
-                        println!("Removed empty directory {}", addons_dir.display());
+                        prog.info(format!("Removed empty directory {}", addons_dir.display()));
                     }
                 }
 
@@ -247,7 +250,7 @@ pub(crate) fn handle_addon_cli_cmd(
                         .remove_file(format!("{global_addons_dir}/{full_addon_name}"))
                         .with_context(|| format!("Removing global addon {full_addon_name}"))?;
 
-                    println!("Removed Global Addon {addon_name}");
+                    prog.info(format!("Removed Global Addon {addon_name}"));
 
                     let num_ents = esp
                         .fd
@@ -263,7 +266,7 @@ pub(crate) fn handle_addon_cli_cmd(
                             .remove_dir(global_addons_dir)
                             .context("Removing global addons dir")?;
 
-                        println!("Removed empty directory {global_addons_dir}");
+                        prog.info(format!("Removed empty directory {global_addons_dir}"));
 
                         // The staged global addon set is a transient overlay that
                         // finalize exchanges with the live set on the next boot. An
@@ -271,13 +274,13 @@ pub(crate) fn handle_addon_cli_cmd(
                         // the last staged global addon leaves the currently active
                         // global addons in effect after reboot.
                         if is_staged {
-                            println!(
+                            prog.info(format!(
                                 "Note: '{addon_name}' was the last staged global addon. \
                                  An empty staged global addon set is not applied on boot, so \
                                  the currently active global addons remain in effect after \
                                  reboot. To drop all global addons, remove them while no \
                                  deployment is staged."
-                            );
+                            ));
                         }
                     }
                 }
@@ -321,7 +324,9 @@ pub(crate) fn handle_addon_cli_cmd(
             });
 
             if already_present {
-                println!("Addon {addon_name} is already present. Nothing to do.");
+                prog.info(format!(
+                    "Addon {addon_name} is already present. Nothing to do."
+                ));
                 return Ok(());
             }
 
@@ -434,17 +439,15 @@ pub(crate) fn handle_addon_cli_cmd(
             .context("fsync")?;
 
             match addon_type {
-                UkiAddonScope::Global => println!("Global UKI Addon {addon_name} added"),
-                UkiAddonScope::Scoped => {
-                    println!(
-                        "UKI Addon {addon_name} added to {} deployment",
-                        if host.status.staged.is_some() {
-                            "staged"
-                        } else {
-                            "booted"
-                        }
-                    )
-                }
+                UkiAddonScope::Global => prog.info(format!("Global UKI Addon {addon_name} added")),
+                UkiAddonScope::Scoped => prog.info(format!(
+                    "UKI Addon {addon_name} added to {} deployment",
+                    if host.status.staged.is_some() {
+                        "staged"
+                    } else {
+                        "booted"
+                    }
+                )),
             }
         }
         UkiAddonCliOpts::ListReferenced { json } => {
@@ -459,18 +462,19 @@ pub(crate) fn handle_addon_cli_cmd(
                     .context("Writing JSON output");
             }
 
+            let mut stdout = std::io::stdout().lock();
             if referenced.is_empty() {
-                println!("No referenced UKI addons found");
+                writeln!(stdout, "No referenced UKI addons found")?;
                 return Ok(());
             }
 
             for (verity, addons) in &referenced {
-                println!("Deployment {verity}:");
+                writeln!(stdout, "Deployment {verity}:")?;
                 if addons.is_empty() {
-                    println!("  (none)");
+                    writeln!(stdout, "  (none)")?;
                 } else {
                     for addon in addons {
-                        println!("  {addon}");
+                        writeln!(stdout, "  {addon}")?;
                     }
                 }
             }

@@ -5,7 +5,7 @@
 //! composefs-rs (`composefs::progress`) reports progress via a synchronous,
 //! `Send + Sync` callback trait invoked directly from whatever task is
 //! driving the pull. That's a poor fit for [`crate::progress_jsonl::ProgressWriter`],
-//! whose API is `async`. We bridge the two by handing composefs-rs a trivial
+//! whose writes can block on a slow reader. We bridge the two by handing composefs-rs a trivial
 //! reporter that forwards every [`ProgressEvent`] over an unbounded channel,
 //! and processing that channel from a concurrently spawned Tokio task which
 //! owns the `indicatif` state and the `ProgressWriter`. This mirrors the
@@ -254,9 +254,9 @@ async fn drive_progress(
             subtasks,
         };
         if required {
-            prog.send(event).await;
+            prog.send(event);
         } else if any_activity {
-            prog.send_lossy(event).await;
+            prog.send_lossy(event);
         }
     }
 

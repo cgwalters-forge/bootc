@@ -9,6 +9,10 @@ static EMITTED_JOURNAL_ERROR: AtomicBool = AtomicBool::new(false);
 
 /// Wrapper for structured logging which is an explicit no-op
 /// when systemd is not in use (e.g. in a container).
+#[expect(
+    clippy::print_stderr,
+    reason = "the journal is failing, and tracing to stderr is filtered by default"
+)]
 pub(crate) fn journal_send<K, V>(
     priority: libsystemd::logging::Priority,
     msg: &str,

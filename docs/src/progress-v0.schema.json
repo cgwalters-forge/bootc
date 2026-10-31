@@ -154,9 +154,47 @@
         "stepsTotal",
         "subtasks"
       ]
+    },
+    {
+      "description": "A human readable status message, with the same text that is\nprinted to the terminal. The text is not a stable interface.",
+      "type": "object",
+      "properties": {
+        "level": {
+          "description": "The severity of the message.",
+          "$ref": "#/$defs/MessageLevel"
+        },
+        "text": {
+          "description": "The message text, without a trailing newline.",
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "Message"
+        }
+      },
+      "required": [
+        "type",
+        "level",
+        "text"
+      ]
     }
   ],
   "$defs": {
+    "MessageLevel": {
+      "description": "The severity of a `Message` event.",
+      "oneOf": [
+        {
+          "description": "Regular status output, e.g. which image was queued for the next boot.",
+          "type": "string",
+          "const": "info"
+        },
+        {
+          "description": "Something the user should pay attention to, which did not cause\nthe operation to fail.",
+          "type": "string",
+          "const": "warning"
+        }
+      ]
+    },
     "SubTaskBytes": {
       "description": "An incremental update to e.g. a container image layer download.\nThe first time a given \"subtask\" name is seen, a new progress bar should be created.\nIf bytes == bytes_total, then the subtask is considered complete.",
       "type": "object",

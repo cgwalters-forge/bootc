@@ -25,6 +25,16 @@ and removing old images.
 
 Note that new stages or fields may be added at any time.
 
+Status messages that bootc prints for the user (e.g. which image was
+queued for the next boot) are also sent as `Message` events, with a
+`level` of `info` or `warning` and the same `text` as printed to the
+terminal. That text is meant for humans and may change between releases,
+so don't parse it. `Message` events were added in version 0.2.0 of the
+protocol, as reported in the initial `Start` event.
+
+New event types may also be added at any time, so consumers must ignore
+events with a `type` they don't recognize.
+
 Importing and staging are affected by disk speed and the total image size. Pulling
 is affected by network speed and how many layers invalidate between pulls.
 Therefore, a large image with a good caching strategy will have longer

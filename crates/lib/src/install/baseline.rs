@@ -35,6 +35,7 @@ use super::State;
 use super::config::Filesystem;
 use crate::bootloader::systemd_version;
 use crate::discoverable_partition_specification::BIOS_BOOT;
+use crate::progress_jsonl::ProgressWriter;
 use crate::task::Task;
 #[cfg(feature = "install-to-disk")]
 use bootc_mount::is_mounted_in_pid1_mountns;
@@ -183,8 +184,8 @@ fn mkfs<'a>(
     Ok(u)
 }
 
-pub(crate) fn wipefs(dev: &Utf8Path) -> Result<()> {
-    println!("Wiping device {dev}");
+pub(crate) fn wipefs(dev: &Utf8Path, prog: &ProgressWriter) -> Result<()> {
+    prog.info(format!("Wiping device {dev}"));
     Command::new("wipefs")
         .args(["-a", dev.as_str()])
         .run_inherited_with_cmd_context()
@@ -891,6 +892,7 @@ pub(crate) fn install_create_rootfs(
     run_repart: bool,
 ) -> Result<RootSetup> {
     let install_config = state.install_config.as_ref();
+    let prog = &state.prog;
     let luks_name = "root";
     // Verify that the target is empty (if not already wiped in particular, but it's
     // also good to verify that the wipe worked)
@@ -906,11 +908,11 @@ pub(crate) fn install_create_rootfs(
         let dev = &opts.device;
         for child in device.children.iter().flatten() {
             let child = child.path();
-            println!("Wiping {child}");
-            wipefs(Utf8Path::new(&child))?;
+            prog.info(format!("Wiping {child}"));
+            wipefs(Utf8Path::new(&child), prog)?;
         }
-        println!("Wiping {dev}");
-        wipefs(dev)?;
+        prog.info(format!("Wiping {dev}"));
+        wipefs(dev, prog)?;
     } else if device.has_children() {
         anyhow::bail!(
             "Detected existing partitions on {}; use e.g. `wipefs` or --wipe if you intend to overwrite",
@@ -967,14 +969,14 @@ pub(crate) fn install_create_rootfs(
             "aboot disk layouts require the composefs backend"
         );
     }
-    println!("Block setup: {block_setup}");
-    println!("       Size: {}", device.size);
-    println!("     Serial: {serial}");
-    println!("      Model: {model}");
-    println!(
+    prog.info(format!("Block setup: {block_setup}"));
+    prog.info(format!("       Size: {}", device.size));
+    prog.info(format!("     Serial: {serial}"));
+    prog.info(format!("      Model: {model}"));
+    prog.info(format!(
         " Partitions: {}",
         if discoverable { "Discoverable" } else { "UUID" }
-    );
+    ));
 
     let root_size = opts
         .root_size

@@ -9,6 +9,8 @@ use cap_std::fs::Dir;
 use cap_std_ext::cap_std;
 use cap_std_ext::prelude::CapStdExtCommandExt;
 
+use crate::progress_jsonl::ProgressWriter;
+
 /// How much information we output
 #[derive(Debug, PartialEq, Eq, Default)]
 enum CmdVerbosity {
@@ -94,28 +96,26 @@ impl Task {
     }
 
     fn pre_run_output(&self) {
+        // Tasks mostly run during install, which doesn't take --progress-fd
+        // yet, so they aren't given a writer.
+        let prog = ProgressWriter::default();
         match self.verbosity {
             CmdVerbosity::Quiet => {}
             CmdVerbosity::Description => {
-                println!("{}", self.description);
+                prog.info(&self.description);
             }
             CmdVerbosity::Verbose => {
                 // Output the description first
-                println!("{}", self.description);
+                prog.info(&self.description);
 
-                // Lock stdout so we buffer
-                let mut stdout = std::io::stdout().lock();
-                let cmd_args = std::iter::once(self.cmd.get_program())
+                let cmdline = std::iter::once(self.cmd.get_program())
                     .chain(self.cmd.get_args())
-                    .map(|arg| arg.to_string_lossy());
-                // We unwrap() here to match the default for println!() even though
-                // arguably that's wrong
-                stdout.write_all(b">").unwrap();
-                for s in cmd_args {
-                    stdout.write_all(b" ").unwrap();
-                    stdout.write_all(s.as_bytes()).unwrap();
-                }
-                stdout.write_all(b"\n").unwrap();
+                    .fold(String::from(">"), |mut buf, arg| {
+                        buf.push(' ');
+                        buf.push_str(&arg.to_string_lossy());
+                        buf
+                    });
+                prog.info(cmdline);
             }
         }
     }
