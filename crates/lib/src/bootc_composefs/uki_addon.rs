@@ -200,22 +200,21 @@ pub fn list_installed_uki_addons(
 ) -> Result<Vec<UkiAddonsList>> {
     let mut addons = vec![];
 
-    let Ok(esp) = storage.require_esp() else {
+    let Ok(boot_partition) = storage.require_uki_partition() else {
         return Ok(addons);
     };
 
-    if let Some(global_dir) = esp.fd.open_dir_optional(GLOBAL_UKI_ADDONS_DIR)? {
+    if let Some(global_dir) = boot_partition.open_dir_optional(GLOBAL_UKI_ADDONS_DIR)? {
         gather_addons_from_dir(&global_dir, &mut addons, UkiAddonType::Global, false)
             .context("Gathering global addons")?;
     };
 
-    if let Some(global_dir) = esp.fd.open_dir_optional(STAGED_GLOBAL_UKI_ADDONS_DIR)? {
+    if let Some(global_dir) = boot_partition.open_dir_optional(STAGED_GLOBAL_UKI_ADDONS_DIR)? {
         gather_addons_from_dir(&global_dir, &mut addons, UkiAddonType::Global, true)
             .context("Gathering staged global addons")?;
     };
 
-    let Some(bootc_uki_dir) = esp
-        .fd
+    let Some(bootc_uki_dir) = boot_partition
         .open_dir_optional(BOOTC_UKI_DIR)
         .context("Opening UKI dir")?
     else {
@@ -244,8 +243,7 @@ pub fn list_installed_uki_addons(
 
         let depl_id = dir_name.strip_prefix(UKI_NAME_PREFIX).unwrap_or(dir_name);
 
-        let dir = esp
-            .fd
+        let dir = boot_partition
             .open_dir(format!("{BOOTC_UKI_DIR}/{filename}"))
             .with_context(|| format!("Opening {filename}"))?;
 

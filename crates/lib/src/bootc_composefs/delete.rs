@@ -64,7 +64,7 @@ fn delete_type1_conf_file(
                     continue;
                 }
 
-                // Boot dir in case of EFI will be the ESP
+                // Boot dir in case of EFI will be the ESP, or XBOOTLDR
                 tracing::debug!("Deleting EFI .conf file: {}", file_name);
                 entry.remove_file().context("Removing .conf file")?;
 
@@ -272,9 +272,9 @@ pub(crate) async fn delete_composefs_deployment(
         delete_depl_boot_entries(&depl_to_del, &storage, deleting_staged)?;
 
         if deleting_staged {
-            let esp = storage.require_esp()?;
+            let boot_partition = storage.require_uki_partition()?;
 
-            esp.fd
+            boot_partition
                 .remove_all_optional(STAGED_GLOBAL_UKI_ADDONS_DIR)
                 .context("Removing staged Global UKI Addons")?;
         }

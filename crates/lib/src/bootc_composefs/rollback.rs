@@ -288,10 +288,10 @@ pub(crate) async fn composefs_rollback(
                 // Clean up any staged global addons which is consistent with what we do
                 // for staged BLS Config files
                 //
-                // The fsync for ESP is done when we rollback entries
-                let esp = storage.require_esp()?;
+                // The boot partition is fsynced when we roll back entries
+                let boot_partition = storage.require_uki_partition()?;
 
-                esp.fd
+                boot_partition
                     .remove_all_optional(STAGED_GLOBAL_UKI_ADDONS_DIR)
                     .context("Removing staged Global UKI Addons")?;
 

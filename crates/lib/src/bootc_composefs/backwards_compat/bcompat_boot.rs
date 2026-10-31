@@ -215,7 +215,7 @@ fn stage_bls_entry_changes(
             }
 
             BLSConfigType::EFI { key, .. } => {
-                // boot_dir in case of UKI is the ESP
+                // boot_dir in case of UKI is the ESP, or XBOOTLDR
                 plan_efi_binary_renames(&boot_dir, &digest, &mut rename_transaction)?;
                 let new_path = Utf8PathBuf::from("/")
                     .join(BOOTC_UKI_DIR)
@@ -290,10 +290,10 @@ fn handle_bls_conf(
     create_staged_bls_entries(boot_dir, &new_bls_entries)?;
 
     let binaries_dir = if is_uki {
-        let esp = storage.require_esp()?;
-        let uki_dir = esp.fd.open_dir(BOOTC_UKI_DIR).context("Opening UKI dir")?;
-
-        uki_dir
+        storage
+            .require_uki_partition()?
+            .open_dir(BOOTC_UKI_DIR)
+            .context("Opening UKI dir")?
     } else {
         storage.bls_boot_binaries_dir()?
     };
