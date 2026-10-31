@@ -319,7 +319,7 @@ pub(crate) async fn do_upgrade(
     host: &Host,
     imgref: &ImageReference,
     opts: &DoUpgradeOpts<'_>,
-    manifest: &ostree_ext::oci_spec::image::ImageManifest,
+    img: &ImgConfigManifest,
 ) -> Result<()> {
     // Unpulled images bypass validate_update(), so check aboot state here too.
     if host.require_composefs_booted()?.boot_type == BootType::Aboot {
@@ -327,7 +327,7 @@ pub(crate) async fn do_upgrade(
     }
 
     // Pre-flight disk space check before pulling.
-    crate::deploy::check_disk_space_composefs(&*booted_cfs.repo, manifest, imgref)?;
+    crate::deploy::check_disk_space_composefs(&*booted_cfs.repo, &img.manifest, imgref)?;
 
     start_finalize_stated_svc()?;
 
@@ -345,6 +345,7 @@ pub(crate) async fn do_upgrade(
         opts.use_unified,
         opts.quiet,
         opts.prog.clone(),
+        img,
     )
     .await?;
 
@@ -655,19 +656,20 @@ pub(crate) async fn upgrade_composefs(
 
     // With a delta the target is whatever the delta says it is, and we can look
     // it up locally; without one we have to ask the registry.
-    let (img_pulled, mut manifest, manifest_digest) = match &delta {
+    let (img_pulled, mut img, manifest_digest) = match &delta {
         Some(delta) => {
             crate::delta::reject_unified_storage(delta, do_upgrade_opts.use_unified)?;
             ensure_delta_source_present(repo, delta)?;
             (
                 lookup_config_splitstream(repo, delta.target_manifest().config().digest())?,
-                delta.target_manifest().clone(),
+                ImgConfigManifest {
+                    config: delta.target_config().clone(),
+                    manifest: delta.target_manifest().clone(),
+                },
                 delta.target_manifest_digest().to_string(),
             )
         }
-        None => is_image_pulled(&repo, booted_imgref)
-            .await
-            .map(|(pulled, img, digest)| (pulled, img.manifest, digest))?,
+        None => is_image_pulled(&repo, booted_imgref).await?,
     };
 
     // Check if we already have this update staged
@@ -699,14 +701,14 @@ pub(crate) async fn upgrade_composefs(
         booted_imgref = &staged_image.image;
 
         let (img_pulled, staged_img_config, _) = is_image_pulled(&repo, booted_imgref).await?;
-        manifest = staged_img_config.manifest;
+        img = staged_img_config;
 
         if let Some(cfg_verity) = img_pulled {
             let action = validate_update(
                 storage,
                 composefs,
                 &host,
-                manifest.config().digest().as_ref(),
+                img.manifest.config().digest().as_ref(),
                 &cfg_verity,
                 false,
             )?;
@@ -724,7 +726,7 @@ pub(crate) async fn upgrade_composefs(
                         &host,
                         booted_imgref,
                         &do_upgrade_opts,
-                        &manifest,
+                        &img,
                     )
                     .await;
                 }
@@ -738,7 +740,7 @@ pub(crate) async fn upgrade_composefs(
             storage,
             composefs,
             &host,
-            manifest.config().digest().as_ref(),
+            img.manifest.config().digest().as_ref(),
             &cfg_verity,
             false,
         )?;
@@ -756,7 +758,7 @@ pub(crate) async fn upgrade_composefs(
                     &host,
                     booted_imgref,
                     &do_upgrade_opts,
-                    &manifest,
+                    &img,
                 )
                 .await;
             }
@@ -765,7 +767,7 @@ pub(crate) async fn upgrade_composefs(
 
     if opts.check {
         let (current_manifest, _) = get_imginfo(storage, &*composefs.cmdline.digest)?;
-        let diff = ManifestDiff::new(&current_manifest.manifest, &manifest);
+        let diff = ManifestDiff::new(&current_manifest.manifest, &img.manifest);
         diff.print();
         return Ok(());
     }
@@ -776,7 +778,7 @@ pub(crate) async fn upgrade_composefs(
         &host,
         booted_imgref,
         &do_upgrade_opts,
-        &manifest,
+        &img,
     )
     .await?;
 
