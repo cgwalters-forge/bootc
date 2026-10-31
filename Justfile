@@ -189,9 +189,7 @@ build-sealed:
 
 # Run tmt integration tests in VMs (e.g. `just test-tmt readonly`)
 [group('core')]
-test-tmt *ARGS: build
-    @just _build-upgrade-image
-    @just test-tmt-nobuild {{ARGS}}
+test-tmt *ARGS: build _build-upgrade-image (test-tmt-nobuild ARGS)
 
 [group('testing')]
 build-ukiboot-test-image: build
