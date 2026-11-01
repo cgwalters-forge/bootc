@@ -10,16 +10,16 @@
 
 use std assert
 use tap.nu
+use install_testlib.nu
 
 def main [] {
     tap begin "install to-filesystem without /boot"
 
     # Copy the booted image to container storage for use as install source
-    bootc image copy-to-storage
-    let target_image = "containers-storage:localhost/bootc"
+    let target_image = install_testlib copy_to_storage
 
     mkdir /var/mnt
-    truncate -s 10G disk.img
+    install_testlib create_disk disk.img
     mkfs.ext4 disk.img
     mount -o loop disk.img /var/mnt
 

@@ -16,11 +16,11 @@
 # variant, every test's install already relies on this default.
 #
 # TODO: This doesn't depend on the booted host; move it into a dedicated
-# install test suite, sharing the install-in-test code with the other install
-# tests: https://github.com/cgwalters-forge/tracker/issues/249
+# install test suite: https://github.com/cgwalters-forge/tracker/issues/249
 
 use std assert
 use tap.nu
+use install_testlib.nu
 
 const NATIVE = "localhost/bootc-composefs-native"
 const BOTH = "localhost/bootc-composefs-both"
@@ -30,39 +30,30 @@ const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITEST test@example.com"
 const KEYS = "/var/tmp/composefs-native-keys"
 
 def build [image: string, extra: string] {
-    let td = mktemp -d
-    $"FROM localhost/bootc
+    install_testlib build $image $"
 RUN rm -rf /usr/lib/bootc/bound-images.d/*
 RUN mkdir -p /usr/lib/composefs && touch /usr/lib/composefs/setup-root-conf.toml
 ($extra)
-" | save $"($td)/Containerfile"
-    # Keep an OCI manifest, see https://github.com/bootc-dev/bootc/issues/1703
-    podman build --format oci -t $image $td
-    rm -rf $td
+"
 }
 
 # Install `image` from itself and return the backend found on the disk
 def install [image: string, ...args: string] {
-    truncate -s 15G $DISK
-    (podman run --rm --privileged --pid=host
-        --security-opt label=type:unconfined_t
-        -v /dev:/dev -v /var/lib/containers:/var/lib/containers -v /var/tmp:/var/tmp
-        $image
-        bootc install to-disk --disable-selinux --via-loopback
-        --root-ssh-authorized-keys $KEYS ...$args $DISK)
+    install_testlib create_disk $DISK 15G
+    install_testlib install_to_disk $image $DISK ([--disable-selinux --root-ssh-authorized-keys $KEYS] | append $args)
 
     # Inspect the root partition of the installed disk
-    let parts = sfdisk --json $DISK | from json | get partitiontable
-    let root = $parts.partitions | where name == "root" | first
-    let offset = $root.start * ($parts.sectorsize? | default 512)
-    mkdir $MNT
-    mount -o $"ro,loop,offset=($offset)" $DISK $MNT
-    let composefs = ($"($MNT)/composefs" | path exists) and ((ls $"($MNT)/state/deploy" | length) == 1)
-    let ostree = ($"($MNT)/ostree/deploy" | path exists)
-    let dropin = glob $"($MNT)/state/deploy/*/etc/tmpfiles.d/bootc-root-ssh.conf"
-        | append (glob $"($MNT)/ostree/deploy/*/deploy/*/etc/tmpfiles.d/bootc-root-ssh.conf")
-        | each {|p| {content: (open --raw $p | decode utf-8), mode: (stat -c %a $p | str trim)}}
-    umount $MNT
+    let result = install_testlib with_mount $DISK $MNT {|mnt|
+        let composefs = ($"($mnt)/composefs" | path exists) and ((ls $"($mnt)/state/deploy" | length) == 1)
+        let ostree = ($"($mnt)/ostree/deploy" | path exists)
+        let dropin = glob $"($mnt)/state/deploy/*/etc/tmpfiles.d/bootc-root-ssh.conf"
+            | append (glob $"($mnt)/ostree/deploy/*/deploy/*/etc/tmpfiles.d/bootc-root-ssh.conf")
+            | each {|p| {content: (open --raw $p | decode utf-8), mode: (stat -c %a $p | str trim)}}
+        {composefs: $composefs, ostree: $ostree, dropin: $dropin}
+    }
+    let composefs = $result.composefs
+    let ostree = $result.ostree
+    let dropin = $result.dropin
     rm -f $DISK
     assert equal $dropin [{content: $"f~ /var/roothome/.ssh/authorized_keys 600 root root - ($KEY | encode base64)\n", mode: "644"}] "root ssh drop-in"
     match [$composefs $ostree] {
@@ -75,7 +66,7 @@ def install [image: string, ...args: string] {
 def main [] {
     tap begin "composefs-native images default to the composefs backend"
 
-    bootc image copy-to-storage
+    install_testlib copy_to_storage | ignore
     $KEY | save -f $KEYS
     build $NATIVE "RUN rm -f /usr/lib/ostree/prepare-root.conf /etc/ostree/prepare-root.conf"
     # On the composefs variant, localhost/bootc is itself composefs-native: it
