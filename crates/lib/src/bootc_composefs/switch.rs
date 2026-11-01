@@ -3,6 +3,7 @@ use fn_error_context::context;
 
 use crate::{
     bootc_composefs::{
+        repo::check_host_sigverify,
         status::get_composefs_status,
         update::{
             DoUpgradeOpts, UpdateAction, apply_upgrade_from_downloaded, do_upgrade,
@@ -67,6 +68,7 @@ pub(crate) async fn switch_composefs(
     let Some(target_imgref) = new_spec.image else {
         anyhow::bail!("Target image is undefined")
     };
+    check_host_sigverify(&target_imgref, delta.is_some())?;
 
     const COMPOSEFS_SWITCH_JOURNAL_ID: &str = "7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1";
 

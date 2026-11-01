@@ -510,6 +510,41 @@ async fn pull_composefs_unified(
     Ok(pull_result)
 }
 
+/// Refuse to pull an image whose reference requires containers-policy.json
+/// enforcement when that cannot happen, matching the ostree backend: either
+/// the policy accepts anything by default, or the content comes from a delta
+/// file that skopeo never sees.
+fn check_sigverify(
+    spec_imgref: &crate::spec::ImageReference,
+    from_delta: bool,
+    root: &Dir,
+) -> Result<()> {
+    if spec_imgref.signature != Some(crate::spec::ImageSignature::ContainerPolicy) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !from_delta,
+        "Cannot verify {} against containers-policy.json when importing from a delta; refusing usage",
+        spec_imgref.image
+    );
+    anyhow::ensure!(
+        !ostree_ext::container::skopeo::container_policy_is_default_insecure(root)?,
+        "containers-policy.json specifies a default of `insecureAcceptAnything`; refusing usage"
+    );
+    Ok(())
+}
+
+/// [`check_sigverify`] against the policy of the running system. Upgrade and
+/// switch call this before touching any state, and the pull itself calls it
+/// again for whatever image it ends up fetching.
+pub(crate) fn check_host_sigverify(
+    spec_imgref: &crate::spec::ImageReference,
+    from_delta: bool,
+) -> Result<()> {
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    check_sigverify(spec_imgref, from_delta, &root)
+}
+
 /// Pulls an image into a composefs repository at /sysroot.
 ///
 /// When `use_unified` is true, the image is first pulled into bootc-owned
@@ -536,6 +571,8 @@ pub(crate) async fn pull_composefs_repo(
     prog: ProgressWriter,
 ) -> Result<PullRepoResult> {
     const COMPOSEFS_PULL_JOURNAL_ID: &str = "4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8";
+
+    check_host_sigverify(spec_imgref, delta.is_some())?;
 
     let imgref = match delta {
         Some(delta) => {
@@ -649,6 +686,46 @@ mod tests {
         let tag = bootc_tag_for_manifest(digest);
         assert_eq!(tag, "localhost/bootc-sha256:abc123def456");
         assert!(tag.starts_with(BOOTC_TAG_PREFIX));
+    }
+
+    #[test]
+    fn test_check_sigverify() {
+        use crate::spec::{ImageReference, ImageSignature};
+
+        const INSECURE: &str = r#"{"default": [{"type": "insecureAcceptAnything"}]}"#;
+        const REJECT: &str = r#"{"default": [{"type": "reject"}]}"#;
+        let insecure = cap_tempfile::tempdir(ambient_authority()).unwrap();
+        insecure.create_dir_all("etc/containers").unwrap();
+        insecure
+            .atomic_write("etc/containers/policy.json", INSECURE)
+            .unwrap();
+        let strict = cap_tempfile::tempdir(ambient_authority()).unwrap();
+        strict.create_dir_all("etc/containers").unwrap();
+        strict
+            .atomic_write("etc/containers/policy.json", REJECT)
+            .unwrap();
+
+        let imgref = |signature| ImageReference {
+            image: "quay.io/example/os:latest".into(),
+            transport: "registry".into(),
+            signature,
+        };
+        let unverified = imgref(None);
+        let enforced = imgref(Some(ImageSignature::ContainerPolicy));
+
+        // (imgref, from_delta, root, expected to pass)
+        let cases = [
+            (&unverified, false, &insecure, true),
+            (&unverified, true, &insecure, true),
+            (&enforced, false, &strict, true),
+            (&enforced, false, &insecure, false),
+            (&enforced, true, &strict, false),
+            (&enforced, true, &insecure, false),
+        ];
+        for (imgref, from_delta, root, ok) in cases {
+            let r = check_sigverify(imgref, from_delta, root);
+            assert_eq!(r.is_ok(), ok, "{imgref:?} delta={from_delta}: {r:?}");
+        }
     }
 
     #[test]

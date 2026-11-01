@@ -27,7 +27,7 @@ use crate::{
             setup_composefs_uki_boot,
         },
         gc::composefs_gc,
-        repo::pull_composefs_repo,
+        repo::{check_host_sigverify, pull_composefs_repo},
         service::start_finalize_stated_svc,
         soft_reboot::prepare_soft_reboot_composefs,
         state::{write_composefs_state, write_staged_deployment},
@@ -638,6 +638,7 @@ pub(crate) async fn upgrade_composefs(
     if let Some(delta) = delta.as_ref() {
         delta.validate_image_reference(booted_imgref)?;
     }
+    check_host_sigverify(booted_imgref, delta.is_some())?;
 
     // Auto-detect unified storage: use the unified path if the target image is
     // already in bootc-owned containers-storage, OR if the booted image is —

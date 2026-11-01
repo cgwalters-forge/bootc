@@ -112,6 +112,13 @@ The following are supported with the composefs backend:
   `bootc container split-kernel-and-rootfs` and
   `bootc container compute-composefs-digest`, and the initramfs setup
   configured by [`setup-root-conf.toml`](man/bootc-setup-root-conf.5.md).
+- `--enforce-container-sigpolicy` on `bootc install` and `bootc switch`,
+  as on the ostree backend: the choice is recorded in the deployment's
+  origin as an `ostree-image-signed:` reference, and later upgrades and
+  switches refuse to pull when `containers-policy.json` defaults to
+  `insecureAcceptAnything` or when the image comes from a delta. Systems
+  installed without the flag, including by earlier releases, record
+  `ostree-unverified-image:` and are unaffected.
 
 On CentOS Stream 9, only sealed UKIs are tested; traditional kernel installs
 require newer dracut and systemd features. Its dracut also doesn't install
