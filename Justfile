@@ -214,6 +214,12 @@ test-ukiboot: build-ukiboot-update-test-image
 unit-tests: build-units
     podman run --rm --read-only localhost/bootc-units /usr/bin/bootc-units
 
+# Build and unit-test bootc without the selinux feature on Arch Linux, which
+# doesn't ship libselinux, checking the binary doesn't link it
+[group('core')]
+test-no-selinux:
+    podman build {{generic_buildargs}} --build-arg=CARGO_INCREMENTAL={{env("CARGO_INCREMENTAL", "")}} -t localhost/bootc-no-selinux -f ci/Containerfile.no-selinux .
+
 # Used by CI's test-integration matrix, where unit tests already ran once per OS.
 # Run the container integration tests only (no unit tests)
 [group('core')]

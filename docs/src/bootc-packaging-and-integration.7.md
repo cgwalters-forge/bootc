@@ -132,6 +132,10 @@ SELinux. Note that libostree may still link libselinux itself, depending on
 how it was built, and that the unit test targets (`make install-unit-tests`)
 always use the default features.
 
+To check this build with podman on Arch Linux, which doesn't ship
+libselinux, run `just test-no-selinux`. It verifies that the binary runs
+and doesn't link libselinux, and runs the `bootc-lib` unit tests.
+
 ## Integration Testing
 
 For distributions that want to include integration tests, use:
