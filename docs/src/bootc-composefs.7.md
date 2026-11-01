@@ -139,6 +139,9 @@ and may change or be removed:
 
 ## Limitations
 
+- CI covers the composefs backend on x86_64 only; aarch64 is untested.
+- On s390x, bootloader installation via zipl currently requires exactly one
+  BLS entry and a SCSI target.
 - `bootc edit` and [`bootc install reset`](bootc-experimental-install-reset.7.md)
   are not yet implemented for the composefs backend.
 - There is no `bootc-boot-complete.service` and no boot counting; see
