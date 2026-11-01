@@ -2,7 +2,6 @@
 //!
 //! This module parses the config files for the spec.
 
-use anyhow::{Result, anyhow};
 use camino::Utf8PathBuf;
 use composefs_boot::bootloader::EFI_EXT;
 use composefs_ctl::composefs_boot;
@@ -19,6 +18,57 @@ use crate::spec::Bootloader;
 
 /// First systemd release that supports UKI without the `efi` prefix
 const SYSTEMD_UKI_MIN_VERSION: u32 = 258;
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub(crate) enum BlsConfigError {
+    #[error("Missing 'version' value")]
+    MissingVersion,
+
+    #[error("'linux' and 'efi'/'uki' values present")]
+    ConflictingBootFields,
+
+    #[error("Missing 'linux', 'efi', or 'uki' value")]
+    MissingBootField,
+
+    #[error("Empty efi field")]
+    EmptyEfi,
+
+    #[error("efi does not start with custom prefix")]
+    MissingEfiPrefix,
+
+    #[error("efi doesn't end with .efi")]
+    MissingEfiSuffix,
+
+    #[error("No options")]
+    NoOptions,
+
+    #[error("{0}")]
+    InvalidComposefsCmdline(String),
+
+    #[error("No composefs= or composefs.digest= param")]
+    MissingComposefsParam,
+
+    #[error("Unknown config type")]
+    UnknownConfigType,
+
+    #[error("EFI path missing file name: {0}")]
+    EfiPathMissingFileName(String),
+
+    #[error("EFI file name missing expected suffix '{EFI_EXT}': {0}")]
+    EfiFileNameMissingSuffix(String),
+
+    #[error("Linux kernel path has no parent directory: {0}")]
+    LinuxPathMissingParent(String),
+
+    #[error("Parent directory has no file name: {0}")]
+    ParentMissingFileName(String),
+
+    #[error("Cannot extract boot artifact name from unknown config type")]
+    UnknownBootArtifactType,
+
+    #[error("No cmdline found for config")]
+    NoCmdline,
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum EFIKey {
@@ -208,7 +258,7 @@ impl BLSConfig {
     /// Get the fs-verity digest from a BLS config
     /// For EFI BLS entries, this returns the name of the UKI
     /// For Non-EFI BLS entries, this returns the fs-verity digest in the "options" field
-    pub(crate) fn get_verity(&self) -> Result<String> {
+    pub(crate) fn get_verity(&self) -> Result<String, BlsConfigError> {
         match &self.cfg_type {
             BLSConfigType::EFI { key } => {
                 let path = match key {
@@ -217,12 +267,12 @@ impl BLSConfig {
                 let name = path
                     .components()
                     .last()
-                    .ok_or(anyhow::anyhow!("Empty efi field"))?
+                    .ok_or(BlsConfigError::EmptyEfi)?
                     .to_string()
                     .strip_prefix(UKI_NAME_PREFIX)
-                    .ok_or_else(|| anyhow::anyhow!("efi does not start with custom prefix"))?
+                    .ok_or(BlsConfigError::MissingEfiPrefix)?
                     .strip_suffix(EFI_EXT)
-                    .ok_or_else(|| anyhow::anyhow!("efi doesn't end with .efi"))?
+                    .ok_or(BlsConfigError::MissingEfiSuffix)?
                     .to_string();
 
                 Ok(name)
@@ -231,15 +281,16 @@ impl BLSConfig {
             BLSConfigType::NonEFI { options, .. } => {
                 let options = options
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No options"))?;
+                    .ok_or(BlsConfigError::NoOptions)?;
 
-                let cfs_cmdline = ComposefsCmdline::find_in_cmdline(&Cmdline::from(&options))?
-                    .ok_or_else(|| anyhow::anyhow!("No composefs= or composefs.digest= param"))?;
+                let cfs_cmdline = ComposefsCmdline::find_in_cmdline(&Cmdline::from(&options))
+                    .map_err(|e| BlsConfigError::InvalidComposefsCmdline(e.to_string()))?
+                    .ok_or(BlsConfigError::MissingComposefsParam)?;
 
                 Ok(cfs_cmdline.digest.to_string())
             }
 
-            BLSConfigType::Unknown => anyhow::bail!("Unknown config type"),
+            BLSConfigType::Unknown => Err(BlsConfigError::UnknownConfigType),
         }
     }
 
@@ -248,7 +299,7 @@ impl BLSConfig {
     ///
     /// The names are stripped of our custom prefix and suffixes, so this returns the
     /// verity digest part of the name
-    pub(crate) fn boot_artifact_name(&self) -> Result<&str> {
+    pub(crate) fn boot_artifact_name(&self) -> Result<&str, BlsConfigError> {
         Ok(self.boot_artifact_info()?.0)
     }
 
@@ -259,7 +310,7 @@ impl BLSConfig {
     /// verity digest part of the name as the first value
     ///
     /// The second value is a boolean indicating whether it found our custom prefix or not
-    pub(crate) fn boot_artifact_info(&self) -> Result<(&str, bool)> {
+    pub(crate) fn boot_artifact_info(&self) -> Result<(&str, bool), BlsConfigError> {
         match &self.cfg_type {
             BLSConfigType::EFI { key } => {
                 let path = match key {
@@ -267,14 +318,10 @@ impl BLSConfig {
                 };
                 let file_name = path
                     .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("EFI path missing file name: {}", path))?;
+                    .ok_or_else(|| BlsConfigError::EfiPathMissingFileName(path.to_string()))?;
 
                 let without_suffix = file_name.strip_suffix(EFI_EXT).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "EFI file name missing expected suffix '{}': {}",
-                        EFI_EXT,
-                        file_name
-                    )
+                    BlsConfigError::EfiFileNameMissingSuffix(file_name.to_string())
                 })?;
 
                 // For backwards compatibility, we don't make this prefix mandatory
@@ -286,11 +333,11 @@ impl BLSConfig {
 
             BLSConfigType::NonEFI { linux, .. } => {
                 let parent_dir = linux.parent().ok_or_else(|| {
-                    anyhow::anyhow!("Linux kernel path has no parent directory: {}", linux)
+                    BlsConfigError::LinuxPathMissingParent(linux.to_string())
                 })?;
 
                 let dir_name = parent_dir.file_name().ok_or_else(|| {
-                    anyhow::anyhow!("Parent directory has no file name: {}", parent_dir)
+                    BlsConfigError::ParentMissingFileName(parent_dir.to_string())
                 })?;
 
                 // For backwards compatibility, we don't make this prefix mandatory
@@ -301,7 +348,7 @@ impl BLSConfig {
             }
 
             BLSConfigType::Unknown => {
-                anyhow::bail!("Cannot extract boot artifact name from unknown config type")
+                Err(BlsConfigError::UnknownBootArtifactType)
             }
         }
     }
@@ -309,22 +356,22 @@ impl BLSConfig {
     /// Gets the `options` field from the config
     /// Returns an error if the field doesn't exist
     /// or if the config is of type `EFI`
-    pub(crate) fn get_cmdline(&self) -> Result<&Cmdline<'_>> {
+    pub(crate) fn get_cmdline(&self) -> Result<&Cmdline<'_>, BlsConfigError> {
         match &self.cfg_type {
             BLSConfigType::NonEFI { options, .. } => {
                 let options = options
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No cmdline found for config"))?;
+                    .ok_or(BlsConfigError::NoCmdline)?;
 
                 Ok(options)
             }
 
-            _ => anyhow::bail!("No cmdline found for config"),
+            _ => Err(BlsConfigError::NoCmdline),
         }
     }
 }
 
-pub(crate) fn parse_bls_config(input: &str) -> Result<BLSConfig> {
+pub(crate) fn parse_bls_config(input: &str) -> Result<BLSConfig, BlsConfigError> {
     let mut title = None;
     let mut version = None;
     let mut linux = None;
@@ -360,7 +407,7 @@ pub(crate) fn parse_bls_config(input: &str) -> Result<BLSConfig> {
         }
     }
 
-    let version = version.ok_or_else(|| anyhow!("Missing 'version' value"))?;
+    let version = version.ok_or(BlsConfigError::MissingVersion)?;
 
     let cfg_type = match (linux, efi_key) {
         (None, Some(key)) => BLSConfigType::EFI { key },
@@ -373,8 +420,8 @@ pub(crate) fn parse_bls_config(input: &str) -> Result<BLSConfig> {
 
         // The spec makes no mention of whether both can be present or not
         // For now, for us, we won't have both at the same time
-        (Some(_), Some(_)) => anyhow::bail!("'linux' and 'efi'/'uki' values present"),
-        (None, None) => anyhow::bail!("Missing 'linux', 'efi', or 'uki' value"),
+        (Some(_), Some(_)) => return Err(BlsConfigError::ConflictingBootFields),
+        (None, None) => return Err(BlsConfigError::MissingBootField),
     };
 
     Ok(BLSConfig {
@@ -389,6 +436,8 @@ pub(crate) fn parse_bls_config(input: &str) -> Result<BLSConfig> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+
     use super::*;
 
     #[test]
@@ -474,7 +523,7 @@ mod tests {
         "#;
 
         let parsed = parse_bls_config(input);
-        assert!(parsed.is_err());
+        assert_eq!(parsed.unwrap_err(), BlsConfigError::MissingVersion);
     }
 
     #[test]
@@ -487,7 +536,7 @@ mod tests {
         "#;
 
         let parsed = parse_bls_config(input);
-        assert!(parsed.is_err());
+        assert_eq!(parsed.unwrap_err(), BlsConfigError::MissingBootField);
     }
 
     #[test]
@@ -759,12 +808,9 @@ mod tests {
         };
 
         let result = config.boot_artifact_name();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing expected suffix")
+        assert_eq!(
+            result.unwrap_err(),
+            BlsConfigError::EfiFileNameMissingSuffix("bootc_composefs-abcd1234".into())
         );
     }
 
@@ -782,12 +828,9 @@ mod tests {
         };
 
         let result = config.boot_artifact_name();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing file name")
+        assert_eq!(
+            result.unwrap_err(),
+            BlsConfigError::EfiPathMissingFileName("/".into())
         );
     }
 
@@ -800,13 +843,7 @@ mod tests {
         };
 
         let result = config.boot_artifact_name();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unknown config type")
-        );
+        assert_eq!(result.unwrap_err(), BlsConfigError::UnknownBootArtifactType);
     }
     #[test]
     fn test_boot_artifact_name_efi_nested_path() -> Result<()> {
@@ -882,7 +919,124 @@ mod tests {
         };
 
         let result = config.boot_artifact_name();
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            BlsConfigError::ParentMissingFileName("".into())
+        );
+    }
+
+    #[test]
+    fn test_conflicting_boot_fields() {
+        for key in ["efi", "uki"] {
+            let input = format!("version 1\nlinux /vmlinuz\n{key} /test.efi");
+            assert_eq!(
+                parse_bls_config(&input).unwrap_err(),
+                BlsConfigError::ConflictingBootFields
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_verity_errors() {
+        use BlsConfigError::*;
+
+        for (path, expected) in [
+            ("", EmptyEfi),
+            ("test.efi", MissingEfiPrefix),
+            ("bootc_composefs-test", MissingEfiSuffix),
+        ] {
+            for key in [EFIKey::Efi(path.into()), EFIKey::Uki(path.into())] {
+                let config = BLSConfig {
+                    cfg_type: BLSConfigType::EFI { key },
+                    ..Default::default()
+                };
+                assert_eq!(config.get_verity().unwrap_err(), expected);
+                assert_eq!(config.get_cmdline().unwrap_err(), NoCmdline);
+            }
+        }
+
+        for (options, expected) in [
+            (None, NoOptions),
+            (Some("root=UUID=abc"), MissingComposefsParam),
+            (
+                Some("composefs=invalid"),
+                InvalidComposefsCmdline("Parsing composefs kernel command line".into()),
+            ),
+        ] {
+            let config = BLSConfig {
+                cfg_type: BLSConfigType::NonEFI {
+                    linux: "/boot/vmlinuz".into(),
+                    initrd: vec![],
+                    options: options.map(Into::into),
+                },
+                ..Default::default()
+            };
+            assert_eq!(config.get_verity().unwrap_err(), expected);
+            if options.is_none() {
+                assert_eq!(config.get_cmdline().unwrap_err(), NoCmdline);
+            }
+        }
+
+        let config = BLSConfig::default();
+        assert_eq!(config.get_verity().unwrap_err(), UnknownConfigType);
+        assert_eq!(config.get_cmdline().unwrap_err(), NoCmdline);
+    }
+
+    #[test]
+    fn test_boot_artifact_info_linux_path_errors() {
+        for (linux, expected) in [
+            ("/", BlsConfigError::LinuxPathMissingParent("/".into())),
+            (
+                "/vmlinuz",
+                BlsConfigError::ParentMissingFileName("/".into()),
+            ),
+        ] {
+            let config = BLSConfig {
+                cfg_type: BLSConfigType::NonEFI {
+                    linux: linux.into(),
+                    initrd: vec![],
+                    options: None,
+                },
+                ..Default::default()
+            };
+            assert_eq!(config.boot_artifact_info().unwrap_err(), expected);
+            assert_eq!(config.boot_artifact_name().unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn test_error_display() {
+        use BlsConfigError::*;
+
+        for (error, expected) in [
+            (MissingVersion, "Missing 'version' value"),
+            (ConflictingBootFields, "'linux' and 'efi'/'uki' values present"),
+            (MissingBootField, "Missing 'linux', 'efi', or 'uki' value"),
+            (EmptyEfi, "Empty efi field"),
+            (MissingEfiPrefix, "efi does not start with custom prefix"),
+            (MissingEfiSuffix, "efi doesn't end with .efi"),
+            (NoOptions, "No options"),
+            (
+                InvalidComposefsCmdline("Parsing composefs kernel command line".into()),
+                "Parsing composefs kernel command line",
+            ),
+            (MissingComposefsParam, "No composefs= or composefs.digest= param"),
+            (UnknownConfigType, "Unknown config type"),
+            (EfiPathMissingFileName("/".into()), "EFI path missing file name: /"),
+            (
+                EfiFileNameMissingSuffix("test".into()),
+                "EFI file name missing expected suffix '.efi': test",
+            ),
+            (
+                LinuxPathMissingParent("/".into()),
+                "Linux kernel path has no parent directory: /",
+            ),
+            (ParentMissingFileName("/".into()), "Parent directory has no file name: /"),
+            (UnknownBootArtifactType, "Cannot extract boot artifact name from unknown config type"),
+            (NoCmdline, "No cmdline found for config"),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

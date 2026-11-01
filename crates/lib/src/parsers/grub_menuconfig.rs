@@ -2,7 +2,6 @@
 
 use std::fmt::Display;
 
-use anyhow::Result;
 use camino::Utf8PathBuf;
 use composefs_boot::bootloader::EFI_EXT;
 use composefs_ctl::composefs_boot;
@@ -18,6 +17,30 @@ use crate::{
     bootc_composefs::boot::{BOOTC_UKI_DIR, get_uki_name},
     composefs_consts::UKI_NAME_PREFIX,
 };
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub(crate) enum GrubMenuError {
+    #[error("Failed to parse GRUB menuentries: {0}")]
+    Parse(String),
+
+    #[error("Found menuentry with empty title")]
+    EmptyTitle,
+
+    #[error("Empty efi field")]
+    EmptyEfi,
+
+    #[error("efi does not start with custom prefix")]
+    MissingEfiPrefix,
+
+    #[error("efi doesn't end with .efi")]
+    MissingEfiSuffix,
+
+    #[error("Chainloader path missing file name: {0}")]
+    ChainloaderMissingFileName(String),
+
+    #[error("EFI file name missing expected suffix '{EFI_EXT}': {0}")]
+    EfiFileNameMissingSuffix(String),
+}
 
 /// Body content of a GRUB menuentry containing parsed commands.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -106,18 +129,18 @@ impl<'a> MenuEntry<'a> {
         }
     }
 
-    pub(crate) fn get_verity(&self) -> Result<String> {
+    pub(crate) fn get_verity(&self) -> Result<String, GrubMenuError> {
         let to_path = Utf8PathBuf::from(self.body.chainloader.clone());
 
         let name = to_path
             .components()
             .last()
-            .ok_or_else(|| anyhow::anyhow!("Empty efi field"))?
+            .ok_or(GrubMenuError::EmptyEfi)?
             .to_string()
             .strip_prefix(UKI_NAME_PREFIX)
-            .ok_or_else(|| anyhow::anyhow!("efi does not start with custom prefix"))?
+            .ok_or(GrubMenuError::MissingEfiPrefix)?
             .strip_suffix(EFI_EXT)
-            .ok_or_else(|| anyhow::anyhow!("efi doesn't end with .efi"))?
+            .ok_or(GrubMenuError::MissingEfiSuffix)?
             .to_string();
 
         Ok(name)
@@ -127,26 +150,19 @@ impl<'a> MenuEntry<'a> {
     ///
     /// The names are stripped of our custom prefix and suffixes, so this returns
     /// the verity digest part of the name
-    pub(crate) fn boot_artifact_name(&self) -> Result<String> {
+    pub(crate) fn boot_artifact_name(&self) -> Result<String, GrubMenuError> {
         Ok(self.boot_artifact_info()?.0)
     }
 
-    pub(crate) fn boot_artifact_info(&self) -> Result<(String, bool)> {
+    pub(crate) fn boot_artifact_info(&self) -> Result<(String, bool), GrubMenuError> {
         let chainloader_path = Utf8PathBuf::from(&self.body.chainloader);
 
         let file_name = chainloader_path.file_name().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Chainloader path missing file name: {}",
-                &self.body.chainloader
-            )
+            GrubMenuError::ChainloaderMissingFileName(self.body.chainloader.clone())
         })?;
 
         let without_suffix = file_name.strip_suffix(EFI_EXT).ok_or_else(|| {
-            anyhow::anyhow!(
-                "EFI file name missing expected suffix '{}': {}",
-                EFI_EXT,
-                file_name
-            )
+            GrubMenuError::EfiFileNameMissingSuffix(file_name.to_string())
         })?;
 
         // For backwards compatibility, we don't make this prefix mandatory
@@ -295,13 +311,13 @@ fn parse_all(input: &str) -> IResult<&str, Vec<MenuEntry<'_>>> {
 }
 
 /// Main entry point for parsing GRUB menuentry files.
-pub(crate) fn parse_grub_menuentry_file(contents: &str) -> anyhow::Result<Vec<MenuEntry<'_>>> {
+pub(crate) fn parse_grub_menuentry_file(contents: &str) -> Result<Vec<MenuEntry<'_>>, GrubMenuError> {
     let (_, entries) = parse_all(&contents)
-        .map_err(|e| anyhow::anyhow!("Failed to parse GRUB menuentries: {e}"))?;
+        .map_err(|e| GrubMenuError::Parse(e.to_string()))?;
     // Validate that entries have reasonable structure
     for entry in &entries {
         if entry.title.is_empty() {
-            anyhow::bail!("Found menuentry with empty title");
+            return Err(GrubMenuError::EmptyTitle);
         }
     }
 
@@ -529,7 +545,10 @@ mod test {
         "#;
 
         let result = parse_grub_menuentry_file(menuentry);
-        assert!(result.is_err(), "Should fail on malformed menuentry");
+        assert_eq!(
+            result.unwrap_err(),
+            GrubMenuError::Parse(parse_all(menuentry).unwrap_err().to_string())
+        );
     }
 
     #[test]
@@ -542,7 +561,10 @@ mod test {
         "#;
 
         let result = parse_grub_menuentry_file(menuentry);
-        assert!(result.is_err(), "Should fail on unbalanced braces");
+        assert_eq!(
+            result.unwrap_err(),
+            GrubMenuError::Parse(parse_all(menuentry).unwrap_err().to_string())
+        );
     }
 
     #[test]
@@ -637,12 +659,9 @@ mod test {
         };
 
         let result = entry.boot_artifact_name();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing expected suffix")
+        assert_eq!(
+            result.unwrap_err(),
+            GrubMenuError::EfiFileNameMissingSuffix("bootc_composefs-abcd1234".into())
         );
     }
 
@@ -662,7 +681,50 @@ mod test {
         };
 
         let result = entry.boot_artifact_name();
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            GrubMenuError::ChainloaderMissingFileName("".into())
+        );
+    }
+
+    #[test]
+    fn test_empty_title() {
+        // The current nom parser rejects empty titles before validation.
+        let input = "menuentry \"\" {}";
+        assert_eq!(
+            parse_grub_menuentry_file(input).unwrap_err(),
+            GrubMenuError::Parse(parse_all(input).unwrap_err().to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_verity_errors() {
+        for (path, expected) in [
+            ("", GrubMenuError::EmptyEfi),
+            ("test.efi", GrubMenuError::MissingEfiPrefix),
+            ("bootc_composefs-test", GrubMenuError::MissingEfiSuffix),
+        ] {
+            let mut entry = MenuEntry::new("Test", "digest");
+            entry.body.chainloader = path.into();
+            assert_eq!(entry.get_verity().unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn test_error_display() {
+        use GrubMenuError::*;
+
+        for (error, expected) in [
+            (Parse("error Tag at: menuentry".into()), "Failed to parse GRUB menuentries: error Tag at: menuentry"),
+            (EmptyTitle, "Found menuentry with empty title"),
+            (EmptyEfi, "Empty efi field"),
+            (MissingEfiPrefix, "efi does not start with custom prefix"),
+            (MissingEfiSuffix, "efi doesn't end with .efi"),
+            (ChainloaderMissingFileName("/".into()), "Chainloader path missing file name: /"),
+            (EfiFileNameMissingSuffix("test".into()), "EFI file name missing expected suffix '.efi': test"),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     /// Test that boot_artifact_name and get_verity return the same value
