@@ -1,4 +1,4 @@
-use std::{path::Path, process::Command};
+use std::{io::Read, path::Path, process::Command};
 
 use crate::bootc_composefs::boot::{GLOBAL_UKI_ADDONS_DIR, STAGED_GLOBAL_UKI_ADDONS_DIR};
 use crate::bootc_composefs::gc::{GCOpts, composefs_gc};
@@ -20,6 +20,88 @@ use etc_merge::{Diff, compute_diff, merge, traverse_etc};
 use rustix::fs::{Mode, OFlags, RenameFlags, fsync, renameat, renameat_with};
 
 use fn_error_context::context;
+
+// Like ostree's /boot/ostree/finalize-failure.stamp, this must survive shutdown
+// and be independent of the deployment whose finalization failed. The hold unit
+// keeps /boot available until finalization finishes.
+const FINALIZE_FAILURE_STAMP: &str = "bootc-finalize-failure.stamp";
+const PREVIOUS_FAILURE_STAMP: &str = "bootc-finalize-failure.stamp.previous";
+const MAX_FAILURE_BYTES: usize = 16 * 1024;
+
+/// Record the result even when loading storage failed. Never hide the original
+/// finalization error if persisting its diagnostic also fails.
+pub(crate) fn record_finalize_result(result: Result<()>) -> Result<()> {
+    let recorded = open_boot_for_stamp().and_then(|boot| update_failure_stamp(&boot, &result));
+    match result {
+        Err(error) => {
+            if let Err(stamp_error) = recorded {
+                tracing::error!("Could not record finalization failure: {stamp_error:#}");
+            }
+            Err(error)
+        }
+        Ok(()) => recorded,
+    }
+}
+
+pub(crate) fn open_boot_for_stamp() -> Result<Dir> {
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    let boot_is_mount = root.is_mountpoint(BOOT)? == Some(true);
+    open_boot_for_stamp_impl(&root, boot_is_mount)
+}
+
+fn open_boot_for_stamp_impl(root: &Dir, boot_is_mount: bool) -> Result<Dir> {
+    if boot_is_mount {
+        crate::utils::open_dir_remount_rw(root, BOOT.into())
+    } else {
+        // Match get_boot_dir_for_grub: without a mounted /boot, its persistent
+        // contents live under /sysroot/boot, not the read-only image's /boot.
+        let sysroot = crate::utils::open_dir_remount_rw(root, "sysroot".into())?;
+        sysroot
+            .open_dir(BOOT)
+            .context("Opening persistent /sysroot/boot")
+    }
+}
+
+fn update_failure_stamp(boot: &Dir, result: &Result<()>) -> Result<()> {
+    if let Err(error) = result {
+        let mut message = format!("{error:#}");
+        let mut end = message.len().min(MAX_FAILURE_BYTES);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        // atomic_write syncs both the file and parent directory.
+        boot.atomic_write(FINALIZE_FAILURE_STAMP, message)
+            .context("Writing finalization failure stamp")?;
+    } else {
+        boot.remove_file_optional(FINALIZE_FAILURE_STAMP)
+            .context("Clearing finalization failure stamp")?;
+    }
+    boot.open(".")?
+        .sync_all()
+        .context("Syncing finalization failure stamp directory")?;
+    Ok(())
+}
+
+/// Consume the failure once, retaining the diagnostic for inspection. Bound the
+/// read even if a damaged or externally written stamp is unexpectedly large.
+pub(crate) fn boot_complete(boot: &Dir) -> Result<()> {
+    let Some(file) = boot.open_optional(FINALIZE_FAILURE_STAMP)? else {
+        return Ok(());
+    };
+    let mut message = Vec::new();
+    file.take(MAX_FAILURE_BYTES as u64)
+        .read_to_end(&mut message)?;
+    boot.rename(FINALIZE_FAILURE_STAMP, boot, PREVIOUS_FAILURE_STAMP)
+        .context("Consuming finalization failure stamp")?;
+    boot.open(".")?
+        .sync_all()
+        .context("Syncing consumed finalization failure stamp")?;
+    anyhow::bail!(
+        "bootc-finalize-staged.service failed on previous boot: {}\nInspect the previous shutdown with: journalctl -b -1 -u bootc-finalize-staged.service",
+        String::from_utf8_lossy(&message)
+    )
+}
 
 pub(crate) async fn get_etc_diff(
     storage: &Storage,
@@ -126,7 +208,12 @@ pub(crate) async fn composefs_backend_finalize(
         .join(&staged_composefs.verity)
         .join("etc");
 
-    let new_etc = Dir::open_ambient_dir(new_etc_path, ambient_authority())?;
+    let new_etc = Dir::open_ambient_dir(&new_etc_path, ambient_authority()).with_context(|| {
+        format!(
+            "Opening staged deployment /etc at {}",
+            new_etc_path.display()
+        )
+    })?;
 
     let (pristine_files, current_files, new_files) =
         traverse_etc(&pristine_etc, &current_etc, Some(&new_etc))?;
@@ -300,4 +387,78 @@ fn finalize_staged_grub_uki(boot_fd: &Dir) -> Result<()> {
     fsync(entries_dir).context("fsync")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_stamp_boot_locations() -> Result<()> {
+        for boot_is_mount in [false, true] {
+            let root = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+            root.create_dir(BOOT)?;
+            root.create_dir_all("sysroot/boot")?;
+            let boot = open_boot_for_stamp_impl(&root, boot_is_mount)?;
+            update_failure_stamp(&boot, &Err(anyhow::anyhow!("broken staged etc")))?;
+            let expected = if boot_is_mount {
+                "boot"
+            } else {
+                "sysroot/boot"
+            };
+            assert!(root.try_exists(format!("{expected}/{FINALIZE_FAILURE_STAMP}"))?);
+            assert!(boot_complete(&open_boot_for_stamp_impl(&root, boot_is_mount)?).is_err());
+            boot_complete(&open_boot_for_stamp_impl(&root, boot_is_mount)?)?;
+            update_failure_stamp(&boot, &Err(anyhow::anyhow!("retry failed")))?;
+            update_failure_stamp(&boot, &Ok(()))?;
+            boot_complete(&open_boot_for_stamp_impl(&root, boot_is_mount)?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failure_stamp_lifecycle() -> Result<()> {
+        let boot = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+        // Missing stamps are a no-op, including repeated successful finalization.
+        boot_complete(&boot)?;
+        update_failure_stamp(&boot, &Ok(()))?;
+        update_failure_stamp(&boot, &Ok(()))?;
+        let failure = Err(anyhow::anyhow!("broken staged etc").context("Finalizing"));
+        update_failure_stamp(&boot, &failure)?;
+        assert_eq!(
+            boot.read_to_string(FINALIZE_FAILURE_STAMP)?,
+            "Finalizing: broken staged etc"
+        );
+        let error = boot_complete(&boot).unwrap_err().to_string();
+        assert!(error.contains("Finalizing: broken staged etc"));
+        assert!(error.contains("journalctl -b -1 -u bootc-finalize-staged.service"));
+        assert!(!boot.try_exists(FINALIZE_FAILURE_STAMP)?);
+        assert_eq!(
+            boot.read_to_string(PREVIOUS_FAILURE_STAMP)?,
+            "Finalizing: broken staged etc"
+        );
+        boot_complete(&boot)?;
+        // A new failure replaces the previous diagnostic, and success clears it.
+        update_failure_stamp(&boot, &failure)?;
+        assert!(boot_complete(&boot).is_err());
+        update_failure_stamp(&boot, &failure)?;
+        update_failure_stamp(&boot, &Ok(()))?;
+        assert!(!boot.try_exists(FINALIZE_FAILURE_STAMP)?);
+        boot_complete(&boot)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failure_stamp_is_bounded() -> Result<()> {
+        let boot = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+        update_failure_stamp(&boot, &Err(anyhow::anyhow!("€".repeat(MAX_FAILURE_BYTES))))?;
+        let message = boot.read_to_string(FINALIZE_FAILURE_STAMP)?;
+        assert!(message.len() <= MAX_FAILURE_BYTES);
+        assert!(!message.is_empty());
+        boot.atomic_write(FINALIZE_FAILURE_STAMP, "x".repeat(MAX_FAILURE_BYTES * 2))?;
+        let error = boot_complete(&boot).unwrap_err().to_string();
+        assert!(!error.contains(&"x".repeat(MAX_FAILURE_BYTES + 1)));
+        boot_complete(&boot)?;
+        Ok(())
+    }
 }

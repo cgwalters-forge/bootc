@@ -425,4 +425,16 @@ execute:
     test:
       - /tmt/tests/tests/test-63-install-shared-propagation
   extra-fixme_skip_if_composefs: true
+
+/plan-64-composefs-finalize-failure:
+  summary: Report a failed shutdown finalization once on the following composefs boot
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-64-composefs-finalize-failure
+  adjust:
+  - when: boot_type == aboot
+    enabled: false
+    because: Exercises systemd-boot or GRUB finalization
+  extra-skip_if_ostree: true
 # END GENERATED PLANS
