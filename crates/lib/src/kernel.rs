@@ -302,7 +302,10 @@ impl KernelType {
 /// where tools look for it. ostree also installs a `devicetree` file or `dtb/`
 /// directory and an `aboot.img` from this directory, but those are separate
 /// boot inputs rather than companions of `vmlinuz`, so they are left alone.
-pub(crate) const KERNEL_COMPANION_FILES: &[&str] = &[".vmlinuz.hmac"];
+pub(crate) const KERNEL_COMPANION_FILES: &[&str] = &[VMLINUZ_HMAC];
+
+/// The kernel's FIPS HMAC; see [`KERNEL_COMPANION_FILES`].
+pub(crate) const VMLINUZ_HMAC: &str = ".vmlinuz.hmac";
 
 /// Move the kernel out of `root` into `output/<kver>/`.
 ///

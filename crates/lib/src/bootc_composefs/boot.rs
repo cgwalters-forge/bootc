@@ -109,6 +109,7 @@ use crate::bootc_kargs::compute_new_kargs;
 use crate::composefs_consts::{
     BLS_ENTRY_FILE_PREFIX, TYPE1_BOOT_DIR_PREFIX, TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED,
 };
+use crate::kernel::VMLINUZ_HMAC;
 use crate::parsers::bls_config::{BLSConfig, BLSConfigType, EFIKey};
 use crate::spec::BootloaderKind;
 use crate::store::find_booted_from_esp;
@@ -589,14 +590,76 @@ pub(crate) fn get_global_uki_addon_name(name: &str) -> String {
     format!("{UKI_NAME_PREFIX}{name_wo_suffix}{EFI_ADDON_FILE_EXT}")
 }
 
-/// Compute SHA256Sum of VMlinuz + Initrd
+/// Read the kernel's FIPS HMAC from `/usr/lib/modules/<kver>` in the image, if
+/// it ships one, rewritten for the [`VMLINUZ`] it is installed next to.
+#[context("Reading kernel HMAC")]
+fn read_kernel_hmac(root: &Dir, kver: &str) -> Result<Option<String>> {
+    let path = format!("usr/lib/modules/{kver}/{VMLINUZ_HMAC}");
+    let Some(mut f) = root
+        .open_optional(&path)
+        .with_context(|| format!("Opening {path}"))?
+    else {
+        return Ok(None);
+    };
+    let mut hmac = String::new();
+    f.read_to_string(&mut hmac)
+        .with_context(|| format!("Reading {path}"))?;
+    rewrite_hmac_filename(&hmac).map(Some)
+}
+
+/// Point a kernel HMAC file at [`VMLINUZ`].
+///
+/// The file holds one `<hex digest>  <filename>` line, and kernel packages
+/// name the kernel as installed in /boot by rpm, e.g. `/boot/vmlinuz-<kver>`.
+/// dracut's `fips` module checks it with `sha512hmac -c` from the directory
+/// the HMAC is in, so the filename must be the kernel's name in that directory.
+fn rewrite_hmac_filename(hmac: &str) -> Result<String> {
+    let mut lines = hmac.lines().filter(|l| !l.trim().is_empty());
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        bail!("Expected exactly one line in {VMLINUZ_HMAC}");
+    };
+    // The line is trimmed, so a split always leaves a non-empty filename.
+    let (digest, _filename) = line
+        .trim()
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| anyhow!("Expected '<digest>  <filename>' in {VMLINUZ_HMAC}"))?;
+    ensure!(
+        digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid digest in {VMLINUZ_HMAC}"
+    );
+    Ok(format!("{digest}  {VMLINUZ}\n"))
+}
+
+/// SHA256 of the files in a Type1 boot directory: vmlinuz, initrd and, if
+/// present, the kernel HMAC as written there. The HMAC is optional so that
+/// directories written before bootc installed it keep their digest; an image
+/// shipping an HMAC therefore no longer matches such a directory, so the first
+/// upgrade after this change writes a new one and is not soft-rebootable.
+fn hash_type1_boot_files(vmlinuz: &[u8], initrd: &[u8], hmac: Option<&[u8]>) -> Result<String> {
+    let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
+        .context("Creating hasher")?;
+
+    hasher.update(vmlinuz).context("hashing vmlinuz")?;
+    hasher.update(initrd).context("hashing initrd")?;
+    if let Some(hmac) = hmac {
+        hasher.update(hmac).context("hashing hmac")?;
+    }
+
+    let digest: &[u8] = &hasher.finish().context("Finishing digest")?;
+
+    Ok(hex::encode(digest))
+}
+
+/// Compute SHA256Sum of VMlinuz + Initrd (+ HMAC)
 ///
 /// # Arguments
 /// * entry - BootEntry containing VMlinuz and Initrd
+/// * hmac - The rewritten kernel HMAC, from [`read_kernel_hmac`]
 /// * repo - The composefs repository
 #[context("Computing boot digest")]
 fn compute_boot_digest(
     entry: &UsrLibModulesVmlinuz<Sha512HashValue>,
+    hmac: Option<&str>,
     repo: &crate::store::ComposefsRepository,
 ) -> Result<String> {
     let vmlinuz = read_file(&entry.vmlinuz, &repo).context("Reading vmlinuz")?;
@@ -607,36 +670,30 @@ fn compute_boot_digest(
 
     let initramfs = read_file(initramfs, &repo).context("Reading intird")?;
 
-    let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
-        .context("Creating hasher")?;
-
-    hasher.update(&vmlinuz).context("hashing vmlinuz")?;
-    hasher.update(&initramfs).context("hashing initrd")?;
-
-    let digest: &[u8] = &hasher.finish().context("Finishing digest")?;
-
-    Ok(hex::encode(digest))
+    hash_type1_boot_files(&vmlinuz, &initramfs, hmac.map(str::as_bytes))
 }
 
 #[context("Computing boot digest for Type1 entries")]
 fn compute_boot_digest_type1(dir: &Dir) -> Result<String> {
-    let mut vmlinuz = dir
-        .open(VMLINUZ)
-        .with_context(|| format!("Opening {VMLINUZ}"))?;
+    let vmlinuz = dir
+        .read(VMLINUZ)
+        .with_context(|| format!("Reading {VMLINUZ}"))?;
 
-    let mut initrd = dir
-        .open(INITRD)
-        .with_context(|| format!("Opening {INITRD}"))?;
+    let initrd = dir
+        .read(INITRD)
+        .with_context(|| format!("Reading {INITRD}"))?;
 
-    let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
-        .context("Creating hasher")?;
+    let hmac = dir
+        .open_optional(VMLINUZ_HMAC)
+        .with_context(|| format!("Opening {VMLINUZ_HMAC}"))?
+        .map(|mut f| {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).map(|_| buf)
+        })
+        .transpose()
+        .with_context(|| format!("Reading {VMLINUZ_HMAC}"))?;
 
-    std::io::copy(&mut vmlinuz, &mut hasher)?;
-    std::io::copy(&mut initrd, &mut hasher)?;
-
-    let digest: &[u8] = &hasher.finish().context("Finishing digest")?;
-
-    Ok(hex::encode(digest))
+    hash_type1_boot_files(&vmlinuz, &initrd, hmac.as_deref())
 }
 
 /// Compute SHA256Sum of .linux + .initrd section of the UKI
@@ -728,6 +785,7 @@ fn write_bls_boot_entries_to_disk(
     boot_dir: &Utf8PathBuf,
     deployment_id: &Sha512HashValue,
     entry: &UsrLibModulesVmlinuz<Sha512HashValue>,
+    hmac: Option<&str>,
     repo: &crate::store::ComposefsRepository,
 ) -> Result<()> {
     let dir_name = get_type1_dir_name(&deployment_id.to_hex());
@@ -756,6 +814,12 @@ fn write_bls_boot_entries_to_disk(
             read_file(initramfs, &repo).context("Reading initrd")?,
         )
         .context("Writing initrd to path")?;
+
+    if let Some(hmac) = hmac {
+        entries_dir
+            .atomic_write(VMLINUZ_HMAC, hmac)
+            .with_context(|| format!("Writing {VMLINUZ_HMAC} to path"))?;
+    }
 
     // Can't call fsync on O_PATH fds, so re-open it as a non O_PATH fd
     let owned_fd = entries_dir
@@ -960,7 +1024,8 @@ pub(crate) fn setup_composefs_bls_boot(
         ComposefsBootEntry::Aboot(..) => anyhow::bail!("Found aboot payload"),
 
         ComposefsBootEntry::UsrLibModulesVmLinuz(usr_lib_modules_vmlinuz) => {
-            let boot_digest = compute_boot_digest(usr_lib_modules_vmlinuz, &repo)
+            let hmac = read_kernel_hmac(mounted_erofs, &usr_lib_modules_vmlinuz.kver)?;
+            let boot_digest = compute_boot_digest(usr_lib_modules_vmlinuz, hmac.as_deref(), &repo)
                 .context("Computing boot digest")?;
 
             let osrel = parse_os_release(mounted_erofs)?;
@@ -1042,6 +1107,7 @@ pub(crate) fn setup_composefs_bls_boot(
                         &entry_paths.entries_path,
                         id,
                         usr_lib_modules_vmlinuz,
+                        hmac.as_deref(),
                         &repo,
                     )?;
                 }
@@ -3045,6 +3111,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("ukiboot_b", &b"boot"[..]), ("ukiboot_a", &b"boot"[..])]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_hmac_filename() {
+        const DIGEST: &str = "0123456789abcdefABCDEF";
+        let expected = format!("{DIGEST}  vmlinuz\n");
+        for input in [
+            format!("{DIGEST}  /boot/vmlinuz-6.12.0-100.fc41.x86_64\n"),
+            format!("{DIGEST}  /boot/vmlinuz-6.12.0-100.fc41.x86_64"),
+            format!("{DIGEST} vmlinuz-6.12.0\n\n"),
+            format!("{DIGEST}\tvmlinuz\n"),
+        ] {
+            assert_eq!(
+                rewrite_hmac_filename(&input).unwrap(),
+                expected,
+                "{input:?}"
+            );
+        }
+        for input in [
+            "",
+            "\n",
+            DIGEST,
+            "not-hex  /boot/vmlinuz",
+            "abcd  /boot/vmlinuz-1\nabcd  /boot/vmlinuz-2\n",
+        ] {
+            assert!(rewrite_hmac_filename(input).is_err(), "{input:?}");
+        }
+    }
+
+    /// The digest computed from the image must match the digest of the boot
+    /// directory written from it, or deployments sharing a kernel would not be
+    /// deduplicated.
+    #[test]
+    fn test_type1_boot_digest_hmac() -> Result<()> {
+        use composefs::repository::RepositoryConfig;
+
+        const KVER: &str = "6.12.0";
+        let temp = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+        let config = RepositoryConfig::new(composefs::fsverity::Algorithm::SHA512).set_insecure();
+        let (repo, _) = ComposefsRepository::init_path(&*temp, "repo", config)?;
+        let entry = UsrLibModulesVmlinuz {
+            kver: KVER.into(),
+            vmlinuz: RegularFile::Inline(Box::from(&b"kernel"[..])),
+            initramfs: Some(RegularFile::Inline(Box::from(&b"initrd"[..]))),
+            os_release: None,
+        };
+        let image = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+        let boot = tempfile::tempdir()?;
+        let boot_path = Utf8Path::from_path(boot.path()).unwrap().to_owned();
+        let boot = Dir::open_ambient_dir(&boot_path, ambient_authority())?;
+
+        // No HMAC: the digest is what it was before bootc installed HMACs.
+        assert_eq!(read_kernel_hmac(&image, KVER)?, None);
+        let digest = compute_boot_digest(&entry, None, &repo)?;
+        assert_eq!(
+            digest,
+            hex::encode(openssl::sha::sha256(b"kernelinitrd")),
+            "digest without HMAC changed"
+        );
+        let id = Sha512HashValue::EMPTY;
+        write_bls_boot_entries_to_disk(&boot_path, &id, &entry, None, &repo)?;
+        let dir = boot.open_dir(get_type1_dir_name(&id.to_hex()))?;
+        assert!(!dir.try_exists(VMLINUZ_HMAC)?);
+        assert_eq!(compute_boot_digest_type1(&dir)?, digest);
+
+        let moddir = format!("usr/lib/modules/{KVER}");
+        image.create_dir_all(&moddir)?;
+        image.write(
+            format!("{moddir}/{VMLINUZ_HMAC}"),
+            format!("abcd  /boot/vmlinuz-{KVER}\n"),
+        )?;
+        let hmac = read_kernel_hmac(&image, KVER)?;
+        assert_eq!(hmac.as_deref(), Some("abcd  vmlinuz\n"));
+        let hmac_digest = compute_boot_digest(&entry, hmac.as_deref(), &repo)?;
+        assert_ne!(hmac_digest, digest);
+        let id = other_digest();
+        write_bls_boot_entries_to_disk(&boot_path, &id, &entry, hmac.as_deref(), &repo)?;
+        let dir = boot.open_dir(get_type1_dir_name(&id.to_hex()))?;
+        assert_eq!(dir.read_to_string(VMLINUZ_HMAC)?, "abcd  vmlinuz\n");
+        assert_eq!(compute_boot_digest_type1(&dir)?, hmac_digest);
         Ok(())
     }
 

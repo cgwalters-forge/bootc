@@ -273,3 +273,8 @@ check:
   summary: Install from a shared mount namespace without leaking the storage bind mount
   duration: 30m
   test: nu booted/test-install-shared-propagation.nu
+
+/test-64-composefs-fips-hmac:
+  summary: Boot a composefs Type1 deployment with fips=1, checking the installed kernel HMAC
+  duration: 45m
+  test: nu booted/test-composefs-fips-hmac.nu

@@ -425,4 +425,13 @@ execute:
     test:
       - /tmt/tests/tests/test-63-install-shared-propagation
   extra-fixme_skip_if_composefs: true
+
+/plan-64-composefs-fips-hmac:
+  summary: Boot a composefs Type1 deployment with fips=1, checking the installed kernel HMAC
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-64-composefs-fips-hmac
+  extra-skip_if_ostree: true
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
