@@ -939,7 +939,7 @@ async fn test_export_etc_remapping() -> Result<()> {
             h.set_entry_type(tar::EntryType::Directory);
             layer_tar.append_data(&mut h.clone(), "etc", &mut std::io::empty())?;
             h.set_mode(0o644);
-            h.set_size(test_etc_content.len().try_into().unwrap());
+            h.set_size(test_etc_content.as_bytes().len().try_into().unwrap());
             h.set_entry_type(tar::EntryType::Regular);
             layer_tar.append_data(
                 &mut h.clone(),
@@ -1548,7 +1548,7 @@ async fn test_container_etc_hardlinked(absolute: bool) -> Result<()> {
             layer_tar.append_data(&mut h.clone(), "etc", &mut std::io::empty())?;
             let testdata = "hardlinked test data";
             h.set_mode(0o644);
-            h.set_size(testdata.len().try_into().unwrap());
+            h.set_size(testdata.as_bytes().len().try_into().unwrap());
             h.set_entry_type(tar::EntryType::Regular);
             layer_tar.append_data(
                 &mut h.clone(),
@@ -1565,7 +1565,7 @@ async fn test_container_etc_hardlinked(absolute: bool) -> Result<()> {
             let mut h = tar::Header::new_ustar();
             h.set_mode(0o644);
             h.set_mtime(42);
-            h.set_size(testdata.len().try_into().unwrap());
+            h.set_size(testdata.as_bytes().len().try_into().unwrap());
             h.set_entry_type(tar::EntryType::Regular);
             layer_tar.append_data(
                 &mut h.clone(),
@@ -1581,8 +1581,9 @@ async fn test_container_etc_hardlinked(absolute: bool) -> Result<()> {
                 let ustarname = &mut h.as_ustar_mut().unwrap().name;
                 // The tar crate doesn't let us set absolute paths in tar archives, so we bypass
                 // it and just write to the path buffer directly.
+                let path = path.as_bytes();
                 assert!(path.len() < ustarname.len());
-                ustarname[0..path.len()].copy_from_slice(path.as_bytes());
+                ustarname[0..path.len()].copy_from_slice(path);
                 h.set_link_name(target)?;
                 h.set_cksum();
                 layer_tar.append(&mut h.clone(), std::io::empty())?;

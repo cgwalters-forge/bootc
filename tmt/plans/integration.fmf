@@ -255,7 +255,7 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-40-install-karg-delete
-  extra-fixme_skip_if_composefs: true
+  extra-fixme_skip_if_uki: true
 
 /plan-41-composefs-gc-uki:
   summary: Test composefs garbage collection for UKI
