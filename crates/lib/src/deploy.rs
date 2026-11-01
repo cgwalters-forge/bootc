@@ -896,18 +896,10 @@ pub(crate) async fn pull_from_prepared(
 }
 
 fn is_retryable_pull_error(error: &anyhow::Error) -> bool {
-    // TODO: Also classify transient prepare/OpenImage failures once
-    // containers-image-proxy exposes a typed error for them. Its current
-    // RequestInitiationFailure cannot safely distinguish DNS/TCP failures from
-    // permanent errors such as a missing image or a signature-policy rejection.
-    // https://github.com/bootc-dev/bootc/issues/2466
     error.chain().any(|source| {
-        matches!(
-            source.downcast_ref::<ostree_ext::containers_image_proxy::Error>(),
-            Some(ostree_ext::containers_image_proxy::Error::BlobError(
-                ostree_ext::containers_image_proxy::GetBlobError::Retryable(_)
-            ))
-        )
+        source
+            .downcast_ref::<ostree_ext::containers_image_proxy::Error>()
+            .is_some_and(|error| error.is_retryable())
     })
 }
 
@@ -1667,10 +1659,19 @@ mod tests {
         anyhow::Error::from(error).context("Creating importer")
     }
 
+    fn retryable_open_image_failure(message: &str) -> anyhow::Error {
+        let error = ostree_ext::containers_image_proxy::Error::RetryableRequestFailure {
+            method: "OpenImage".into(),
+            error: message.into(),
+        };
+        anyhow::Error::from(error).context("Creating importer")
+    }
+
     #[test]
     fn test_retryable_pull_error_classification() {
         let cases = [
             (retryable_blob_failure("502 Bad Gateway"), true),
+            (retryable_open_image_failure("502 Bad Gateway"), true),
             (permanent_blob_failure("blob unknown"), false),
             (open_image_failure("image unknown"), false),
         ];
@@ -1701,6 +1702,27 @@ mod tests {
         assert_eq!(value, 42);
         assert_eq!(attempts.get(), 2);
         assert_eq!(start.elapsed(), pull_retry_delay(0));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_pull_operation_retries_transient_prepare_error() -> Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let progress = PullProgress::new(true, ProgressWriter::default());
+        retry_pull_operation(&progress, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            async move {
+                if attempt == 1 {
+                    Err(retryable_open_image_failure("502 Bad Gateway"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await?;
+
+        assert_eq!(attempts.get(), 2);
         Ok(())
     }
 
