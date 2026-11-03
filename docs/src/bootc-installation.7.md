@@ -190,6 +190,12 @@ discussing mounting the root filesystem.
 
 Note that if a separate `/boot` is needed (e.g. for LUKS) you will also need to provide `--boot-mount-spec UUID=...`.
 
+With the composefs backend, mount the intended ESP at the target's `/boot/efi`
+or `/efi` (`/boot/efi` takes precedence). It must be a VFAT partition with the
+EFI System Partition type GUID; a mounted non-ESP is rejected. If neither path
+is mounted, bootc uses the first ESP found among the root's backing disks.
+Only one ESP is written; a separate XBOOTLDR partition is not supported yet.
+
 The `bootc install to-filesystem` command allows an operating
 system or distribution to ship a separate installer that creates more complex block
 storage or filesystem setups, but reuses the "top half" of the logic.

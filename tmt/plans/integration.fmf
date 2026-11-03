@@ -174,7 +174,7 @@ execute:
       - /tmt/tests/tests/test-32-install-to-filesystem-var-mount
 
 /plan-32-multi-device-esp:
-  summary: Test multi-device ESP detection for to-existing-root
+  summary: Test ESP discovery and composefs mounted ESP selection
   discover:
     how: fmf
     test:

@@ -152,8 +152,10 @@ and may change or be removed:
 - `--soft-reboot=auto` doesn't fall back to a regular reboot when the new
   deployment can't be soft rebooted into; see
   [Soft reboots](bootc-upgrades.7.md#soft-reboots).
-- Only a single ESP is used (the first one found), and a separate
-  XBOOTLDR partition is not supported.
+- Only a single ESP is used. Installation uses the ESP mounted at the target's
+  `/boot/efi` (or `/efi`); otherwise it uses the first ESP found among the root's
+  backing disks. A separate XBOOTLDR partition is not supported yet; see
+  [XBOOTLDR support](https://github.com/bootc-dev/bootc/pull/2573).
 - Rollback with GRUB and UKIs assumes exactly two deployments.
 - `bootc internals fsck` doesn't yet comprehensively cover the composefs
   backend; see [#2497](https://github.com/bootc-dev/bootc/pull/2497).

@@ -38,6 +38,73 @@ const KERNEL_INSTALL_CONF_ROOT: &str = "/tmp";
 /// See: <https://www.freedesktop.org/software/systemd/man/latest/bootctl.html>
 const BOOTCTL_RANDOM_SEED_MIN_VERSION: u32 = 257;
 
+/// Prefer the installer's mounted ESP; otherwise retain backing-disk discovery.
+pub(crate) fn find_install_esp(
+    root: &Dir,
+    root_path: &Utf8Path,
+    root_device: &bootc_blockdev::Device,
+) -> Result<bootc_blockdev::Device> {
+    if let Some(esp) = find_mounted_esp(root, root_path)? {
+        return Ok(esp);
+    }
+
+    let esps = root_device
+        .find_colocated_esps()?
+        .context("No ESP partition found among backing devices")?;
+    let mut esps = esps.into_iter();
+    let chosen = esps
+        .next()
+        .context("No ESP partition found among backing devices")?;
+    let others: Vec<_> = esps.map(|esp| esp.path()).collect();
+    if !others.is_empty() {
+        tracing::warn!(
+            "No ESP mounted under {root_path}; using {} instead of {}",
+            chosen.path(),
+            others.join(", ")
+        );
+    }
+    Ok(chosen)
+}
+
+/// Only an actual mount at boot/efi or efi is an explicit installer selection.
+fn find_mounted_esp(root: &Dir, root_path: &Utf8Path) -> Result<Option<bootc_blockdev::Device>> {
+    for subdir in ["boot/efi", EFI_DIR] {
+        let path = root_path.join(subdir);
+        let Some(dir) = root
+            .open_dir_optional(subdir)
+            .with_context(|| format!("Opening {path}"))?
+        else {
+            continue;
+        };
+        if dir.is_mountpoint(".")? != Some(true) {
+            continue;
+        }
+        let device = bootc_blockdev::list_dev_by_dir(&dir)
+            .with_context(|| format!("Resolving mounted ESP at {path}"))?;
+        validate_mounted_esp(&device, &path)?;
+        return Ok(Some(device));
+    }
+    Ok(None)
+}
+
+fn validate_mounted_esp(device: &bootc_blockdev::Device, path: &Utf8Path) -> Result<()> {
+    // Do not write bootloader files onto an unrelated mounted filesystem.
+    if !device
+        .parttype
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(bootc_blockdev::ESP))
+        || device.fstype.as_deref() != Some("vfat")
+    {
+        bail!(
+            "Mounted device {} at {path} is not a VFAT EFI System Partition (parttype={:?}, fstype={:?})",
+            device.path(),
+            device.parttype,
+            device.fstype
+        );
+    }
+    Ok(())
+}
+
 /// Mount the first ESP found among backing devices at /boot/efi.
 ///
 /// This is used by the install-alongside path to clean stale bootloader
@@ -474,6 +541,48 @@ pub(crate) fn install_via_zipl(device: &bootc_blockdev::Device, boot_uuid: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_mounted_esp() {
+        for (parttype, fstype, accepted) in [
+            (Some(bootc_blockdev::ESP), Some("vfat"), true),
+            (
+                Some("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"),
+                Some("vfat"),
+                true,
+            ),
+            (Some(bootc_blockdev::ESP), Some("ext4"), false),
+            (Some(bootc_blockdev::ESP), None, false),
+            (Some(bootc_blockdev::BIOS_BOOT), Some("vfat"), false),
+            (None, Some("vfat"), false),
+            (None, None, false),
+        ] {
+            let device = serde_json::from_value(serde_json::json!({
+                "name": "test-esp", "size": 512,
+                "parttype": parttype, "fstype": fstype,
+            }))
+            .unwrap();
+            let result = validate_mounted_esp(&device, Utf8Path::new("/target/boot/efi"));
+            if accepted {
+                result.unwrap();
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("/dev/test-esp at /target/boot/efi"));
+                assert!(message.contains("not a VFAT EFI System Partition"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_mounted_esp() -> Result<()> {
+        let root = cap_std_ext::cap_tempfile::tempdir(cap_std_ext::cap_std::ambient_authority())?;
+        let path = Utf8Path::new("/target");
+        assert!(find_mounted_esp(&root, path)?.is_none());
+        root.create_dir_all("boot/efi")?;
+        root.create_dir("efi")?;
+        assert!(find_mounted_esp(&root, path)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn test_parse_systemd_version() {

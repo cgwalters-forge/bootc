@@ -1,6 +1,6 @@
 # number: 32
 # tmt:
-#   summary: Test multi-device ESP detection for to-existing-root
+#   summary: Test ESP discovery and composefs mounted ESP selection
 #   duration: 60m
 #
 # Test that bootc install to-existing-root can find and use ESP partitions
@@ -187,6 +187,79 @@ def run_install [mountpoint: string] {
             --acknowledge-destructive
             --target-no-signature-verification
             /target)
+}
+
+# Exercise both composefs install paths (BLS and UKI) with systemd-boot.
+# The same disk has two ESPs: only the second is selected by the installer.
+def test_mounted_esp [] {
+    tap begin "composefs uses the mounted ESP"
+    bootc image copy-to-storage
+    let disk = "/var/tmp/mounted-esp.img"
+    let target = "/var/mnt/mounted-esp"
+    let check = "/var/mnt/unselected-esp"
+    truncate -s 10G $disk
+    let loop = (losetup -f --show $disk | str trim)
+    try {
+        $"label: gpt\nsize=512M, type=($ESP_TYPE)\nsize=512M, type=($ESP_TYPE)\ntype=($ROOT_TYPE)\n" | sfdisk $loop
+        partx -u $loop
+        udevadm settle
+        mkfs.vfat -F 32 $"($loop)p1"
+        mkfs.vfat -F 32 $"($loop)p2"
+        mkdir $target $check
+        mount $"($loop)p1" $check
+        "leave this ESP alone" | save $"($check)/sentinel"
+
+        for subdir in ["boot/efi", "efi"] {
+            mkfs.ext4 -q -F -O verity $"($loop)p3"
+            mount $"($loop)p3" $target
+            mkdir $"($target)/($subdir)"
+            mount $"($loop)p2" $"($target)/($subdir)"
+            run_composefs_install $target
+            assert ($"($target)/($subdir)/EFI/systemd" | path exists) "No systemd-boot on selected ESP"
+            let entries = (glob $"($target)/($subdir)/loader/entries/*.conf")
+            let ukis = (glob $"($target)/($subdir)/EFI/Linux/*.efi")
+            assert (($entries | is-not-empty) or ($ukis | is-not-empty)) "No BLS entries or UKIs on selected ESP"
+            assert equal (ls -a $check | get name | path basename) ["sentinel"] "Unselected ESP was modified"
+            assert equal (open --raw $"($check)/sentinel") "leave this ESP alone" "Sentinel changed"
+            umount $"($target)/($subdir)"
+            umount $target
+            mkfs.vfat -F 32 $"($loop)p2"
+        }
+
+        # A mounted ext4 filesystem is not an ESP, even with the ESP type GUID.
+        mkfs.ext4 -q -F $"($loop)p2"
+        mkfs.ext4 -q -F -O verity $"($loop)p3"
+        mount $"($loop)p3" $target
+        mkdir $"($target)/boot/efi"
+        mount $"($loop)p2" $"($target)/boot/efi"
+        let result = (do { run_composefs_install $target } | complete)
+        assert ($result.exit_code != 0) "Install accepted a mounted ext4 ESP"
+        let output = $"($result.stdout)\n($result.stderr)"
+        assert ($output | str contains "not a VFAT EFI System Partition") $output
+        assert ($output | str contains $"($loop)p2 at /target/boot/efi") $output
+        umount $"($target)/boot/efi"
+        umount $target
+        umount $check
+    } catch {|e|
+        # Only cleanup errors are ignored, to preserve the original test failure.
+        do { umount -R $target } | complete | ignore
+        do { umount $check } | complete | ignore
+        do { losetup -d $loop } | complete | ignore
+        error make {msg: $"Mounted ESP test failed: ($e)"}
+    }
+    losetup -d $loop
+    rm -f $disk
+    rmdir $target $check
+    tap ok
+}
+
+def run_composefs_install [target: string] {
+    (podman run --rm --privileged --pid=host
+        --security-opt label=type:unconfined_t
+        -v $"($target):/target" -v /dev:/dev -v /run/udev:/run/udev:ro
+        -v /usr/share/empty:/usr/lib/bootc/bound-images.d
+        $target_image bootc install to-filesystem --composefs-backend
+        --disable-selinux --generic-image --target-no-signature-verification /target)
 }
 
 # Test scenario 1: Single ESP on first device
@@ -471,12 +544,16 @@ def main [] {
         return
     }
 
-    # This test exercises bootupd-based bootloader installation which only
-    # supports GRUB today.  Skip when the image uses systemd-boot.
+    # systemd-boot exercises explicit mounted ESP selection; GRUB exercises
+    # bootupd's multi-device discovery below.
     if (tap is_composefs) {
         let st = bootc status --json | from json
         let bootloader = $st.status.booted.composefs.bootloader | str downcase
-        if $bootloader == "systemd" or $bootloader == "grub-cc" {
+        if $bootloader == "systemd" {
+            test_mounted_esp
+            return
+        }
+        if $bootloader == "grub-cc" {
             print $"SKIP: multi-device ESP test not supported with ($bootloader)"
             tap ok
             return

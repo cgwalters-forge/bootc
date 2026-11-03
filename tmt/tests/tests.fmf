@@ -102,7 +102,7 @@ check:
   test: bash booted/test-install-to-filesystem-var-mount.sh
 
 /test-32-multi-device-esp:
-  summary: Test multi-device ESP detection for to-existing-root
+  summary: Test ESP discovery and composefs mounted ESP selection
   duration: 60m
   test: nu booted/test-multi-device-esp.nu
 

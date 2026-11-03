@@ -330,7 +330,15 @@ fn read_dumpfile_from_fs(
 
 pub(crate) enum BootSetupType<'a> {
     /// For initial setup, i.e. install to-disk
-    Setup((&'a RootSetup, &'a State, &'a PostFetchState, bool)),
+    Setup(
+        (
+            &'a RootSetup,
+            &'a State,
+            &'a PostFetchState,
+            bool,
+            &'a bootc_blockdev::Device,
+        ),
+    ),
     /// For `bootc upgrade`
     Upgrade(
         (
@@ -830,7 +838,7 @@ pub(crate) fn setup_composefs_bls_boot(
     let id_hex = id.to_hex();
 
     let (esp_device, mut cmdline_refs, bootloader) = match setup_type {
-        BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
+        BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity, esp_part)) => {
             // root_setup.kargs has [root=UUID=<UUID>, "rw"]
             let mut cmdline_options = Cmdline::new();
 
@@ -861,12 +869,6 @@ pub(crate) fn setup_composefs_bls_boot(
                     tracing::debug!("Added /boot mount karg: {mount_extra}");
                 }
             }
-
-            // Locate ESP partition device by walking up to the root disk(s)
-            //
-            // NOTE: Not using [`find_booted_from_esp`] as we aren't booted
-            // into a bootc system
-            let esp_part = root_setup.device_info.find_first_colocated_esp()?;
 
             (
                 esp_part.path(),
@@ -1950,14 +1952,8 @@ pub(crate) fn setup_composefs_uki_boot(
         uki_addons_via_cli,
         installed_uki_addons,
     ) = match setup_type {
-        BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
+        BootSetupType::Setup((_, state, postfetch, allow_missing_fsverity, esp_part)) => {
             state.require_no_kargs_for_immutable_boot()?;
-
-            // Locate ESP partition device by walking up to the root disk(s)
-            //
-            // NOTE: Not using [`find_booted_from_esp`] as we aren't booted
-            // into a bootc system
-            let esp_part = root_setup.device_info.find_first_colocated_esp()?;
 
             let mut addons: Vec<UkiAddonsList> = vec![];
 
@@ -2255,24 +2251,14 @@ pub(crate) struct MountedImageRoot {
 }
 
 impl MountedImageRoot {
-    /// Find the ESP on `device`, attach the composefs image to a tmpdir, and
-    /// mount the ESP and a scratch tmpfs inside it.
+    /// Attach the composefs image to a tmpdir, prepare the selected ESP for
+    /// on-demand mounting, and mount a scratch tmpfs inside it.
     // TODO: install to all ESPs on multi-device setups
     #[context("Preparing image root for bootloader installation")]
     pub(crate) fn new(
         composefs_mnt_fd: std::os::fd::OwnedFd,
-        device: &bootc_blockdev::Device,
+        esp_part: &bootc_blockdev::Device,
     ) -> Result<Self> {
-        let roots = device.find_all_roots()?;
-        let mut esp_part = None;
-        for root in &roots {
-            if let Some(esp) = root.find_partition_of_esp_optional()? {
-                esp_part = Some(esp);
-                break;
-            }
-        }
-        let esp_part = esp_part.ok_or_else(|| anyhow!("ESP partition not found"))?;
-
         // Attach the detached composefs fsmount fd to a real tmpdir path so
         // that mount(2) and bootctl --root can work with it.
         let composefs = TempMount::mount_fd(composefs_mnt_fd)
@@ -2700,6 +2686,7 @@ pub(crate) fn prepare_composefs_aboot_artifacts(
 
 fn install_composefs_bootloader(
     root_setup: &RootSetup,
+    esp_part: Option<&bootc_blockdev::Device>,
     state: &State,
     bootloader: Bootloader,
     composefs_mnt_fd: std::os::fd::OwnedFd,
@@ -2709,7 +2696,15 @@ fn install_composefs_bootloader(
     if bootloader == Bootloader::None {
         return Ok(());
     }
-    let mounted_root = MountedImageRoot::new(composefs_mnt_fd, &root_setup.device_info)?;
+    // Android/ukiboot does not use the BLS/UKI install ESP selection.
+    let fallback_esp;
+    let esp_part = if let Some(esp) = esp_part {
+        esp
+    } else {
+        fallback_esp = root_setup.device_info.find_first_colocated_esp()?;
+        &fallback_esp
+    };
+    let mounted_root = MountedImageRoot::new(composefs_mnt_fd, esp_part)?;
 
     if bootloader == Bootloader::Ukiboot {
         return mounted_root.with_esp(|esp| install_ukiboot(mounted_root.dir(), fs, repo, esp));
@@ -2878,8 +2873,20 @@ pub(crate) async fn setup_composefs_boot(
         state.require_no_kargs_for_immutable_boot()?;
     }
 
+    // Resolve and validate before any bootloader writes, and share the result
+    // with the boot-entry writer so they cannot target different ESPs.
+    let esp_part = match boot_type {
+        BootType::Bls | BootType::Uki => Some(crate::bootloader::find_install_esp(
+            &root_setup.physical_root,
+            &root_setup.physical_root_path,
+            &root_setup.device_info,
+        )?),
+        BootType::Aboot => None,
+    };
+
     install_composefs_bootloader(
         root_setup,
+        esp_part.as_ref(),
         state,
         postfetch.detected_bootloader,
         composefs_mnt_fd,
@@ -2897,7 +2904,13 @@ pub(crate) async fn setup_composefs_boot(
     let (boot_digest, deploy_id) = match boot_type {
         BootType::Bls => (
             setup_composefs_bls_boot(
-                BootSetupType::Setup((&root_setup, &state, &postfetch, allow_missing_fsverity)),
+                BootSetupType::Setup((
+                    &root_setup,
+                    &state,
+                    &postfetch,
+                    allow_missing_fsverity,
+                    esp_part.as_ref().context("Missing install ESP for BLS")?,
+                )),
                 &repo,
                 &provisional_deploy_id,
                 provisional_format,
@@ -2908,7 +2921,13 @@ pub(crate) async fn setup_composefs_boot(
         ),
         BootType::Uki => print_uki_dumpfile_diff_on_mismatch(
             setup_composefs_uki_boot(
-                BootSetupType::Setup((&root_setup, &state, &postfetch, allow_missing_fsverity)),
+                BootSetupType::Setup((
+                    &root_setup,
+                    &state,
+                    &postfetch,
+                    allow_missing_fsverity,
+                    esp_part.as_ref().context("Missing install ESP for UKI")?,
+                )),
                 &repo,
                 &provisional_deploy_id,
                 &boot_ids,
