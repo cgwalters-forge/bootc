@@ -126,6 +126,10 @@ EORUN
     
     # Build the derived image
     podman build --quiet -t localhost/bootc-derived-policy .
+    podman image inspect --format 'image={{.Id}} digest={{.Digest}} names={{.RepoTags}}' localhost/bootc localhost/bootc-derived-policy
+    # Keep the exact guest recipe/settings in the test output even on switch failure.
+    print (open --raw Dockerfile)
+    bootc --version
     
     # Verify soft reboot preparation hasn't happened yet
     assert (not ("/run/nextroot" | path exists))

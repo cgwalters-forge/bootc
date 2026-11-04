@@ -1088,7 +1088,7 @@ pub(crate) enum UkiAddonCliOpts {
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[clap(name = "bootc")]
 #[clap(rename_all = "kebab-case")]
-#[clap(version,long_version=clap::crate_version!())]
+#[clap(version, long_version=concat!(env!("CARGO_PKG_VERSION"), "\ncomposefs-oci: ", env!("BOOTC_COMPOSEFS_BUILD")))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Opt {
     /// Download and queue an updated container image to apply.
@@ -3070,6 +3070,14 @@ mod tests {
             };
             assert_eq!(erofs_version, expected);
         }
+    }
+
+    #[test]
+    fn test_version_includes_composefs_build() {
+        let error = Opt::try_parse_from(["bootc", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let output = error.to_string();
+        assert!(output.contains(concat!("composefs-oci: ", env!("BOOTC_COMPOSEFS_BUILD"))));
     }
 
     #[test]

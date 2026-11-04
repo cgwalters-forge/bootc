@@ -228,9 +228,6 @@ pub(crate) fn print_uki_dumpfile_diff(
     let dumpfile_name = mismatch
         .uki_name()
         .and_then(|x| x.strip_suffix(EFI_EXT).map(|x| format!("{x}.dump")));
-    // .uki_name
-    // .strip_suffix(EFI_EXT)
-    // .map(|x| format!("{x}.dump"));
 
     let Some(dumpfile_name) = &dumpfile_name else {
         return;
@@ -271,6 +268,8 @@ pub(crate) fn print_uki_dumpfile_diff(
 
     let mut cmd = std::process::Command::new("diff");
     cmd.arg("--color=auto")
+        .arg("--label=sealing-time boot tree")
+        .arg("--label=imported OCI tree (before boot transform)")
         .arg(format!("{}/stored", path.display()))
         .arg(format!("{}/current", path.display()));
 
@@ -1682,9 +1681,50 @@ pub(crate) fn ensure_correct_composefs_digest(
             expected_ids,
         });
     };
-    reconcile_uki_candidates(&expected, expected_ids, |digest| {
+    let result = reconcile_uki_candidates(&expected, expected_ids, |digest| {
         composefs_oci::find_matching_boot_image(repo, manifest_digest, digest)
-    })
+    });
+    // Diagnostic only: never change acceptance or replace the original error.
+    // Limit the extra work to the supported mode/format matrix, on rejection,
+    // and only when debug output was requested (as it is in integration CI).
+    if result.as_ref().is_err_and(|e| e.is::<UKIDigestMismatch>())
+        && tracing::enabled!(tracing::Level::DEBUG)
+    {
+        tracing::debug!(%manifest_digest, composefs_build = env!("BOOTC_COMPOSEFS_BUILD"),
+            "Rejected boot artifact; computing imported OCI boot tree candidates");
+        if let Err(error) = print_boot_image_candidates(repo, manifest_digest) {
+            tracing::debug!("Computing mismatch diagnostics failed: {error:#}");
+        }
+    }
+    result
+}
+
+fn print_boot_image_candidates(
+    repo: &Arc<crate::store::ComposefsRepository>,
+    manifest_digest: &composefs_oci::OciDigest,
+) -> Result<()> {
+    use composefs_boot::BootOps as _;
+
+    let image = composefs_oci::oci_image::OciImage::open(repo, manifest_digest, None)?;
+    for &mode in composefs_oci::XattrFiltering::VARIANTS {
+        let mut fs = composefs_oci::image::create_filesystem(
+            repo,
+            image.config_digest(),
+            Some(image.config_verity()),
+            &composefs_oci::OciTransformOptions { xattrs: mode },
+        )?;
+        fs.transform_for_boot(repo)?;
+        for version in FormatVersion::BOOT_VERSIONS {
+            let digest = fs.compute_image_id(version);
+            tracing::debug!(
+                ?mode,
+                ?version,
+                ?digest,
+                "Computed imported OCI boot image candidate"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The repository-independent part of [`ensure_correct_composefs_digest`]:
@@ -3797,6 +3837,17 @@ mod tests {
             (
                 "legacy unknown",
                 uki_v2(unknown.clone(), false),
+                &[(V1, &v1), (V2, &v2)],
+                &[],
+                Err("doesn't match any of"),
+            ),
+            (
+                "valid primary with stale fallback",
+                format!(
+                    "{} {}",
+                    uki_v1(v1.clone(), false),
+                    uki_explicit_v2(&unknown)
+                ),
                 &[(V1, &v1), (V2, &v2)],
                 &[],
                 Err("doesn't match any of"),

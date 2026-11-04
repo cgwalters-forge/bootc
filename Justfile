@@ -98,6 +98,7 @@ build: package _keygen && _pull-lbi-images
     pkg_path=$(realpath target/packages)
     eval $(just _git-build-vars)
     podman build {{_nocache_arg}} --build-arg=image_version=${VERSION} --build-context "packages=${pkg_path}" -t {{base_img}} {{buildargs}} .
+    podman image inspect --format '{{ "image={{.Id}} digest={{.Digest}} names={{.RepoTags}}" }}' {{base_img}}
 
 # Fetch all external dependencies with a retry loop.
 #
@@ -537,6 +538,7 @@ _build-upgrade-image:
         -t {{upgrade_img}} \
         -f tmt/tests/Dockerfile.upgrade \
         .
+    podman image inspect --format '{{ "image={{.Id}} digest={{.Digest}} names={{.RepoTags}}" }}' {{upgrade_img}}
 
 # Build the upgrade source image: base image + tmt dependencies (rsync, nu, cloud-init)
 _build-upgrade-source-image:

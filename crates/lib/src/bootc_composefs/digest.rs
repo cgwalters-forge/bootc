@@ -93,6 +93,9 @@ pub(crate) async fn compute_composefs_digest(
     fs.transform_for_boot(&repo).context("Preparing for boot")?;
     let id = fs.compute_image_id(erofs_version);
     let digest = id.to_hex();
+    tracing::debug!(rootfs = %path, ?erofs_version,
+        xattrs = ?composefs::generic_tree::XattrFiltering::default(), %digest,
+        "Computed sealing-time boot tree digest");
 
     if let Some(dumpfile_path) = write_dumpfile_to {
         let mut w = File::create(dumpfile_path)
@@ -107,6 +110,7 @@ pub(crate) async fn compute_composefs_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
 
@@ -169,6 +173,40 @@ mod tests {
             digest, digest2,
             "Digest should be consistent across multiple computations"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dumpfile_records_metadata_drift() {
+        for version in FormatVersion::BOOT_VERSIONS {
+            let td = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            create_test_filesystem(td.path()).unwrap();
+            let root = Utf8Path::from_path(td.path()).unwrap();
+            let dump = Utf8PathBuf::from_path_buf(output.path().join("sealed.dump")).unwrap();
+            let sealed = compute_composefs_digest(root, version, Some(&dump))
+                .await
+                .unwrap();
+            let sealed_dump = fs::read_to_string(&dump).unwrap();
+            // Same file contents, different metadata after sealing.
+            fs::set_permissions(
+                td.path().join("usr/bin/hello"),
+                Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let imported = compute_composefs_digest(root, version, Some(&dump))
+                .await
+                .unwrap();
+            let imported_dump = fs::read_to_string(&dump).unwrap();
+            assert_ne!(sealed, imported);
+            assert!(
+                sealed_dump.contains("/usr/bin/hello 5 100755"),
+                "{sealed_dump}"
+            );
+            assert!(
+                imported_dump.contains("/usr/bin/hello 5 100700"),
+                "{imported_dump}"
+            );
+        }
     }
 
     #[tokio::test]
