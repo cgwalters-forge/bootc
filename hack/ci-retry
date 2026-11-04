@@ -1,0 +1,20 @@
+#!/bin/bash
+# Run a command, retrying it on failure; used for the network-fetching
+# stages in the Justfile. Only use this for steps that run before the
+# Dockerfile's --network=none cutoff, never for a compile.
+# Override with e.g. BOOTC_CI_RETRIES=10 BOOTC_CI_DELAY=60.
+set -euo pipefail
+retries=${BOOTC_CI_RETRIES:-3}
+delay=${BOOTC_CI_DELAY:-30}
+for attempt in $(seq 1 "$retries"); do
+    echo "--- Attempt ${attempt}/${retries}: $*"
+    if "$@"; then
+        exit 0
+    fi
+    if [ "$attempt" -lt "$retries" ]; then
+        echo "--- Attempt ${attempt} failed, retrying in ${delay}s..."
+        sleep "$delay"
+    fi
+done
+echo "--- All ${retries} attempts failed: $*" >&2
+exit 1
