@@ -238,6 +238,15 @@ check:
   duration: 30m
   test: nu booted/test-install-repart.nu
 
+/test-55-boot-bind-fstab:
+  summary: BIOS hybrid install keeps the OSTree boot bind mounted
+  duration: 10m
+  enabled: false
+  adjust:
+  - when: boot_bind_fstab == true
+    enabled: true
+  test: nu booted/test-boot-bind-fstab.nu
+
 /test-57-composefs-separate-boot:
   summary: Test composefs with GRUB and a separate /boot partition
   duration: 60m

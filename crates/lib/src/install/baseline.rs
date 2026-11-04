@@ -1263,6 +1263,13 @@ pub(crate) fn install_create_rootfs(
         BlockSetup::Tpm2Luks => Some(luks_name.to_string()),
     };
     Ok(RootSetup {
+        allow_boot_bind: super::allow_boot_bind(
+            boot.is_some(),
+            state
+                .install_config
+                .as_ref()
+                .and_then(|c| c.boot_mount_spec.as_deref()),
+        ),
         luks_device,
         device_info: device,
         physical_root_path,

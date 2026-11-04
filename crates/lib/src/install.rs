@@ -1411,6 +1411,29 @@ async fn install_container(
                 writeln!(w, "{}", boot.to_fstab()).map_err(Into::into)
             })?;
         }
+    } else if root_setup.allow_boot_bind
+        && state
+            .install_config
+            .as_ref()
+            .and_then(|c| c.boot_bind_fstab)
+            .unwrap_or(false)
+    {
+        // Prevent GPT-auto's unused-ESP automount from expiring this bind.
+        // Probe the deployed image, not the installer's libostree: older
+        // generators would compete with systemd-fstab-generator for /boot.
+        let version = Command::new("timeout")
+            .args([
+                "--kill-after=1s",
+                "10s",
+                "chroot",
+                ".",
+                "/usr/bin/ostree",
+                "--version",
+            ])
+            .cwd_dir(root.try_clone()?)
+            .run_get_string()
+            .context("Checking target OSTree for boot-bind-fstab")?;
+        write_boot_bind_fstab(&root, &version, sepolicy)?;
     }
 
     if let Some(contents) = state.root_ssh_authorized_keys.as_deref() {
@@ -1424,6 +1447,66 @@ async fn install_container(
         &state.selinux_state,
     )?;
     Ok((deployment, aleph))
+}
+
+fn write_boot_bind_fstab(
+    root: &Dir,
+    version: &str,
+    sepolicy: Option<&ostree::SePolicy>,
+) -> Result<()> {
+    ensure!(
+        ostree_supports_boot_fstab(version)?,
+        "boot-bind-fstab requires target OSTree >= 2026.5"
+    );
+    ensure!(
+        read_boot_fstab_entry(root)?.is_none(),
+        "boot-bind-fstab conflicts with an existing /boot fstab entry"
+    );
+    let existing = root
+        .read_to_string_optional("etc/fstab")?
+        .unwrap_or_default();
+    let fstab = append_boot_bind_fstab(&existing);
+    crate::lsm::atomic_replace_labeled(root, "etc/fstab", 0o644.into(), sepolicy, |w| {
+        w.write_all(fstab.as_bytes()).map_err(Into::into)
+    })
+}
+
+/// An explicit spec (including empty) owns policy; never infer layout from
+/// the optional MountSpec, which is also None for the empty-spec opt-out.
+fn allow_boot_bind(boot_is_mount: bool, explicit_spec: Option<&str>) -> bool {
+    !boot_is_mount && explicit_spec.is_none()
+}
+
+/// OSTree 2026.5 makes its boot mount generator yield to fstab.
+fn ostree_supports_boot_fstab(output: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(rename = "Version")]
+        version: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Output {
+        libostree: Version,
+    }
+
+    let output: Output = serde_yaml::from_str(output).context("Parsing target ostree --version")?;
+    let (year, release) = output
+        .libostree
+        .version
+        .split_once('.')
+        .context("Invalid OSTree version")?;
+    let version = (year.parse::<u32>()?, release.parse::<u32>()?);
+    Ok(version >= (2026, 5))
+}
+
+fn append_boot_bind_fstab(existing: &str) -> String {
+    let mut fstab = existing.to_owned();
+    if !fstab.is_empty() && !fstab.ends_with('\n') {
+        fstab.push('\n');
+    }
+    fstab.push_str("/sysroot/boot /boot none bind 0 0\n");
+    fstab
 }
 
 pub(crate) fn delete_kargs(existing: &mut Cmdline, deletes: &Vec<&str>) {
@@ -1490,6 +1573,8 @@ pub(crate) struct RootSetup {
     /// True if we should skip finalizing
     skip_finalize: bool,
     boot: Option<MountSpec>,
+    /// Same-partition layout with no explicit boot mount policy.
+    allow_boot_bind: bool,
     pub(crate) kargs: CmdlineOwned,
 }
 
@@ -3018,6 +3103,13 @@ pub(crate) async fn install_to_filesystem(
     let skip_finalize =
         matches!(fsopts.replace, Some(ReplaceMode::Alongside)) || fsopts.skip_finalize;
     let mut rootfs = RootSetup {
+        allow_boot_bind: allow_boot_bind(
+            boot_is_mount,
+            fsopts
+                .boot_mount_spec
+                .as_deref()
+                .or(config_boot_mount_spec.map(String::as_str)),
+        ),
         #[cfg(feature = "install-to-disk")]
         luks_device: None,
         device_info,
@@ -3268,6 +3360,96 @@ pub(crate) async fn install_finalize(target: &Utf8Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_boot_bind_layout_gate() {
+        for (separate, spec, expected) in [
+            (false, None, true),
+            (true, None, false),
+            (false, Some(""), false),
+            (true, Some(""), false),
+            (false, Some("UUID=boot"), false),
+            (true, Some("UUID=boot"), false),
+        ] {
+            assert_eq!(super::allow_boot_bind(separate, spec), expected);
+        }
+    }
+
+    #[test]
+    fn test_write_boot_bind_fstab() -> anyhow::Result<()> {
+        let td = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        td.create_dir("etc")?;
+        let supported = "libostree: {Version: '2026.5'}";
+        let old = "libostree: {Version: '2026.4'}";
+        td.write(
+            "etc/fstab",
+            "# existing\nUUID=data /var/data xfs defaults 0 0\n",
+        )?;
+        let original = td.read_to_string("etc/fstab")?;
+        assert!(super::write_boot_bind_fstab(&td, old, None).is_err());
+        assert_eq!(td.read_to_string("etc/fstab")?, original);
+        super::write_boot_bind_fstab(&td, supported, None)?;
+        assert_eq!(
+            td.read_to_string("etc/fstab")?,
+            format!("{original}/sysroot/boot /boot none bind 0 0\n")
+        );
+        for entry in [
+            "/sysroot/boot /boot none bind 0 0\n",
+            "UUID=boot /boot ext4 defaults 0 0\n",
+        ] {
+            td.write("etc/fstab", entry)?;
+            assert!(super::write_boot_bind_fstab(&td, supported, None).is_err());
+            assert_eq!(td.read_to_string("etc/fstab")?, entry);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_boot_bind_fstab() {
+        for existing in [
+            "",
+            "# keep me",
+            "# keep me\n",
+            "UUID=data /var/data xfs defaults 0 0\n",
+        ] {
+            let actual = super::append_boot_bind_fstab(existing);
+            assert!(actual.starts_with(existing));
+            assert_eq!(
+                actual.lines().last(),
+                Some("/sysroot/boot /boot none bind 0 0")
+            );
+            assert_eq!(actual.lines().count(), existing.lines().count() + 1);
+        }
+        assert_eq!(
+            super::append_boot_bind_fstab(""),
+            "/sysroot/boot /boot none bind 0 0\n"
+        );
+    }
+
+    #[test]
+    fn test_ostree_boot_fstab_gate() {
+        for (version, expected) in [
+            ("2025.9", false),
+            ("2026.4", false),
+            ("2026.5", true),
+            ("2026.10", true),
+            ("2027.1", true),
+        ] {
+            let output = format!("libostree:\n  Version: '{version}'\n  Features: []\n");
+            assert_eq!(
+                super::ostree_supports_boot_fstab(&output).unwrap(),
+                expected
+            );
+        }
+        for output in [
+            "",
+            "libostree: {}",
+            "libostree: {Version: unknown}",
+            "libostree: {Version: '2026.5-dev'}",
+        ] {
+            assert!(super::ostree_supports_boot_fstab(output).is_err());
+        }
+    }
+
     use super::*;
 
     #[test]

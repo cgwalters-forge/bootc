@@ -376,6 +376,20 @@ execute:
     test:
       - /tmt/tests/tests/test-52-install-repart
 
+/plan-55-boot-bind-fstab:
+  summary: BIOS hybrid install keeps the OSTree boot bind mounted
+  enabled: false
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-55-boot-bind-fstab
+  adjust:
+  - when: boot_bind_fstab == true
+    enabled: true
+  extra-bios: true
+  extra-fixme_skip_if_composefs: true
+  extra-fixme_skip_if_uki: true
+
 /plan-57-composefs-separate-boot:
   summary: Test composefs with GRUB and a separate /boot partition
   discover:
