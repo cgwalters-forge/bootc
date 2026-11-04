@@ -19,6 +19,7 @@ use xshell::{Shell, cmd};
 mod bcvk;
 mod buildsys;
 mod man;
+mod pull;
 mod sysext;
 mod tmt;
 
@@ -109,6 +110,13 @@ enum Commands {
     ValidateComposefsDigest(ValidateComposefsDigestArgs),
     /// Print podman bind mount arguments for local path dependencies
     LocalRustDeps(LocalRustDepsArgs),
+    /// Pull images with podman, retrying transient transport errors
+    /// (attempts and initial delay from BOOTC_CI_RETRIES and BOOTC_CI_DELAY)
+    PullImages {
+        /// Images to pull
+        #[arg(required = true)]
+        images: Vec<String>,
+    },
     /// Development VM management via bcvk + systemd-sysext
     Bcvk {
         #[command(subcommand)]
@@ -427,6 +435,7 @@ fn try_main() -> Result<()> {
         Commands::CheckBuildsys => buildsys::check_buildsys(&sh, "Dockerfile".into()),
         Commands::ValidateComposefsDigest(args) => validate_composefs_digest(&sh, &args),
         Commands::LocalRustDeps(args) => local_rust_deps(&sh, &args),
+        Commands::PullImages { images } => pull::pull_images(&images),
         Commands::Bcvk { command } => match command {
             BcvkCommands::Vm => sysext::bcvk_vm(&sh),
             BcvkCommands::Sync => sysext::bcvk_vm_sync(&sh),

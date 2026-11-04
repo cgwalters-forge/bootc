@@ -96,6 +96,9 @@ build: package _keygen && _pull-lbi-images
     set -xeuo pipefail
     test -d target/packages
     pkg_path=$(realpath target/packages)
+    # `package` skips its pull under BOOTC_SKIP_PACKAGE; don't let
+    # `podman build` pull a missing base on its own without retries.
+    podman image exists {{base}} || cargo xtask pull-images {{base}}
     eval $(just _git-build-vars)
     podman build {{_nocache_arg}} --build-arg=image_version=${VERSION} --build-context "packages=${pkg_path}" -t {{base_img}} {{buildargs}} .
 
@@ -109,6 +112,8 @@ build: package _keygen && _pull-lbi-images
 #
 # The retry parameters can be overridden via environment variables:
 #   BOOTC_CI_RETRIES=10 BOOTC_CI_DELAY=60 just build-fetch
+# `cargo xtask pull-images` reads the same variables, but uses the delay as
+# the start of a capped backoff and retries only transient registry errors.
 [group('core')]
 build-fetch: _keygen package
     #!/bin/bash
@@ -455,8 +460,8 @@ package:
     if [[ -z "{{no_auto_local_deps}}" ]]; then
         local_deps_args=$(cargo xtask local-rust-deps)
     fi
-    # Pull the base image up front with more retries than `podman build` defaults to
-    podman pull -q --retry 5 --retry-delay 5s {{base}}
+    # Pull the base image up front, retrying transient registry errors
+    cargo xtask pull-images {{base}}
     podman build {{base_buildargs}} --build-arg=SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} --build-arg=pkgversion=${VERSION} -t localhost/bootc-pkg --target=build $local_deps_args .
     mkdir -p "${packages}"
     rm -vf "${packages}"/*.rpm
@@ -487,7 +492,7 @@ sysext:
 # ============================================================================
 
 _pull-lbi-images:
-    podman pull -q --retry 5 --retry-delay 5s {{lbi_images}}
+    cargo xtask pull-images {{lbi_images}}
 
 _git-build-vars:
     #!/bin/bash
