@@ -1934,7 +1934,8 @@ async fn prepare_install(
     bootc_mount::ensure_mirrored_host_mount("/var/tmp")?;
     // udev state is required for running lsblk during install to-disk
     // see https://github.com/bootc-dev/bootc/pull/688
-    bootc_mount::ensure_mirrored_host_mount("/run/udev")?;
+    // Hosts without udev (e.g. mdev) have no /run/udev; blockdev falls back to blkid.
+    bootc_mount::ensure_optional_mirrored_host_mount("/run/udev")?;
     // We also always want /tmp to be a proper tmpfs on general principle.
     setup_tmp_mount()?;
     // Allocate a temporary directory we can use in various places to avoid
