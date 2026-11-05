@@ -1,0 +1,14 @@
+# Derive a composefs (GRUB/BLS) image from the localhost/bootc image that
+# Containerfile.packit builds; used by provision-packit-composefs.sh.
+FROM localhost/bootc
+
+RUN <<EORUN
+set -xeuo pipefail
+# The base image's initramfs predates the bootc RPM under test; regenerate it
+# with the composefs root setup module, as test-composefs-gc.nu does.
+kver=$(cd /usr/lib/modules && echo *)
+dracut -vf --add bootc "/usr/lib/modules/${kver}/initramfs.img" "${kver}"
+# The composefs backend doesn't install logically bound images yet:
+# https://github.com/bootc-dev/bootc/issues/2540
+rm -vf /usr/lib/bootc/bound-images.d/*
+EORUN

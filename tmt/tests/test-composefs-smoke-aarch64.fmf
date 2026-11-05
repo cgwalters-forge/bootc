@@ -1,0 +1,3 @@
+summary: Check composefs boot after package-mode install
+test: nu install/composefs-smoke-aarch64/check.nu
+duration: 20m
