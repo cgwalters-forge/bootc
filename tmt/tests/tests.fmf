@@ -273,3 +273,8 @@ check:
   summary: Install from a shared mount namespace without leaking the storage bind mount
   duration: 30m
   test: nu booted/test-install-shared-propagation.nu
+
+/test-64-boot-automount-idle-update-timer:
+  summary: Apply an update from the timer after the /boot automount idles out
+  duration: 30m
+  test: nu booted/test-boot-automount-idle-update-timer.nu
