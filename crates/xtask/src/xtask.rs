@@ -21,6 +21,7 @@ mod buildsys;
 mod man;
 mod sysext;
 mod tmt;
+mod vmupgrade;
 
 const NAME: &str = "bootc";
 /// JSON schemas generated from the bootc CLI: (schema-name, output-path) pairs.
@@ -109,6 +110,8 @@ enum Commands {
     ValidateComposefsDigest(ValidateComposefsDigestArgs),
     /// Print podman bind mount arguments for local path dependencies
     LocalRustDeps(LocalRustDepsArgs),
+    /// Build two git revisions, install one in a VM, switch to the other and reboot
+    VmUpgradeTest(VmUpgradeTestArgs),
     /// Development VM management via bcvk + systemd-sysext
     Bcvk {
         #[command(subcommand)]
@@ -339,6 +342,54 @@ impl RunTmtArgs {
     }
 }
 
+/// Arguments for vm-upgrade-test command.
+///
+/// Example, one row of a btrfs matrix:
+/// `cargo xtask vm-upgrade-test --from v1.16.0 --to FETCH_HEAD --filesystem btrfs --composefs-backend --bootloader grub`
+#[derive(Debug, Args)]
+pub(crate) struct VmUpgradeTestArgs {
+    /// Git revision (e.g. a tag) of bootc to install
+    #[arg(long)]
+    pub(crate) from: String,
+
+    /// Git revision of bootc to switch to (e.g. FETCH_HEAD after fetching a PR head)
+    #[arg(long)]
+    pub(crate) to: String,
+
+    /// Base bootc image both revisions are built onto
+    #[arg(long, default_value = "quay.io/fedora/fedora-bootc:44")]
+    pub(crate) base: String,
+
+    /// Root filesystem (e.g. ext4, xfs, btrfs)
+    #[arg(long, default_value = "ext4")]
+    pub(crate) filesystem: String,
+
+    /// Install with the composefs backend instead of ostree
+    #[arg(long)]
+    pub(crate) composefs_backend: bool,
+
+    /// Bootloader for the composefs backend
+    #[arg(long)]
+    pub(crate) bootloader: Option<Bootloader>,
+
+    /// Install the composefs backend without fs-verity
+    #[arg(long)]
+    pub(crate) allow_missing_fsverity: bool,
+
+    /// Additional kernel arguments for the install
+    #[arg(long)]
+    pub(crate) karg: Vec<String>,
+
+    /// VM name (defaults to "bootc-vm-upgrade-`<random>`"); an existing VM of
+    /// this name is replaced
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+
+    /// Keep the VM after the test instead of removing it
+    #[arg(long)]
+    pub(crate) keep: bool,
+}
+
 /// Arguments for tmt-provision command
 #[derive(Debug, Args)]
 pub(crate) struct TmtProvisionArgs {
@@ -427,6 +478,7 @@ fn try_main() -> Result<()> {
         Commands::CheckBuildsys => buildsys::check_buildsys(&sh, "Dockerfile".into()),
         Commands::ValidateComposefsDigest(args) => validate_composefs_digest(&sh, &args),
         Commands::LocalRustDeps(args) => local_rust_deps(&sh, &args),
+        Commands::VmUpgradeTest(args) => vmupgrade::vm_upgrade_test(&sh, &args),
         Commands::Bcvk { command } => match command {
             BcvkCommands::Vm => sysext::bcvk_vm(&sh),
             BcvkCommands::Sync => sysext::bcvk_vm_sync(&sh),

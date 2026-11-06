@@ -15,7 +15,7 @@ const SSH_CONNECTIVITY_MAX_ATTEMPTS: u32 = 60;
 const SSH_CONNECTIVITY_RETRY_DELAY_SECS: u64 = 3;
 
 // Base args - firmware type will be added dynamically based on secure boot key availability
-const COMMON_INST_ARGS: &[&str] = &["--label=bootc.test=1"];
+pub(crate) const COMMON_INST_ARGS: &[&str] = &["--label=bootc.test=1"];
 
 // Metadata field names
 const FIELD_TRY_BIND_STORAGE: &str = "try_bind_storage";
@@ -49,7 +49,7 @@ use crate::bcvk::BcvkInstallOpts;
 use crate::{RunTmtArgs, SealState, TmtProvisionArgs, out_of_sync_error};
 
 /// Generate a random alphanumeric suffix for VM names
-fn generate_random_suffix() -> String {
+pub(crate) fn generate_random_suffix() -> String {
     let mut rng = rand::rng();
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     (0..8)
