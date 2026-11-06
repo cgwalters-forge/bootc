@@ -560,9 +560,15 @@ pub(crate) fn secondary_sort_key(os_id: &str) -> String {
     format!("bootc-{os_id}-{SORTKEY_PRIORITY_SECONDARY}")
 }
 
-/// Returns the name of the directory where we store Type1 boot entries
-pub(crate) fn get_type1_dir_name(depl_verity: &str) -> String {
-    format!("{TYPE1_BOOT_DIR_PREFIX}{depl_verity}")
+/// Returns the name of the directory where we store Type1 boot entries.
+///
+/// New directories are named after the sha256 boot digest of the vmlinuz +
+/// initrd they hold. Older ones are named after a deployment's 128 hex
+/// character verity, but some firmware (e.g. HP G10 laptops) hangs loading a
+/// kernel from a path that long. Readers treat the part after the prefix as
+/// an opaque name, so both kinds are valid.
+pub(crate) fn get_type1_dir_name(id: &str) -> String {
+    format!("{TYPE1_BOOT_DIR_PREFIX}{id}")
 }
 
 /// Returns the name of a UKI given verity digest
@@ -726,14 +732,12 @@ pub(crate) fn find_vmlinuz_initrd_duplicate(
 #[context("Writing BLS entries to disk")]
 fn write_bls_boot_entries_to_disk(
     boot_dir: &Utf8PathBuf,
-    deployment_id: &Sha512HashValue,
+    dir_name: &str,
     entry: &UsrLibModulesVmlinuz<Sha512HashValue>,
     repo: &crate::store::ComposefsRepository,
 ) -> Result<()> {
-    let dir_name = get_type1_dir_name(&deployment_id.to_hex());
-
-    // Write the initrd and vmlinuz at /boot/composefs-<id>/
-    let path = boot_dir.join(&dir_name);
+    // Write the initrd and vmlinuz at /boot/bootc_composefs-<boot digest>/
+    let path = boot_dir.join(dir_name);
     create_dir_all(&path)?;
 
     let entries_dir = Dir::open_ambient_dir(&path, ambient_authority())
@@ -827,8 +831,6 @@ pub(crate) fn setup_composefs_bls_boot(
     entry: &ComposefsBootEntry<Sha512HashValue>,
     mounted_erofs: &Dir,
 ) -> Result<String> {
-    let id_hex = id.to_hex();
-
     let (esp_device, mut cmdline_refs, bootloader) = match setup_type {
         BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
             // root_setup.kargs has [root=UUID=<UUID>, "rw"]
@@ -983,9 +985,33 @@ pub(crate) fn setup_composefs_bls_boot(
                 }
             };
 
-            let mut bls_config = BLSConfig::default();
+            let shared_entry = match setup_type {
+                BootSetupType::Setup(_) => None,
+                BootSetupType::Upgrade((storage, ..)) => {
+                    find_vmlinuz_initrd_duplicate(storage, &boot_digest)?
+                }
+            };
 
-            let entries_dir = get_type1_dir_name(&id_hex);
+            // Multiple deployments could be using the same kernel + initrd, but there
+            // would be only one available
+            //
+            // Symlinking directories themselves would be better, but vfat does not support
+            // symlinks
+            let entries_dir = match shared_entry {
+                Some(shared_entry) => shared_entry,
+                None => {
+                    let entries_dir = get_type1_dir_name(&boot_digest);
+                    write_bls_boot_entries_to_disk(
+                        &entry_paths.entries_path,
+                        &entries_dir,
+                        usr_lib_modules_vmlinuz,
+                        &repo,
+                    )?;
+                    entries_dir
+                }
+            };
+
+            let mut bls_config = BLSConfig::default();
 
             bls_config
                 .with_title(title)
@@ -999,53 +1025,6 @@ pub(crate) fn setup_composefs_bls_boot(
                     initrd: vec![entry_paths.abs_entries_path.join(&entries_dir).join(INITRD)],
                     options: Some(cmdline_refs),
                 });
-
-            let shared_entry = match setup_type {
-                BootSetupType::Setup(_) => None,
-                BootSetupType::Upgrade((storage, ..)) => {
-                    find_vmlinuz_initrd_duplicate(storage, &boot_digest)?
-                }
-            };
-
-            match shared_entry {
-                Some(shared_entry) => {
-                    // Multiple deployments could be using the same kernel + initrd, but there
-                    // would be only one available
-                    //
-                    // Symlinking directories themselves would be better, but vfat does not support
-                    // symlinks
-                    match bls_config.cfg_type {
-                        BLSConfigType::NonEFI {
-                            ref mut linux,
-                            ref mut initrd,
-                            ..
-                        } => {
-                            *linux = entry_paths
-                                .abs_entries_path
-                                .join(&shared_entry)
-                                .join(VMLINUZ);
-
-                            *initrd = vec![
-                                entry_paths
-                                    .abs_entries_path
-                                    .join(&shared_entry)
-                                    .join(INITRD),
-                            ];
-                        }
-
-                        _ => unreachable!(),
-                    };
-                }
-
-                None => {
-                    write_bls_boot_entries_to_disk(
-                        &entry_paths.entries_path,
-                        id,
-                        usr_lib_modules_vmlinuz,
-                        &repo,
-                    )?;
-                }
-            };
 
             (bls_config, boot_digest, os_id)
         }
@@ -3062,6 +3041,18 @@ mod tests {
         assert!(grub_bls_abs_entries_path(Utf8Path::new("/")).is_err());
         assert!(grub_bls_abs_entries_path(&td.join("nonexistent/boot")).is_err());
         Ok(())
+    }
+
+    /// HP G10 firmware hangs loading a kernel from a 163 character path but
+    /// boots from 160 (bootc-dev/bootc#2585); stay well below that.
+    #[test]
+    fn test_type1_esp_kernel_path_length() {
+        let boot_digest = hex::encode(openssl::sha::sha256(b"vmlinuz+initrd"));
+        let path = Utf8PathBuf::from("/")
+            .join(EFI_LINUX)
+            .join(get_type1_dir_name(&boot_digest))
+            .join(VMLINUZ);
+        assert_eq!(path.as_str().len(), 99, "{path}");
     }
 
     #[test]

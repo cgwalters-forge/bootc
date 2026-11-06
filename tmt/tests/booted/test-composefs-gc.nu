@@ -32,7 +32,7 @@ def first_boot [] {
     let path = bootc internals cfs dump-files $new_st.status.staged.composefs.verity /usr/share/large-test-file --backing-path-only | awk '{print $2}'
     echo $"/sysroot/composefs/objects/($path)" | save /var/large-file-marker-objpath
 
-    echo $st.status.booted.composefs.verity | save /var/first-verity
+    echo $st.status.booted.composefs.bootDigest | save /var/first-boot-digest
 
     tmt-reboot
 }
@@ -81,7 +81,7 @@ def third_boot [] {
     assert equal $booted.image.image "localhost/bootc-derived-initrd"
 
     # Also assert we have two different kernel + initrd pairs
-    let booted_verity = (bootc status --json | from json).status.booted.composefs.verity
+    let booted_boot_digest = (bootc status --json | from json).status.booted.composefs.bootDigest
 
     let bootloader = ((bootc status --json | from json).status.booted.composefs.bootloader | str downcase)
 
@@ -94,15 +94,16 @@ def third_boot [] {
         "/sysroot/boot"
     }
 
-    assert ($"($boot_dir)/($dir_prefix)($booted_verity)" | path exists)
+    # Boot binary directories are named after the boot digest of the
+    # kernel + initrd they hold
+    assert ($"($boot_dir)/($dir_prefix)($booted_boot_digest)" | path exists)
 
-    # This is for the rollback, but since the rollback and the very
-    # first boot have the same kernel + initrd pair, and this rollback
-    # was deployed after the first boot, we will still be using the very
-    # first verity for the boot binary name
-    assert ($"($boot_dir)/($dir_prefix)(cat /var/first-verity)" | path exists)
+    # This is for the rollback, which has the same kernel + initrd pair as
+    # the very first boot and so shares its directory
+    let first_boot_dir = $"($boot_dir)/($dir_prefix)(cat /var/first-boot-digest)"
+    assert ($first_boot_dir | path exists)
 
-    echo $"($boot_dir)/($dir_prefix)(cat /var/first-verity)" | save /var/to-be-deleted-kernel
+    echo $first_boot_dir | save /var/to-be-deleted-kernel
 
     # Switching and rebooting here won't delete the old kernel because we still
     # have it as the rollback deployment
