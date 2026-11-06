@@ -1,0 +1,11 @@
+summary: Check composefs boot after package-mode install
+description: |
+  Only meaningful after the prepare steps of
+  /tmt/plans/composefs-smoke-aarch64, so it carries the same opt-in.
+test: nu install/composefs-smoke-aarch64/check.nu
+duration: 20m
+enabled: false
+adjust:
+  - when: bootc_smoke == composefs-aarch64 and arch == aarch64 and distro == centos-stream-10
+    enabled: true
+    because: explicitly selected opt-in smoke test

@@ -1,0 +1,34 @@
+summary: Opt-in aarch64 composefs install smoke test
+description: |
+  Replaces a package-mode CentOS Stream 10 aarch64 guest with a composefs
+  GRUB/BLS image via bootc install to-existing-root, reboots, and checks
+  the result. Disabled unless explicitly selected with the
+  bootc_smoke=composefs-aarch64 context; see tmt/README.md.
+enabled: false
+adjust:
+  - when: bootc_smoke == composefs-aarch64 and arch == aarch64 and distro == centos-stream-10
+    enabled: true
+    because: explicitly selected opt-in smoke test
+discover:
+  how: fmf
+  test:
+    - /tmt/tests/test-composefs-smoke-aarch64
+prepare:
+  - how: install
+    package:
+      - podman
+      - jq
+      - bootc
+      - efibootmgr
+      # lsinitrd, and its decompressor for the image's initramfs
+      - dracut
+      - zstd
+  - how: shell
+    script: cd hack && bash provision-packit-composefs.sh
+  # tmt-reboot and reboot do not work in this case
+  # reboot in ansible is the only way to reboot in tmt prepare
+  - how: ansible
+    playbook:
+      - hack/packit-reboot.yml
+execute:
+  how: tmt

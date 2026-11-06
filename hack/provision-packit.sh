@@ -92,6 +92,13 @@ if [[ -n "${BOOTC_source_image_archive:-}" ]]; then
     podman save --format oci-archive -o "${BOOTC_source_image_archive#/sysroot}" localhost/bootc
 fi
 
+# provision-packit-composefs.sh only needs the localhost/bootc build: it
+# derives and installs its own composefs image, which does not use logically
+# bound images.
+if [[ -n "${BOOTC_PACKIT_BUILD_ONLY:-}" ]]; then
+    exit 0
+fi
+
 # Keep these in sync with what's used in hack/lbi
 podman pull -q --retry 5 --retry-delay 5s quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest
 
