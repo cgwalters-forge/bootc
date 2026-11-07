@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bootc_utils::CommandRunExt;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::{cap_std::fs::Dir, cmdext::CapStdExtCommandExt};
 use fn_error_context::context;
 use rustix::{
@@ -218,11 +218,19 @@ pub fn unmount_recursive(target: &Utf8Path) -> Result<()> {
 pub fn is_same_as_host(path: &Utf8Path) -> Result<bool> {
     // Add a leading '/' in case a relative path is passed
     let path = Utf8Path::new("/").join(path);
+    same_filesystem(&path, &host_path(&path)?)
+}
 
+/// The path to `path` (which must be absolute) in the host (pid 1) mount namespace.
+fn host_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    Ok(Utf8Path::new("/proc/1/root").join(path.strip_prefix("/")?))
+}
+
+/// Whether the two paths have the same filesystem id.
+fn same_filesystem(path: &Utf8Path, hostpath: &Utf8Path) -> Result<bool> {
     // Using statvfs instead of fs, since rustix will translate the fsid field
     // for us.
     let devstat = rustix::fs::statvfs(path.as_std_path())?;
-    let hostpath = Utf8Path::new("/proc/1/root").join(path.strip_prefix("/")?);
     let hostdevstat = rustix::fs::statvfs(hostpath.as_std_path())?;
     tracing::trace!(
         "base mount id {:?}, host mount id {:?}",
@@ -361,22 +369,170 @@ pub fn bind_mount_from_pidns(
 /// If the target path is not already mirrored from the host (e.g. via `-v /dev:/dev`)
 /// then recursively mount it.
 pub fn ensure_mirrored_host_mount(path: impl AsRef<Utf8Path>) -> Result<()> {
-    let path = path.as_ref();
+    let path = Utf8Path::new("/").join(path.as_ref());
+    ensure_mirror(&path, &host_path(&path)?, false)
+}
+
+/// Like [`ensure_mirrored_host_mount`], but the path need not exist: if
+/// it is missing on the host (e.g. `/run/udev` on hosts without udev),
+/// nothing is mounted or created. If it exists on the host, a missing local
+/// mount point is created as for required mirrors.
+pub fn ensure_optional_mirrored_host_mount(path: impl AsRef<Utf8Path>) -> Result<()> {
+    let path = Utf8Path::new("/").join(path.as_ref());
+    ensure_mirror(&path, &host_path(&path)?, true)
+}
+
+/// What to do to mirror a host path into our mount namespace.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorAction {
+    /// The optional path is missing on the host.
+    Skip,
+    /// The path is already the same filesystem as on the host.
+    AlreadyMirrored,
+    /// The host mount needs to be bind mounted.
+    Bind,
+}
+
+/// Mirror `hostpath` (as seen from our namespace) to `path` per [`plan_mirror`].
+fn ensure_mirror(path: &Utf8Path, hostpath: &Utf8Path, optional: bool) -> Result<()> {
+    match plan_mirror(path, hostpath, optional)? {
+        MirrorAction::Skip => {
+            tracing::debug!("Not mirroring {path}: missing on host");
+            Ok(())
+        }
+        MirrorAction::AlreadyMirrored => {
+            tracing::debug!("Already mounted from host: {path}");
+            Ok(())
+        }
+        MirrorAction::Bind => {
+            tracing::debug!("Propagating host mount: {path}");
+            bind_mount_from_pidns(PID1, path, path, true)
+        }
+    }
+}
+
+/// Decide how to mirror `hostpath` to `path`. Only if `optional` is set may
+/// the host path be missing, in which case nothing is created locally.
+#[context("Checking host mount {path}")]
+fn plan_mirror(path: &Utf8Path, hostpath: &Utf8Path, optional: bool) -> Result<MirrorAction> {
+    if optional && !hostpath.try_exists()? {
+        return Ok(MirrorAction::Skip);
+    }
     // If we didn't have this in our filesystem already (e.g. for /var/lib/containers)
     // then create it now.
     std::fs::create_dir_all(path)?;
-    if is_same_as_host(path)? {
-        tracing::debug!("Already mounted from host: {path}");
-        return Ok(());
+    if same_filesystem(path, hostpath)? {
+        Ok(MirrorAction::AlreadyMirrored)
+    } else {
+        Ok(MirrorAction::Bind)
     }
-    tracing::debug!("Propagating host mount: {path}");
-    bind_mount_from_pidns(PID1, path, path, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
+
+    /// The OS error number of an error from [`plan_mirror`].
+    fn errno(err: &anyhow::Error) -> Option<i32> {
+        if let Some(e) = err.downcast_ref::<std::io::Error>() {
+            e.raw_os_error()
+        } else {
+            err.downcast_ref::<rustix::io::Errno>()
+                .map(|e| e.raw_os_error())
+        }
+    }
+
+    #[test]
+    fn test_host_path() -> Result<()> {
+        assert_eq!(
+            host_path(Utf8Path::new("/run/udev"))?,
+            Utf8Path::new("/proc/1/root/run/udev")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mirror_cases() -> Result<()> {
+        use MirrorAction::*;
+        // Both paths live in one temporary directory, so when present they
+        // are on the same filesystem.
+        let cases = [
+            // (optional, local exists, host exists, expected)
+            (true, true, true, Ok(AlreadyMirrored)),
+            (true, true, false, Ok(Skip)),
+            (true, false, false, Ok(Skip)),
+            // The local mount point is created, as for required mirrors.
+            (true, false, true, Ok(AlreadyMirrored)),
+            (false, true, true, Ok(AlreadyMirrored)),
+            (false, false, true, Ok(AlreadyMirrored)),
+            (false, true, false, Err(libc::ENOENT)),
+            (false, false, false, Err(libc::ENOENT)),
+        ];
+        for (optional, local_exists, host_exists, expected) in cases {
+            let name = format!("optional={optional} local={local_exists} host={host_exists}");
+            let td = tempfile::tempdir()?;
+            let td = Utf8Path::from_path(td.path()).unwrap();
+            let local = td.join("local/run/udev");
+            let host = td.join("host/run/udev");
+            for (p, exists) in [(&local, local_exists), (&host, host_exists)] {
+                if exists {
+                    std::fs::create_dir_all(p)?;
+                }
+            }
+            let got = plan_mirror(&local, &host, optional)
+                .map_err(|e| errno(&e).unwrap_or_else(|| panic!("{name}: {e:#}")));
+            assert_eq!(got, expected, "case: {name}");
+            // Only a skipped optional mirror leaves a missing local path alone.
+            let created = local_exists || host_exists || !optional;
+            assert_eq!(local.is_dir(), created, "case: {name}");
+            assert_eq!(td.join("local").exists(), created, "case: {name}");
+        }
+
+        // A present path on a different filesystem needs a bind mount.
+        let td = tempfile::tempdir()?;
+        let td = Utf8Path::from_path(td.path()).unwrap();
+        let procfs = Utf8Path::new("/proc");
+        assert!(!same_filesystem(td, procfs)?);
+        for optional in [true, false] {
+            assert_eq!(plan_mirror(td, procfs, optional)?, Bind);
+        }
+
+        // A symlink loop deterministically fails lookup even when running as
+        // root, and is not treated as a missing optional path.
+        let host = td.join("host-loop");
+        std::os::unix::fs::symlink("host-loop", &host)?;
+        let local = td.join("local/run/udev");
+        let err = plan_mirror(&local, &host, true).unwrap_err();
+        assert_eq!(errno(&err), Some(libc::ELOOP));
+        assert!(!td.join("local").exists());
+        Ok(())
+    }
+
+    /// The paths in these cases never need a bind mount, so no privileges are required.
+    #[test]
+    fn ensure_optional_mirror_unprivileged() -> Result<()> {
+        let td = tempfile::tempdir()?;
+        let td = Utf8Path::from_path(td.path()).unwrap();
+        let local = td.join("local/run/udev");
+        let host = td.join("host/run/udev");
+
+        // Missing on the host: succeed without creating anything locally.
+        ensure_mirror(&local, &host, true)?;
+        assert!(!td.join("local").exists());
+
+        // Present on the same filesystem: the local mount point is created.
+        std::fs::create_dir_all(&host)?;
+        ensure_mirror(&local, &host, true)?;
+        assert!(local.is_dir());
+
+        // Other lookup errors propagate.
+        let host = td.join("host-loop");
+        std::os::unix::fs::symlink("host-loop", &host)?;
+        let err = ensure_mirror(&td.join("other/run/udev"), &host, true).unwrap_err();
+        assert_eq!(errno(&err), Some(libc::ELOOP));
+        assert!(!td.join("other").exists());
+        Ok(())
+    }
 
     fn mk_fs(source: &str, target: &str, children: Vec<Filesystem>) -> Filesystem {
         Filesystem {
