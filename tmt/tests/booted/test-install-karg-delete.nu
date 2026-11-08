@@ -2,46 +2,135 @@
 # tmt:
 #   summary: Test bootc install --karg-delete
 #   duration: 30m
+#   adjust:
+#     - when: boot_type == uki or boot_type == aboot
+#       enabled: false
 # extra:
-#   fixme_skip_if_composefs: true
+#   fixme_skip_if_uki: true
 #
 use std assert
 use tap.nu
 #
-# Use an OS-matched target image to avoid version mismatches
+# Use an OS-matched target image to avoid version mismatches.
 let target_image = (tap get_target_image)
+let composefs = (tap is_composefs)
+if $composefs {
+    let st = bootc status --json | from json
+    assert equal ($st.status.booted.composefs.bootType | str downcase) "bls"
+}
 
-# setup filesystem
+# Track resources outside the try block so failures during setup or assertions
+# take the same cleanup path as a successful install.
+let workdir = (mktemp -d | str trim)
+let disk = $"($workdir)/disk.img"
+let image = $"localhost/bootc-karg-delete:($workdir | path basename | str downcase)"
+let config = "/etc/bootc/install/99-test-karg-delete.toml"
+assert (not ($config | path exists))
+mut loop_device = null
 mkdir /var/mnt
-truncate -s 10G disk.img
-mkfs.ext4 disk.img
-mount -o loop disk.img /var/mnt
+let failure = try {
+    # Both deletion sources must remove an argument that really exists in the
+    # image; a missing fixture would otherwise make the negative checks pass.
+    { kargs: ["gapdel=1", "gapclidel=1"] } | to toml | save $"($workdir)/kargs.toml"
+    $"FROM ($target_image | str replace 'docker://' '')
+COPY kargs.toml /usr/lib/bootc/kargs.d/99-install-delete.toml
+" | save $"($workdir)/Containerfile"
+    podman build -t $image $workdir
+    let image_kargs = (podman run --rm $image cat /usr/lib/bootc/kargs.d/99-install-delete.toml | from toml | get kargs)
+    assert equal $image_kargs ["gapdel=1", "gapclidel=1"]
 
-# Mask off the bootupd state to reproduce https://github.com/bootc-dev/bootc/issues/1778
-# Also it turns out that installation outside of containers dies due to `error: Multiple commit objects found`
-# so we mask off /sysroot/ostree
-# And using systemd-run here breaks our install_t so we disable SELinux enforcement
-setenforce 0
+    # run_install isolates bootupd/ostree mounts. Disable enforcement for its
+    # transient systemd unit, as in the other outside-container install tests.
+    setenforce 0
+    mkdir /etc/bootc/install
+    { install: { kargs: ["gapcfg=1", "foo=bar"], karg-deletes: ["gapdel=1"] } } | to toml | save $config
 
-mkdir /etc/bootc/install
-{ install: { kargs: ["foo=bar"] } } | to toml | save /etc/bootc/install/99-test.toml
+    truncate -s 10G $disk
+    let backend = if $composefs { "--composefs-backend" } else { "" }
+    let install_args = $"($backend) --disable-selinux --source-imgref containers-storage:($image) --target-transport containers-storage --karg-delete gapclidel=1 --karg-delete foo"
+    if $composefs {
+        let st = bootc status --json | from json
+        let bootloader = ($st.status.booted.composefs.bootloader | str downcase)
+        tap run_install $"bootc install to-disk --via-loopback --filesystem ext4 --bootloader ($bootloader) ($install_args) ($disk)"
+        $loop_device = (losetup --find --show --partscan $disk | str trim)
+        udevadm settle
+        let partitions = (lsblk --json --tree --paths --output PATH,PARTLABEL $loop_device | from json | get blockdevices.0.children)
+        let root = ($partitions | where partlabel == "root" | get path | first)
+        let esp = ($partitions | where partlabel == "EFI-SYSTEM" | get path | first)
+        mount $root /var/mnt
+        mkdir /var/mnt/esp
+        mount $esp /var/mnt/esp
+    } else {
+        mkfs.ext4 $disk
+        $loop_device = (losetup --find --show $disk | str trim)
+        mount $loop_device /var/mnt
+        tap run_install $"bootc install to-filesystem --bootloader none ($install_args) /var/mnt"
+    }
 
-tap run_install $"bootc install to-filesystem --disable-selinux --bootloader none --source-imgref ($target_image) --karg-delete localtestkarg --karg-delete foo /var/mnt"
+    let entry_paths = (glob /var/mnt/boot/loader/entries/*.conf | append (glob /var/mnt/esp/loader/entries/*.conf))
+    assert (not ($entry_paths | is-empty)) "No bootloader entries found"
+    for entry in $entry_paths {
+        let options = (open $entry | lines | where { $in | str starts-with "options " })
+        assert equal ($options | length) 1
+        # Fixture arguments have no quoting or whitespace. Check whole options
+        # tokens, never substrings in titles, paths, or other BLS fields.
+        let tokens = ($options | first | split row -r '\s+' | skip 1)
+        assert ("gapcfg=1" in $tokens) $"Missing install-config karg in ($entry)"
+        for deleted in ["gapdel=1", "gapclidel=1", "foo=bar"] {
+            assert (not ($deleted in $tokens)) $"Found deleted karg ($deleted) in ($entry)"
+        }
+        let backend_keys = if $composefs { ["composefs=", "composefs.digest="] } else { ["ostree="] }
+        assert ($tokens | any {|token| $backend_keys | any {|key| $token | str starts-with $key } }) $"Wrong install backend in ($entry)"
+    }
+    null
+} catch {|err| $err }
 
-
-# Verify the karg is gone from the bootloader entries
-let entries = (glob /var/mnt/boot/loader/entries/*.conf
-    | each { open $in | lines }
-    | flatten)
-
-let localtestkarg_found = ($entries | find "localtestkarg" | is-empty)
-assert $localtestkarg_found "Found localtestkarg in bootloader entries, but it should have been deleted"
-
-let foo_found = ($entries | find "foo" | is-empty)
-assert $foo_found "Found foo in bootloader entries, but it should have been deleted"
-
-# Clean up
-umount /var/mnt
-rm -rf disk.img
+# Unmount children first, including when installation or mounting failed halfway.
+# Attempt independent cleanup even after a teardown error, without masking the
+# original failure or deleting a disk that is still attached to a loop device.
+def cleanup [action: closure] {
+    try { do $action; null } catch {|err| $err }
+}
+let device = $loop_device
+let cleanup_errors = ([
+    (cleanup {
+        if (mountpoint -q /var/mnt/esp | complete).exit_code == 0 {
+            umount /var/mnt/esp
+        }
+    })
+    (cleanup {
+        if (mountpoint -q /var/mnt | complete).exit_code == 0 {
+            umount /var/mnt
+        }
+    })
+    (cleanup {
+        if $device != null {
+            losetup -d $device
+        }
+    })
+    (cleanup {
+        if ($config | path exists) {
+            rm $config
+        }
+    })
+    (cleanup {
+        if (podman image exists $image | complete).exit_code == 0 {
+            podman image rm $image
+        }
+    })
+    (cleanup {
+        assert (losetup -j $disk | str trim | is-empty) "Disk still has an attached loop device"
+        rm -rf $workdir
+    })
+] | compact)
+for err in $cleanup_errors {
+    print -e $"Cleanup failed: ($err.msg)"
+}
+if $failure != null {
+    error make $failure
+}
+if not ($cleanup_errors | is-empty) {
+    error make { msg: "Install test cleanup failed" }
+}
 
 tap ok

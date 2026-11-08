@@ -156,6 +156,9 @@ check:
 /test-40-install-karg-delete:
   summary: Test bootc install --karg-delete
   duration: 30m
+  adjust:
+  - when: boot_type == uki or boot_type == aboot
+    enabled: false
   test: nu booted/test-install-karg-delete.nu
 
 /test-41-composefs-gc-uki:
