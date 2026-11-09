@@ -1816,10 +1816,7 @@ mod tests {
             "User agent should start with bootc/"
         );
         // Verify the version is present (not just "bootc/")
-        assert!(
-            prefix.len() > "bootc/".len(),
-            "Version should be present after bootc/"
-        );
+        assert!(prefix != "bootc/", "Version should be present after bootc/");
     }
 
     #[test]

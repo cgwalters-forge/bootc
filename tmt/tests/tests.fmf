@@ -153,9 +153,20 @@ check:
   duration: 30m
   test: nu booted/test-upgrade-tag.nu
 
+/test-40-install-immutable-kargs:
+  summary: Reject install-time karg settings for UKI and aboot images
+  duration: 30m
+  adjust:
+  - when: boot_type != uki and boot_type != aboot
+    enabled: false
+  test: nu booted/test-install-immutable-kargs.nu
+
 /test-40-install-karg-delete:
   summary: Test bootc install --karg-delete
   duration: 30m
+  adjust:
+  - when: boot_type == uki or boot_type == aboot
+    enabled: false
   test: nu booted/test-install-karg-delete.nu
 
 /test-41-composefs-gc-uki:

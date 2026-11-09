@@ -95,7 +95,7 @@ use composefs_ctl::composefs;
 use composefs_ctl::composefs_boot;
 use composefs_ctl::composefs_oci;
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::{Cmdline, Parameter, ParameterKey};
+use linux_kernel_cmdline::utf8::{Cmdline, CmdlineOwned, Parameter, ParameterKey};
 use ostree_ext::composefs::dumpfile;
 use ostree_ext::composefs_boot::bootloader::Type2Entry;
 use rustix::{mount::MountFlags, path::Arg};
@@ -814,6 +814,22 @@ fn replace_composefs_karg(cmdline: &mut Cmdline, new_karg: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load image kargs before applying install-time additions and deletions.
+fn compute_composefs_install_kargs(
+    root_kargs: &Cmdline,
+    install_config: Option<&crate::install::config::InstallConfiguration>,
+    config_opts: &crate::install::InstallConfigOpts,
+    mounted_erofs: &Dir,
+) -> Result<CmdlineOwned> {
+    let image_kargs = crate::bootc_kargs::get_kargs_in_root(mounted_erofs, std::env::consts::ARCH)?;
+    Ok(crate::install::compute_install_kargs(
+        root_kargs,
+        install_config,
+        &image_kargs,
+        config_opts,
+    ))
+}
+
 /// Sets up and writes BLS entries and binaries (VMLinuz + Initrd) to disk
 ///
 /// # Returns
@@ -832,15 +848,12 @@ pub(crate) fn setup_composefs_bls_boot(
     let (esp_device, mut cmdline_refs, bootloader) = match setup_type {
         BootSetupType::Setup((root_setup, state, postfetch, allow_missing_fsverity)) => {
             // root_setup.kargs has [root=UUID=<UUID>, "rw"]
-            let mut cmdline_options = Cmdline::new();
-
-            cmdline_options.extend(&root_setup.kargs);
-
-            if let Some(user_kargs) = &state.config_opts.karg {
-                for karg in user_kargs {
-                    cmdline_options.extend(karg);
-                }
-            }
+            let mut cmdline_options = compute_composefs_install_kargs(
+                &root_setup.kargs,
+                state.install_config.as_ref(),
+                &state.config_opts,
+                mounted_erofs,
+            )?;
 
             let composefs_cmdline =
                 build_composefs_karg(id.clone(), format_version, allow_missing_fsverity);
@@ -911,13 +924,11 @@ pub(crate) fn setup_composefs_bls_boot(
 
     let is_upgrade = matches!(setup_type, BootSetupType::Upgrade(..));
 
-    let current_root = if is_upgrade {
-        Some(&Dir::open_ambient_dir("/", ambient_authority()).context("Opening root")? as &Dir)
-    } else {
-        None
-    };
-
-    compute_new_kargs(mounted_erofs, current_root, &mut cmdline_refs)?;
+    if is_upgrade {
+        let current_root =
+            Dir::open_ambient_dir("/", ambient_authority()).context("Opening root")?;
+        compute_new_kargs(mounted_erofs, Some(&current_root), &mut cmdline_refs)?;
+    }
 
     let (entry_paths, _tmpdir_guard) = match bootloader.kind()? {
         BootloaderKind::GRUBClassic => {
@@ -2984,6 +2995,43 @@ pub(crate) fn expected_boot_image_ids(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_composefs_install_kargs() -> anyhow::Result<()> {
+        use super::*;
+        let td = tempfile::tempdir()?;
+        let root = Dir::open_ambient_dir(td.path(), ambient_authority())?;
+        root.create_dir_all("usr/lib/bootc/kargs.d")?;
+        root.write(
+            "usr/lib/bootc/kargs.d/10-test.toml",
+            "kargs = [\"image-delete=1\", \"cli-delete=1\", \"keep=1\"]",
+        )?;
+        let config = crate::install::config::InstallConfiguration {
+            kargs: Some(vec!["config=1".into()]),
+            karg_deletes: Some(vec!["image-delete=1".into()]),
+            ..Default::default()
+        };
+        for (cli_kargs, expected) in [
+            ("", "root=UUID=test rw config=1 keep=1"),
+            (
+                "image-delete=1 cli-delete=2",
+                "root=UUID=test rw config=1 keep=1 image-delete=1 cli-delete=2",
+            ),
+        ] {
+            let mut opts: crate::install::InstallConfigOpts =
+                serde_json::from_value(serde_json::json!({}))?;
+            opts.karg_delete = Some(vec!["cli-delete=1".into()]);
+            opts.karg = Some(vec![Cmdline::from(cli_kargs)]);
+            let kargs = compute_composefs_install_kargs(
+                &Cmdline::from("root=UUID=test rw"),
+                Some(&config),
+                &opts,
+                &root,
+            )?;
+            assert_eq!(kargs.to_string(), expected);
+        }
+        Ok(())
+    }
+
     use super::*;
     use composefs::erofs::format::FormatVersion;
     use composefs_boot::bootloader::{AbootArtifact, AbootEncoding, AbootEntry, Type2Entry};

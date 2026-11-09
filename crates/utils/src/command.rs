@@ -282,7 +282,7 @@ mod tests {
         let e = Command::new("/bin/sh")
             .args([
                 "-c",
-                r"echo -e 'expected\xf5\x80\x80\x80\x80-foo\xc0bar\xc0\xc0' 1>&2; exit 1",
+                r"printf 'expected\365\200\200\200\200-foo\300bar\300\300\n' 1>&2; exit 1",
             ])
             .run_capture_stderr()
             .err()

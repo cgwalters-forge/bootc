@@ -249,13 +249,27 @@ execute:
     test:
       - /tmt/tests/tests/test-39-upgrade-tag
 
+/plan-40-install-immutable-kargs:
+  summary: Reject install-time karg settings for UKI and aboot images
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-40-install-immutable-kargs
+  adjust:
+  - when: boot_type != uki and boot_type != aboot
+    enabled: false
+  extra-skip_if_ostree: true
+
 /plan-40-install-karg-delete:
   summary: Test bootc install --karg-delete
   discover:
     how: fmf
     test:
       - /tmt/tests/tests/test-40-install-karg-delete
-  extra-fixme_skip_if_composefs: true
+  adjust:
+  - when: boot_type == uki or boot_type == aboot
+    enabled: false
+  extra-fixme_skip_if_uki: true
 
 /plan-41-composefs-gc-uki:
   summary: Test composefs garbage collection for UKI
