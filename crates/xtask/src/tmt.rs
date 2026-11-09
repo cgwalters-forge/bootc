@@ -4,6 +4,8 @@ use fn_error_context::context;
 use rand::RngExt;
 use xshell::{Shell, cmd};
 
+mod diagnostics;
+
 // Generation markers for integration.fmf
 const PLAN_MARKER_BEGIN: &str = "# BEGIN GENERATED PLANS\n";
 const PLAN_MARKER_END: &str = "# END GENERATED PLANS\n";
@@ -803,8 +805,24 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         println!("Disk usage after plan {}:", plan);
         let _ = cmd!(sh, "df -h").run();
 
-        // Clean up VM regardless of test result (unless --preserve-vm is set)
-        cleanup_vm();
+        // Collect before removal; diagnostics must never replace the test result.
+        diagnostics::finish_plan(
+            sh,
+            test_result.is_err(),
+            preserve_vm,
+            &diagnostics::Plan {
+                name: plan,
+                vm: &vm_name,
+                results: &Utf8Path::new("/var/tmp/tmt")
+                    .join(&run_id)
+                    .join(plan.trim_start_matches('/'))
+                    .join("execute/results.yaml"),
+                dir: &vm_log_dir,
+                capture_supported: bcvk_has_log_dir,
+                port: ssh_port,
+                key: &key_path,
+            },
+        );
 
         match test_result {
             Ok(_) => {
