@@ -64,6 +64,9 @@ _nocache_arg := if nocache != "" { "--no-cache" } else { "" }
 _baseconfigs_env := if baseconfigs != "" { "--env=BOOTC_baseconfigs=" + baseconfigs } else { "" }
 testimage_label := "bootc.testimage=1"
 lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest"
+# Transient registry transfers can abort CI builds. Opt CI callers into whole-pull
+# retries; local runs remain single-attempt unless explicitly configured.
+_pull_retries := env("BOOTC_CI_RETRIES", if env("CI", "") == "true" { "3" } else { "1" })
 fedora-coreos := "quay.io/fedora/fedora-coreos:testing-devel"
 generic_buildargs := ""
 _extra_src_args := if extra_src != "" { "-v " + extra_src + ":/run/extra-src:ro --security-opt=label=disable" } else { "" }
@@ -96,6 +99,8 @@ build: package _keygen && _pull-lbi-images
     set -xeuo pipefail
     test -d target/packages
     pkg_path=$(realpath target/packages)
+    # Package may have skipped its pull under BOOTC_SKIP_PACKAGE.
+    podman image exists {{base}} || BOOTC_CI_RETRIES={{_pull_retries}} cargo xtask pull-images {{base}}
     eval $(just _git-build-vars)
     podman build {{_nocache_arg}} --build-arg=image_version=${VERSION} --build-context "packages=${pkg_path}" -t {{base_img}} {{buildargs}} .
 
@@ -455,8 +460,8 @@ package:
     if [[ -z "{{no_auto_local_deps}}" ]]; then
         local_deps_args=$(cargo xtask local-rust-deps)
     fi
-    # Pull the base image up front with more retries than `podman build` defaults to
-    podman pull -q --retry 5 --retry-delay 5s {{base}}
+    # Pull up front with bounded retries for transient registry failures.
+    BOOTC_CI_RETRIES={{_pull_retries}} cargo xtask pull-images {{base}}
     podman build {{base_buildargs}} --build-arg=SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} --build-arg=pkgversion=${VERSION} -t localhost/bootc-pkg --target=build $local_deps_args .
     mkdir -p "${packages}"
     rm -vf "${packages}"/*.rpm
@@ -487,7 +492,7 @@ sysext:
 # ============================================================================
 
 _pull-lbi-images:
-    podman pull -q --retry 5 --retry-delay 5s {{lbi_images}}
+    BOOTC_CI_RETRIES={{_pull_retries}} cargo xtask pull-images {{lbi_images}}
 
 _git-build-vars:
     #!/bin/bash
