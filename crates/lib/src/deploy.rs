@@ -1817,7 +1817,7 @@ mod tests {
         );
         // Verify the version is present (not just "bootc/")
         assert!(
-            prefix.len() > "bootc/".len(),
+            prefix.as_bytes().len() > "bootc/".as_bytes().len(),
             "Version should be present after bootc/"
         );
     }
