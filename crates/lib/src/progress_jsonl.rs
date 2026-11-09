@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 const REFRESH_HZ: u16 = 5;
 
 /// Semantic version of the protocol.
-const API_VERSION: &str = "0.1.0";
+const API_VERSION: &str = "0.2.0";
 
 /// An incremental update to e.g. a container image layer download.
 /// The first time a given "subtask" name is seen, a new progress bar should be created.
@@ -68,6 +68,17 @@ pub struct SubTaskStep<'t> {
     pub id: Cow<'t, str>,
     /// Starts as false when beginning to execute and turns true when completed.
     pub completed: bool,
+}
+
+/// The severity of a `Message` event.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageLevel {
+    /// Regular status output, e.g. which image was queued for the next boot.
+    Info,
+    /// Something the user should pay attention to, which did not cause
+    /// the operation to fail.
+    Warning,
 }
 
 /// An event emitted as JSON.
@@ -135,6 +146,15 @@ pub enum Event<'t> {
         /// The currently running subtasks.
         subtasks: Vec<SubTaskStep<'t>>,
     },
+    /// A human readable status message, with the same text that is
+    /// printed to the terminal. The text is not a stable interface.
+    Message {
+        /// The severity of the message.
+        level: MessageLevel,
+        /// The message text, without the newline added by the terminal helper.
+        #[serde(borrow)]
+        text: Cow<'t, str>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +218,51 @@ impl TryFrom<RawProgressFd> for ProgressWriter {
 }
 
 impl ProgressWriter {
+    /// Print status to stdout and send a required Message event, if enabled.
+    #[allow(dead_code)] // Foundation for subsequent caller conversions.
+    pub(crate) async fn info(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Info, text.as_ref(), |text| {
+            write_terminal(&mut std::io::stdout().lock(), text)
+        })
+        .await;
+    }
+
+    /// Print a warning to stderr and send a required Message event, if enabled.
+    #[allow(dead_code)] // Foundation for subsequent caller conversions.
+    pub(crate) async fn warning(&self, text: impl AsRef<str>) {
+        self.message(MessageLevel::Warning, text.as_ref(), |text| {
+            write_terminal(&mut std::io::stderr().lock(), text)
+        })
+        .await;
+    }
+
+    // Injectable terminal sink; keep potentially blocking terminal I/O off the
+    // async executor. Like println!/eprintln!, terminal write failures panic.
+    async fn message<F>(&self, level: MessageLevel, text: &str, terminal: F)
+    where
+        F: FnOnce(&str) -> std::io::Result<()> + Send + 'static,
+    {
+        let text = text.to_owned();
+        let (text, result) = tokio::task::spawn_blocking(move || {
+            let result = terminal(&text);
+            (text, result)
+        })
+        .await
+        .expect("terminal writer task panicked");
+        result.unwrap_or_else(|e| {
+            let stream = match level {
+                MessageLevel::Info => "stdout",
+                MessageLevel::Warning => "stderr",
+            };
+            panic!("failed printing to {stream}: {e}");
+        });
+        self.send(Event::Message {
+            level,
+            text: text.into(),
+        })
+        .await;
+    }
+
     /// Serialize the target value as a single line of JSON and write it.
     async fn send_impl_inner<T: Serialize>(inner: &mut ProgressWriterInner, v: T) -> Result<()> {
         // canon_json is guaranteed not to output newlines here
@@ -278,11 +343,214 @@ impl ProgressWriter {
     }
 }
 
+fn write_terminal(writer: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    writeln!(writer, "{text}")
+}
+
 #[cfg(test)]
 mod test {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
+
+    const TEXTS: &[&str] = &["", "hello", "a\nb", "trailing\n\n", "日本語 🦀"];
+
+    #[test]
+    fn test_schema() -> Result<()> {
+        let documented: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/src/progress-v0.schema.json"))?;
+        assert_eq!(
+            serde_json::to_value(schemars::schema_for!(Event))?,
+            documented
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_messages() -> Result<()> {
+        let (send, recv) = tokio::net::unix::pipe::pipe()?;
+        let sender = async move {
+            let writer = ProgressWriter::from(send);
+            for text in TEXTS {
+                for level in [MessageLevel::Info, MessageLevel::Warning] {
+                    let expected = format!("{text}\n").into_bytes();
+                    writer
+                        .message(level, text, move |text| {
+                            let mut bytes = Vec::new();
+                            write_terminal(&mut bytes, text)?;
+                            assert_eq!(bytes, expected);
+                            Ok(())
+                        })
+                        .await;
+                }
+            }
+        };
+        let receiver = async move {
+            let mut lines = BufReader::new(recv).lines();
+            assert_eq!(
+                lines.next_line().await?.as_deref(),
+                Some(r#"{"type":"Start","version":"0.2.0"}"#)
+            );
+            for text in TEXTS {
+                for level in [MessageLevel::Info, MessageLevel::Warning] {
+                    let line = lines.next_line().await?.unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Event>(&line)?,
+                        Event::Message {
+                            level,
+                            text: (*text).into()
+                        }
+                    );
+                }
+            }
+            assert!(lines.next_line().await?.is_none());
+            anyhow::Ok(())
+        };
+        let (_, result) = tokio::join!(sender, receiver);
+        result
+    }
+
+    #[test]
+    fn test_terminal_write_errors() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for text in TEXTS {
+            assert_eq!(
+                write_terminal(&mut Broken, text).unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    // Run with libtest capture disabled so these exercise the real standard
+    // streams, including the macros' panic/exit behavior on closed outputs.
+    #[test]
+    fn terminal_child() {
+        let Ok(mode) = std::env::var("BOOTC_TERMINAL_TEST") else {
+            return;
+        };
+        let text = std::env::var("BOOTC_TERMINAL_TEXT").unwrap();
+        if std::env::var_os("BOOTC_TERMINAL_CLOSED").is_some() {
+            // Let the parent close the selected output after libtest's banner.
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+        }
+        match mode.as_str() {
+            "println" => println!("{text}"),
+            "eprintln" => eprintln!("{text}"),
+            "info" | "warning" => {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let writer = ProgressWriter::default();
+                        if mode == "info" {
+                            writer.info(&text).await;
+                        } else {
+                            writer.warning(&text).await;
+                        }
+                    });
+            }
+            _ => panic!("unknown terminal test mode"),
+        }
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        // Omit libtest's timing-dependent summary.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn test_terminal_subprocesses() -> Result<()> {
+        let run = |mode: &str, text: &str, closed: bool| -> Result<std::process::Output> {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "progress_jsonl::test::terminal_child",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env("BOOTC_TERMINAL_TEST", mode)
+                .env("BOOTC_TERMINAL_TEXT", text)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if closed {
+                command.env("BOOTC_TERMINAL_CLOSED", "1");
+            }
+            let mut child = command.spawn()?;
+            let handshake = if closed {
+                let mut stdout = child.stdout.take().unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                if matches!(mode, "eprintln" | "warning") {
+                    drop(child.stderr.take());
+                }
+                Some(std::thread::spawn(move || -> std::io::Result<()> {
+                    // Read on a separate thread so the deadline also bounds
+                    // failures before the child reaches its handshake.
+                    let mut banner = Vec::new();
+                    while !banner.ends_with(b"running 1 test\n") {
+                        let mut byte = [0];
+                        stdout.read_exact(&mut byte)?;
+                        banner.push(byte[0]);
+                    }
+                    drop(stdout);
+                    stdin.write_all(b"x")
+                }))
+            } else {
+                None
+            };
+            let deadline = Instant::now() + std::time::Duration::from_secs(15);
+            while child.try_wait()?.is_none() {
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    child.wait()?;
+                    if let Some(handshake) = handshake {
+                        handshake.join().unwrap()?;
+                    }
+                    anyhow::bail!("terminal child timed out: {mode}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Some(handshake) = handshake {
+                handshake.join().unwrap()?;
+            }
+            Ok(child.wait_with_output()?)
+        };
+        for (original, helper) in [("println", "info"), ("eprintln", "warning")] {
+            for text in TEXTS {
+                let expected = run(original, text, false)?;
+                let actual = run(helper, text, false)?;
+                assert!(expected.status.success());
+                assert_eq!(actual.status, expected.status);
+                assert_eq!(actual.stdout, expected.stdout);
+                assert_eq!(actual.stderr, expected.stderr);
+                let expected = run(original, text, true)?;
+                let actual = run(helper, text, true)?;
+                assert!(!expected.status.success());
+                assert_eq!(actual.status, expected.status);
+                if helper == "info" {
+                    assert!(
+                        String::from_utf8_lossy(&actual.stderr)
+                            .contains("failed printing to stdout")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_jsonl() -> Result<()> {
@@ -336,6 +604,8 @@ mod test {
                 };
                 assert_eq!(&found, expected_value);
             }
+            assert!(got_first);
+            assert!(expected.next().is_none());
             anyhow::Ok(())
         };
         tokio::try_join!(sender, receiver)?;
