@@ -836,6 +836,9 @@ pub(crate) enum InternalsOpts {
         late_dir: Option<Utf8PathBuf>,
     },
     FixupEtcFstab,
+    /// Report a composefs finalization failure from the previous shutdown.
+    #[clap(hide = true)]
+    ComposefsBootComplete,
     /// Remove orphaned and duplicate entries from /etc/shadow and /etc/gshadow
     /// before systemd-sysusers runs.
     SysusersSync,
@@ -2556,6 +2559,10 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
         }
         Opt::Status(opts) => super::status::status(opts).await,
         Opt::Internals(opts) => match opts {
+            InternalsOpts::ComposefsBootComplete => {
+                let boot = crate::bootc_composefs::finalize::open_boot_for_stamp()?;
+                crate::bootc_composefs::finalize::boot_complete(&boot)
+            }
             InternalsOpts::ComposefsAbootReconcile => {
                 let storage = get_storage().await?;
                 let digest = match storage.kind()? {
@@ -2891,15 +2898,25 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 // but /boot.
                 crate::bootc_composefs::finalize::hold_boot()
             } else {
-                let storage = &get_storage().await?;
-                match storage.kind()? {
-                    BootedStorageKind::Ostree(_) => {
-                        anyhow::bail!(
-                            "ComposefsFinalizeStaged is only supported for composefs backend"
-                        )
-                    }
-                    BootedStorageKind::Composefs(booted_cfs) => {
-                        composefs_backend_finalize(storage, &booted_cfs).await
+                match get_storage().await {
+                    Ok(storage) => match storage.kind()? {
+                        BootedStorageKind::Ostree(_) => {
+                            anyhow::bail!(
+                                "ComposefsFinalizeStaged is only supported for composefs backend"
+                            )
+                        }
+                        BootedStorageKind::Composefs(booted_cfs) => {
+                            let result = composefs_backend_finalize(&storage, &booted_cfs).await;
+                            // Aboot has no /boot; leave its finalization unchanged.
+                            if storage.boot_dir.is_none() {
+                                result
+                            } else {
+                                crate::bootc_composefs::finalize::record_finalize_result(result)
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        crate::bootc_composefs::finalize::record_finalize_result(Err(error))
                     }
                 }
             }

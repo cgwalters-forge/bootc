@@ -62,7 +62,11 @@ pub(crate) fn fstab_generator_impl(root: &Dir, unit_dir: &Dir) -> Result<bool> {
 }
 
 pub(crate) fn enable_unit(unitdir: &Dir, name: &str, target: &str) -> Result<()> {
-    let wants = Utf8PathBuf::from(format!("{target}.wants"));
+    enable_unit_dependency(unitdir, name, target, "wants")
+}
+
+fn enable_unit_dependency(unitdir: &Dir, name: &str, target: &str, dependency: &str) -> Result<()> {
+    let wants = Utf8PathBuf::from(format!("{target}.{dependency}"));
     unitdir
         .create_dir_all(&wants)
         .with_context(|| format!("Creating {wants}"))?;
@@ -118,6 +122,8 @@ pub(crate) fn generator(root: &Dir, unit_dir: &Dir) -> Result<()> {
             .as_deref()
             .is_some_and(|s| s.starts_with("composefs:"));
     let is_ostree = root.try_exists(OSTREE_BOOTED)?;
+
+    boot_complete_generator_impl(unit_dir, is_composefs)?;
 
     // === Relabel unit: runs for transient composefs boots (native or ostree) ===
     // Must be before the ostree-booted guard because native composefs boots do
@@ -208,6 +214,21 @@ pub(crate) fn generator(root: &Dir, unit_dir: &Dir) -> Result<()> {
     let updated = fstab_generator_impl(root, unit_dir)?;
     tracing::trace!("Generated fstab: {updated}");
 
+    Ok(())
+}
+
+fn boot_complete_generator_impl(unit_dir: &Dir, is_composefs: bool) -> Result<()> {
+    if is_composefs {
+        // Before= alone does not block boot-complete.target (and blessing) on
+        // failure. The target must require the check. Its stamp condition makes
+        // this a no-op on clean boots; don't inspect /boot in the generator.
+        enable_unit_dependency(
+            unit_dir,
+            "bootc-boot-complete.service",
+            "boot-complete.target",
+            "requires",
+        )?;
+    }
     Ok(())
 }
 
@@ -367,6 +388,29 @@ mod tests {
         tempdir.create_dir("sysroot")?;
         tempdir.create_dir_all("run/systemd/system")?;
         Ok(tempdir)
+    }
+
+    #[test]
+    fn boot_complete_required_dependency() -> Result<()> {
+        let root = fixture()?;
+        let units = root.open_dir("run/systemd/system")?;
+        boot_complete_generator_impl(&units, false)?;
+        assert_eq!(units.entries()?.count(), 0);
+        for _ in 0..2 {
+            boot_complete_generator_impl(&units, true)?;
+        }
+        assert_eq!(
+            units
+                .read_link_contents("boot-complete.target.requires/bootc-boot-complete.service")?,
+            std::path::Path::new("/usr/lib/systemd/system/bootc-boot-complete.service")
+        );
+        let service = include_str!("../../../systemd/bootc-boot-complete.service");
+        assert!(service.contains("Before=boot-complete.target bootc-finalize-staged.service"));
+        assert!(service.contains("ConditionPathExists=|/boot/bootc-finalize-failure.stamp"));
+        assert!(
+            service.contains("ConditionPathExists=|/sysroot/boot/bootc-finalize-failure.stamp")
+        );
+        Ok(())
     }
 
     #[test]

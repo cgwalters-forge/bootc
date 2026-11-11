@@ -1,0 +1,20 @@
+[Unit]
+Description=Composefs Complete Boot
+Documentation=man:bootc(1)
+# Enabled by the bootc generator only on composefs-booted systems.
+ConditionPathExists=|/boot/bootc-finalize-failure.stamp
+ConditionPathExists=|/sysroot/boot/bootc-finalize-failure.stamp
+RequiresMountsFor=/boot /sysroot
+DefaultDependencies=no
+After=sysinit.target
+Before=boot-complete.target bootc-finalize-staged.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Allow a read-only /boot to be remounted in a private mount namespace.
+PrivateMounts=yes
+ExecStart=/usr/bin/bootc internals composefs-boot-complete
+
+[Install]
+RequiredBy=boot-complete.target

@@ -273,3 +273,12 @@ check:
   summary: Install from a shared mount namespace without leaking the storage bind mount
   duration: 30m
   test: nu booted/test-install-shared-propagation.nu
+
+/test-64-composefs-finalize-failure:
+  summary: Report a failed shutdown finalization once on the following composefs boot
+  duration: 30m
+  adjust:
+  - when: boot_type == aboot
+    enabled: false
+    because: Exercises systemd-boot or GRUB finalization
+  test: nu booted/test-composefs-finalize-failure.nu
