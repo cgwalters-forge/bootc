@@ -311,6 +311,14 @@ test-container-export: build
 test-tmt-nobuild *ARGS:
     cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_erofs_version={{erofs_version}} {{_baseconfigs_env}} --upgrade-image={{upgrade_img}} {{base_img}} {{ARGS}}
 
+# Opt-in regression lane; image must already contain the chosen ostree revision.
+# Prevent a disabled/missing plan from turning this dedicated check green.
+[group('testing')]
+test-boot-automount image:
+    podman image inspect "{{image}}"
+    git rev-parse HEAD
+    cargo xtask run-tmt --context=boot_automount_lane=required --env=BOOTC_variant=ostree --boot-type=bls --seal-state=unsealed --require-plan=/tmt/plans/boot-automount "{{image}}"
+
 # Run readonly tests with a baseconfig baked into the image at build time.
 # Requires composefs variant. Example: just variant=composefs test-tmt-baseconfig root-transient
 [group('testing')]

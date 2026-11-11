@@ -1,0 +1,58 @@
+summary: Require boot automount update coverage
+# A separate opt-in profile, not part of the generated general integration plans.
+enabled: false
+adjust:
+  - when: boot_automount_lane == required
+    enabled: true
+    because: Dedicated regression runs must reject unsupported layouts and skips
+provision:
+  how: virtual
+  image: $@{test_disk_image}
+discover:
+  how: fmf
+  # Read-only build input: the test source of upstream bootc PR 2634, tracked
+  # by issue 105. Do not carry a second copy of it here.
+  url: https://github.com/cgwalters-forge/bootc
+  ref: 3a4f4d148361e1c3d634ba43babc52b791f707b1
+  test:
+    - ^/tmt/tests/tests/test-64-boot-automount-idle-update-timer$
+prepare:
+  how: shell
+  script:
+    - |
+      set -euxo pipefail
+      . /usr/lib/os-release
+      test "$ID-$VERSION_ID" = fedora-44
+      test -d /sys/firmware/efi
+      test -f /run/ostree-booted
+      test -d /sysroot/ostree/repo
+      # /boot must be ostree's bind of the physical root, not a boot partition.
+      test "$(stat -c %d /sysroot/boot)" = "$(stat -c %d /sysroot)"
+      findmnt --mountpoint /boot --types autofs
+      ls /boot
+      test "$(stat -c %d /boot)" = "$(stat -c %d /sysroot/boot)"
+      # Prove that the GPT ESP is present, even though /boot uses the root fs.
+      lsblk --json --output NAME,PARTTYPE,PARTUUID,MOUNTPOINTS
+      lsblk --noheadings --output PARTTYPE | grep -qi c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+      systemctl cat boot.automount boot.mount
+      bootc status --json
+      rpm -q ostree ostree-libs
+      mkdir -p /var/log/journal
+      journalctl --flush
+execute:
+  how: tmt
+finish:
+  how: shell
+  script:
+    - |
+      set -euxo pipefail
+      # Diagnostics first, best effort: there is no previous boot when the
+      # test gave up before its first reboot, and that must still be reported.
+      journalctl -b -1 --no-pager -o short-monotonic -u bootc-fetch-apply-updates.timer -u bootc-fetch-apply-updates.service -u ostree-finalize-staged.service -u boot.mount -u boot.automount || true
+      journalctl -b --no-pager -o short-monotonic -u bootc-fetch-apply-updates.timer -u bootc-fetch-apply-updates.service -u ostree-finalize-staged.service -u boot.mount -u boot.automount || true
+      bootc status --json || true
+      findmnt --mountpoint /boot || true
+      cat /usr/share/bootc-test-2402 || true
+      # The test reports a missing automount as TAP success. This lane cannot
+      # pass without actually booting its new deployment.
+      test "$(cat /usr/share/bootc-test-2402)" = v2

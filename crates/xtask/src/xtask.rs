@@ -253,6 +253,10 @@ pub(crate) struct RunTmtArgs {
     #[arg(value_name = "FILTER")]
     pub(crate) filters: Vec<String>,
 
+    /// Require exactly this full plan name; fail if discovery disables or loses it
+    #[arg(long, conflicts_with = "filters")]
+    pub(crate) require_plan: Option<String>,
+
     /// Include additional context values
     #[clap(long)]
     pub(crate) context: Vec<String>,

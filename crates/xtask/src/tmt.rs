@@ -87,6 +87,17 @@ fn boot_context(boot_type: &crate::BootType, seal_state: Option<&SealState>) -> 
     ]
 }
 
+/// Dedicated lanes must not succeed when their plan is absent or disabled.
+fn require_plan(plans: &mut Vec<&str>, required: &str) -> Result<()> {
+    plans.retain(|plan| *plan == required);
+    anyhow::ensure!(
+        plans.len() == 1,
+        "Required plan {required} was not discovered exactly once (found {})",
+        plans.len()
+    );
+    Ok(())
+}
+
 /// Check that required dependencies are available
 #[context("Checking dependencies")]
 fn check_dependencies(sh: &Shell) -> Result<()> {
@@ -514,6 +525,10 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             plans.len(),
             filter_args
         );
+    }
+
+    if let Some(required) = args.require_plan.as_deref() {
+        require_plan(&mut plans, required)?;
     }
 
     if plans.is_empty() {
@@ -1525,6 +1540,27 @@ fn generate_integration() -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_require_plan() {
+        for (input, expected) in [
+            (vec!["/wanted", "/other"], true),
+            (vec!["/other"], false),
+            (vec![], false),
+            (vec!["/wanted", "/wanted"], false),
+            (vec!["/wanted-suffix"], false),
+        ] {
+            let mut plans = input.clone();
+            assert_eq!(
+                require_plan(&mut plans, "/wanted").is_ok(),
+                expected,
+                "{input:?}"
+            );
+            if expected {
+                assert_eq!(plans, ["/wanted"]);
+            }
+        }
+    }
 
     #[test]
     fn test_boot_context_values() {
