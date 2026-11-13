@@ -311,6 +311,21 @@ test-container-export: build
 test-tmt-nobuild *ARGS:
     cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_erofs_version={{erofs_version}} {{_baseconfigs_env}} --upgrade-image={{upgrade_img}} {{base_img}} {{ARGS}}
 
+# Add the pending CentOS Stream 10 ostree fix to an already-built test image.
+[group('testing')]
+build-boot-automount-regression image output:
+    podman build --build-arg=base={{quote(image)}} -t {{quote(output)}} -f tmt/Containerfile.boot-automount-regression .
+
+# Opt-in PR 106 lane; supply an ostree CentOS Stream 10 test image with /boot on root.
+[group('testing')]
+test-boot-automount-regression image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    image_id=$(podman image inspect --format '{{"{{.Id}}"}}' {{quote(image)}})
+    podman image inspect "$image_id"
+    # Allow 15 minutes for provisioning beyond the test's 30-minute duration.
+    timeout --kill-after=30s 45m cargo xtask run-tmt --context=boot_automount_regression=true --log-dir=/var/tmp/tmt "$image_id" /tmt/plans/boot-automount-regression
+
 # Run readonly tests with a baseconfig baked into the image at build time.
 # Requires composefs variant. Example: just variant=composefs test-tmt-baseconfig root-transient
 [group('testing')]

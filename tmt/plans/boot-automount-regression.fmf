@@ -1,0 +1,54 @@
+summary: Boot automount regression on CentOS Stream 10
+# Prevent a false green from PR 106's unsupported-layout success/skip path.
+# General integration tests keep their existing skip policy.
+enabled: false
+adjust:
+  - when: boot_automount_regression == true
+    enabled: true
+discover:
+  how: fmf
+  # PR 106 is read-only input; update this pin through review, not a branch ref.
+  # Use an archive: unmerged PR commits need not belong to a cloned branch.
+  url: https://github.com/cgwalters-forge/bootc/archive/e1f8132bb2719fcc3823859ae6f3c0965ab5e8cc.tar.gz
+  url-content-type: archive
+  path: /bootc-e1f8132bb2719fcc3823859ae6f3c0965ab5e8cc
+  test: ^/tmt/tests/tests/test-64-boot-automount-idle-update-timer$
+provision:
+  how: virtual
+prepare:
+  how: shell
+  script:
+    - |
+      set -eux
+      . /usr/lib/os-release
+      test "$ID" = centos
+      test "$NAME" = "CentOS Stream"
+      test "$VERSION_ID" = 10
+      test -e /run/ostree-booted
+      test ! -e /usr/share/bootc-test-2402
+      # Persist across the first reboot; only the test should start the timer.
+      systemctl disable --now bootc-fetch-apply-updates.timer
+      systemctl stop bootc-fetch-apply-updates.service
+      # Inspect autofs before accessing /boot, then prove the bind mount is
+      # /boot on the physical root, rather than a separate boot partition.
+      findmnt --mountpoint /boot --types autofs
+      systemctl is-active boot.automount
+      systemctl cat boot.automount boot.mount
+      ls /boot
+      test "$(findmnt -n -o MAJ:MIN -T /boot)" = "$(findmnt -n -o MAJ:MIN -T /sysroot)"
+      test "$(findmnt -n -o FSROOT -T /boot)" = /boot
+      findmnt -R /sysroot
+      findmnt --mountpoint /boot
+      bootc status --json
+      rpm -q ostree ostree-libs bootc systemd
+execute:
+  how: tmt
+finish:
+  how: shell
+  script:
+    - |
+      set -eux
+      bootc status --json
+      journalctl -b -1 -o short-monotonic --no-pager -u bootc-fetch-apply-updates.service -u bootc-fetch-apply-updates.timer -u ostree-finalize-staged.service -u boot.automount -u boot.mount
+      # A success/skip without the test's rebooted v2 deployment must fail.
+      test "$(cat /usr/share/bootc-test-2402)" = v2

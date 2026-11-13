@@ -1,0 +1,17 @@
+# Pending c10s rebase: https://gitlab.com/redhat/centos-stream/rpms/ostree/-/merge_requests/92
+# Layer onto a test image, not the live guest: reboots must retain the fix.
+ARG base
+FROM ${base}
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    set -eux; \
+    . /usr/lib/os-release; \
+    test "$ID" = centos; \
+    test "$NAME" = "CentOS Stream"; \
+    test "$VERSION_ID" = 10; \
+    arch=$(rpm --eval '%{_arch}'); \
+    nvr=2026.7-1.el10; \
+    rpms=https://kojihub.stream.centos.org/kojifiles/packages/ostree/2026.7/1.el10/$arch; \
+    dnf -y install "$rpms/ostree-$nvr.$arch.rpm" "$rpms/ostree-libs-$nvr.$arch.rpm"; \
+    test "$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' ostree)" = "$nvr"; \
+    test "$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' ostree-libs)" = "$nvr"; \
+    dnf clean all
