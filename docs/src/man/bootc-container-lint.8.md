@@ -15,6 +15,10 @@ container build.
 This is intended to be invoked via e.g. `RUN bootc container lint` as
 part of a build process; it will error if any problems are detected.
 
+The lints of type `fatal` (see `--list`) are also run by `bootc install`
+against the container image being installed, before any changes are made
+to the target. This can be disabled with `bootc install --skip-lints`.
+
 # OPTIONS
 
 <!-- BEGIN GENERATED OPTIONS -->
