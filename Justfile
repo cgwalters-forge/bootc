@@ -274,6 +274,25 @@ test-upgrade *ARGS: build _build-upgrade-source-image
         "${composefs_args[@]}" \
         {{upgrade_source_img}} {{ARGS}} readonly
 
+# Pin the historical stager so a replaced RPM cannot silently change the client
+# under test. If Koji prunes it, mirror the exact RPM without changing the hashes.
+bridge_1160_rpm_url := "https://kojipkgs.fedoraproject.org/packages/bootc/1.16.0/1.fc45/x86_64/bootc-1.16.0-1.fc45.x86_64.rpm"
+bridge_1160_rpm_sha256 := "86436dfbf68b3c95557361384a9d9ce7d5333edc0262b9fbf269fc3e942626b4"
+bridge_1160_bootc_sha256 := "db0e84f902f1c5220bdc31c3237fad705b4317b23ad7bcfc04393231c2ab2830"
+
+# Opt-in test-49: Fedora x86_64, bootc 1.16.0 -> current dual-format UKI.
+# CI integration is still outstanding; this does not add a CI job.
+[group('testing')]
+test-composefs-bridge seal_state:
+    #!/bin/bash
+    set -euo pipefail
+    case "{{seal_state}}" in sealed) fs=ext4 ;; unsealed) fs=xfs ;; *) echo 'seal_state must be sealed or unsealed' >&2; exit 1 ;; esac
+    for tool in bcvk tmt; do command -v "$tool" >/dev/null || { echo "Missing bridge VM prerequisite: $tool" >&2; exit 1; }; done
+    test "$(uname -m)" = x86_64 || { echo 'Bridge stager requires x86_64' >&2; exit 1; }
+    just base="$(just pullspec-for-os base fedora-44)" buildroot_base="$(just pullspec-for-os buildroot-base fedora-44)" \
+        base_img={{base_img}}-bridge-{{seal_state}} variant=composefs bootloader=systemd boot_type=uki \
+        seal_state={{seal_state}} filesystem="$fs" erofs_version=v1 _test-composefs-bridge
+
 # Run all validation checks: tmt plan staleness (local), then fmt/clippy/man/schema (container)
 [group('core')]
 validate:
@@ -541,6 +560,28 @@ _build-upgrade-image:
 # Build the upgrade source image: base image + tmt dependencies (rsync, nu, cloud-init)
 _build-upgrade-source-image:
     podman build --build-arg=base={{base}} --build-arg=variant={{variant}} -t {{upgrade_source_img}} -f tmt/tests/Dockerfile.upgrade-source .
+
+_test-composefs-bridge: build
+    just base_img={{base_img}} boot_type=uki seal_state={{seal_state}} filesystem={{filesystem}} erofs_version=v1 _build-upgrade-image
+    podman build {{_nocache_arg}} --build-arg=base={{base_img}} --build-arg=seal_state={{seal_state}} \
+        --build-arg=bootc_rpm_url={{bridge_1160_rpm_url}} --build-arg=bootc_rpm_sha256={{bridge_1160_rpm_sha256}} \
+        --build-arg=bootc_sha256={{bridge_1160_bootc_sha256}} \
+        --secret=id=secureboot_key,src=target/test-secureboot/db.key --secret=id=secureboot_cert,src=target/test-secureboot/db.crt \
+        --build-context=secureboot=target/test-secureboot \
+        --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse \
+        -t {{base_img}}-1160-stager -f tmt/tests/Dockerfile.composefs-1-16-stager .
+    podman build --build-arg=base={{base_img}} --build-arg=fixture=current-dual-uki-{{seal_state}} \
+        -t {{base_img}}-fixture -f tmt/tests/Dockerfile.composefs-bridge-label .
+    podman build --build-arg=base={{upgrade_img}} --build-arg=fixture=current-dual-uki-upgrade-{{seal_state}} \
+        -t {{upgrade_img}}-fixture -f tmt/tests/Dockerfile.composefs-bridge-label .
+    # Plan metadata requests --bind-storage-ro; explicitly override any opt-out.
+    cargo xtask run-tmt --skip-bind-storage=false \
+        --env=BOOTC_variant=composefs --env=BOOTC_erofs_version=v1 \
+        --env=BOOTC_composefs_bridge_integrity_mode={{seal_state}} --env=BOOTC_1160_bootc_sha256={{bridge_1160_bootc_sha256}} \
+        --context=composefs_bridge=true --composefs-backend --bootloader=systemd --boot-type=uki \
+        --seal-state={{seal_state}} --filesystem={{filesystem}} \
+        --bridge-image={{base_img}}-fixture --upgrade-image={{upgrade_img}}-fixture \
+        {{base_img}}-1160-stager composefs-1-16-bridge
 
 # Copy an image from user podman storage to root's podman storage
 # This allows building as regular user then running privileged tests

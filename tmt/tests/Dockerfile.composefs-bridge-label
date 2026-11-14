@@ -1,0 +1,5 @@
+# Labels change only image metadata, not the rootfs covered by the UKI digest.
+ARG base
+FROM ${base}
+ARG fixture
+LABEL bootc.test.fixture=${fixture}
