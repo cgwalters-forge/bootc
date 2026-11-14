@@ -141,7 +141,10 @@ and may change or be removed:
 
 - `bootc edit` and [`bootc install reset`](bootc-experimental-install-reset.7.md)
   are not yet implemented for the composefs backend.
-- There is no `bootc-boot-complete.service` and no boot counting; see
+- There is no `bootc-boot-complete.service`. Boot counting is opt-in and only
+  supported with systemd-boot, for traditional BLS and UKI Type-1 wrappers;
+  explicit rollback does not add counted retries. SELinux policy may prevent
+  healthy blessing. See
   [boot failure detection](bootc-boot-failure-detection.7.md#composefs-backend-boot-failure-detection).
 - There is no in-place transition from an ostree system to the composefs
   backend yet, so for now a system has to be reinstalled. We fully intend to

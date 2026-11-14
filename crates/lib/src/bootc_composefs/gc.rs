@@ -883,6 +883,63 @@ mod tests {
     }
 
     #[test]
+    fn counted_entries_keep_gc_roots_after_renames() -> Result<()> {
+        let root = tempdir(ambient_authority())?;
+        let deployment = "11".repeat(64);
+        // Traditional BLS can share a kernel belonging to another deployment.
+        let artifact = "22".repeat(64);
+        let orphan = "33".repeat(64);
+        for uki in [false, true] {
+            let boot_type = if uki { BootType::Uki } else { BootType::Bls };
+            let payload = if uki {
+                format!("efi /EFI/Linux/bootc/bootc_composefs-{deployment}.efi\n")
+            } else {
+                format!(
+                    "linux /bootc_composefs-{artifact}/vmlinuz\ninitrd /bootc_composefs-{artifact}/initrd\noptions composefs={deployment}\n"
+                )
+            };
+            let artifact_id = if uki { &deployment } else { &artifact };
+            let binaries = [
+                (boot_type, artifact_id.clone()),
+                (boot_type, orphan.clone()),
+            ];
+            for dir in ["loader/entries", "loader/entries.staged"] {
+                root.create_dir_all(dir)?;
+                let mut old_name = format!("{dir}/entry+3.conf");
+                root.write(
+                    &old_name,
+                    format!("title Counted\nversion 1\nsort-key 0\n{payload}"),
+                )?;
+                for counter in ["+3", "+2-1", "", "+0-3"] {
+                    let name = format!("{dir}/entry{counter}.conf");
+                    if old_name != name {
+                        root.rename(&old_name, &root, &name)?;
+                    }
+                    old_name = name;
+                    let entries = list_type1_entries(&root)?;
+                    assert_eq!(
+                        entries,
+                        [BootloaderEntry {
+                            fsverity: deployment.clone(),
+                            boot_artifact_name: artifact_id.clone()
+                        }]
+                    );
+                    let unreferenced = unreferenced_boot_binaries(&binaries, &entries);
+                    assert_eq!(
+                        unreferenced,
+                        [&binaries[1]],
+                        "uki={uki}, counter={counter}, dir={dir}"
+                    );
+                }
+                root.remove_file(old_name)?;
+                let entries = list_type1_entries(&root)?;
+                assert_eq!(unreferenced_boot_binaries(&binaries, &entries).len(), 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_image_refs_match_v2_when_v1_is_present() {
         let v1 = composefs::fsverity::Sha512HashValue::from_hex(&"11".repeat(64)).unwrap();
         let v2 = composefs::fsverity::Sha512HashValue::from_hex(&"22".repeat(64)).unwrap();

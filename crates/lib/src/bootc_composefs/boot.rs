@@ -64,6 +64,7 @@
 use std::cell::Cell;
 use std::fs::create_dir_all;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -102,6 +103,7 @@ use rustix::{mount::MountFlags, path::Arg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bootc_composefs::boot_counting::with_boot_tries;
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
 use crate::bootc_composefs::status::build_composefs_karg;
 use crate::bootc_composefs::uki_addon::{UkiAddonType, UkiAddonsList, list_installed_uki_addons};
@@ -543,7 +545,9 @@ pub fn type1_entry_conf_file_name(
     priority: &str,
 ) -> String {
     let os_id_safe = os_id.replace('-', "_");
-    format!("{BLS_ENTRY_FILE_PREFIX}{os_id_safe}-{version}-{priority}.conf")
+    // The Boot Loader Specification reserves '+' for boot counters.
+    let version_safe = version.to_string().replace('+', "_");
+    format!("{BLS_ENTRY_FILE_PREFIX}{os_id_safe}-{version_safe}-{priority}.conf")
 }
 
 /// Generate sort key for the primary (new/upgraded) boot entry.
@@ -826,6 +830,7 @@ pub(crate) fn setup_composefs_bls_boot(
     format_version: FormatVersion,
     entry: &ComposefsBootEntry<Sha512HashValue>,
     mounted_erofs: &Dir,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<String> {
     let id_hex = id.to_hex();
 
@@ -1087,7 +1092,10 @@ pub(crate) fn setup_composefs_bls_boot(
         .with_context(|| format!("Opening {config_path:?}"))?;
 
     loader_entries_dir.atomic_write(
-        type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+        with_boot_tries(
+            type1_entry_conf_file_name(&os_id, &bls_config.version(), FILENAME_PRIORITY_PRIMARY),
+            boot_tries,
+        ),
         bls_config.to_string().as_bytes(),
     )?;
 
@@ -1864,18 +1872,20 @@ fn write_grub_uki_menuentry(
 fn write_systemd_uki_config(
     esp_dir: &Dir,
     setup_type: &BootSetupType,
-    boot_label: String,
-    version: Option<String>,
-    os_id: Option<String>,
-    id: &Sha512HashValue,
+    uki_info: &UKIInfo,
     bootloader: &Bootloader,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<()> {
-    let os_id = os_id.as_deref().unwrap_or("bootc");
+    let id = uki_info
+        .composefs_digest
+        .as_ref()
+        .context("No composefs cmdline found in UKI or UKI Addons")?;
+    let os_id = uki_info.os_id.as_deref().unwrap_or("bootc");
     let primary_sort_key = primary_sort_key(os_id);
 
     let mut bls_conf = BLSConfig::default();
     bls_conf
-        .with_title(boot_label)
+        .with_title(uki_info.boot_label.clone())
         .with_cfg(BLSConfigType::EFI {
             key: EFIKey::for_bootloader(
                 format!("/{BOOTC_UKI_DIR}/{}", get_uki_name(&id.to_hex())).into(),
@@ -1883,7 +1893,7 @@ fn write_systemd_uki_config(
             ),
         })
         .with_sort_key(primary_sort_key.clone())
-        .with_version(version.unwrap_or_else(|| id.to_hex()));
+        .with_version(uki_info.version.clone().unwrap_or_else(|| id.to_hex()));
 
     let (entries_dir, booted_bls) = match setup_type {
         BootSetupType::Setup(..) => {
@@ -1908,7 +1918,10 @@ fn write_systemd_uki_config(
 
     entries_dir
         .atomic_write(
-            type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+            with_boot_tries(
+                type1_entry_conf_file_name(os_id, &bls_conf.version(), FILENAME_PRIORITY_PRIMARY),
+                boot_tries,
+            ),
             bls_conf.to_string().as_bytes(),
         )
         .context("Writing conf file")?;
@@ -1942,6 +1955,7 @@ pub(crate) fn setup_composefs_uki_boot(
     id: &Sha512HashValue,
     boot_ids: &ExpectedBootImageIds,
     entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
+    boot_tries: Option<NonZeroU32>,
 ) -> Result<(String, Sha512HashValue)> {
     let (
         esp_device,
@@ -2170,21 +2184,13 @@ pub(crate) fn setup_composefs_uki_boot(
         };
     }
 
-    let Some(deploy_id) = uki_info.composefs_digest else {
+    let Some(deploy_id) = uki_info.composefs_digest.as_ref() else {
         anyhow::bail!("No composefs cmdline found in UKI or UKI Addons");
     };
 
     if uki_info.boot_label.is_empty() {
         anyhow::bail!("Failed to get boot label from UKI");
     }
-
-    let UKIInfo {
-        boot_label,
-        version,
-        os_id,
-        boot_digest,
-        ..
-    } = uki_info;
 
     let is_upgrade = matches!(setup_type, BootSetupType::Upgrade(..));
 
@@ -2194,26 +2200,27 @@ pub(crate) fn setup_composefs_uki_boot(
     }
 
     for entry in entries_to_write {
-        write_pe_to_esp(repo, &entry, &deploy_id, esp_mount.dir.path(), is_upgrade)?;
+        write_pe_to_esp(repo, &entry, deploy_id, esp_mount.dir.path(), is_upgrade)?;
     }
 
     match bootloader.kind()? {
-        BootloaderKind::GRUBClassic => {
-            write_grub_uki_menuentry(&setup_type, boot_label, &deploy_id, &esp_device)?
-        }
+        BootloaderKind::GRUBClassic => write_grub_uki_menuentry(
+            &setup_type,
+            uki_info.boot_label.clone(),
+            deploy_id,
+            &esp_device,
+        )?,
 
         BootloaderKind::BLSCompatible => write_systemd_uki_config(
             &esp_mount.fd,
             &setup_type,
-            boot_label,
-            version,
-            os_id,
-            &deploy_id,
+            &uki_info,
             &bootloader,
+            boot_tries,
         )?,
     };
 
-    Ok((boot_digest, deploy_id))
+    Ok((uki_info.boot_digest, deploy_id.clone()))
 }
 
 /// A composefs image attached to a temporary directory with the ESP and a
@@ -2903,6 +2910,8 @@ pub(crate) async fn setup_composefs_boot(
                 provisional_format,
                 entry,
                 &image_root,
+                // Initial installs have nothing to fall back to.
+                None,
             )?,
             provisional_deploy_id,
         ),
@@ -2913,6 +2922,7 @@ pub(crate) async fn setup_composefs_boot(
                 &provisional_deploy_id,
                 &boot_ids,
                 entries,
+                None,
             ),
             &repo,
             &fs,
@@ -3315,6 +3325,10 @@ mod tests {
         // Test rhel example
         let filename = type1_entry_conf_file_name("rhel", "9.3.0", FILENAME_PRIORITY_SECONDARY);
         assert_eq!(filename, "bootc_rhel-9.3.0-0.conf");
+
+        // '+' from an image version must not be interpreted as a counter.
+        let filename = type1_entry_conf_file_name("fedora", "1.2.3+42", FILENAME_PRIORITY_PRIMARY);
+        assert_eq!(filename, "bootc_fedora-1.2.3_42-1.conf");
     }
 
     #[test]

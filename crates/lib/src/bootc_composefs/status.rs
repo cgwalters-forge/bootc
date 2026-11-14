@@ -18,6 +18,7 @@ use crate::{
     bootc_composefs::{
         aboot,
         boot::BootType,
+        boot_counting::entry_is_bad,
         selinux::are_selinux_policies_compatible,
         state::{get_usr_overlay_status, read_boot_type, read_origin},
         utils::{compute_store_boot_digest_for_uki, get_uki_cmdline},
@@ -329,8 +330,10 @@ fn get_sorted_type1_boot_entries_helper(
     // Sort based on bootloader type
     configs_with_filenames.sort_by(|a, b| {
         let ord = match bootloader {
-            // For systemd-boot sort by sort-key
-            Bootloader::Systemd => a.config.cmp(&b.config),
+            // Like systemd-boot, exhausted entries sort after all others.
+            Bootloader::Systemd => entry_is_bad(&a.filename)
+                .cmp(&entry_is_bad(&b.filename))
+                .then_with(|| a.config.cmp(&b.config)),
             // For grub and grub-cc, sort by filename in descending order
             // See: https://github.com/bootc-dev/bootc/issues/2221
             Bootloader::Grub | Bootloader::GrubCC => b.filename.cmp(&a.filename),
@@ -1662,6 +1665,86 @@ mod tests {
             false,
         );
         assert!(result.is_err(), "InvalidData should propagate as an error");
+    }
+
+    #[test]
+    fn counted_entries_status_ordering() -> Result<()> {
+        let root = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        let current = "11".repeat(64);
+        let previous = "22".repeat(64);
+        for uki in [false, true] {
+            let payload = |digest: &str| {
+                if uki {
+                    format!("uki /EFI/Linux/bootc/bootc_composefs-{digest}.efi\n")
+                } else {
+                    format!(
+                        "linux /bootc_composefs-{digest}/vmlinuz\ninitrd /bootc_composefs-{digest}/initrd\noptions composefs={digest}\n"
+                    )
+                }
+            };
+            for (counter, exhausted) in [
+                ("+3", false),
+                ("+2-1", false),
+                ("", false),
+                ("+0", true),
+                ("+0-3", true),
+            ] {
+                for staged in [false, true] {
+                    let dir = if staged {
+                        TYPE1_ENT_PATH_STAGED
+                    } else {
+                        TYPE1_ENT_PATH
+                    };
+                    root.remove_all_optional(dir)?;
+                    root.create_dir_all(dir)?;
+                    root.write(
+                        format!("{dir}/current{counter}.conf"),
+                        format!(
+                            "title Current\nversion 2\nsort-key 0\n{}",
+                            payload(&current)
+                        ),
+                    )?;
+                    root.write(
+                        format!("{dir}/previous.conf"),
+                        format!(
+                            "title Previous\nversion 1\nsort-key 1\n{}",
+                            payload(&previous)
+                        ),
+                    )?;
+                    for ascending in [true, false] {
+                        let entries = get_sorted_type1_boot_entries_helper(
+                            &root,
+                            ascending,
+                            staged,
+                            Bootloader::Systemd,
+                        )?;
+                        let current_first = ascending != exhausted;
+                        assert_eq!(
+                            entries[0].get_verity()?,
+                            if current_first { &current } else { &previous }.as_str(),
+                            "uki={uki}, counter={counter}, ascending={ascending}, staged={staged}"
+                        );
+                        if ascending {
+                            assert_eq!(
+                                rollback_queued_from_first_entry(&entries[0], &current)?,
+                                exhausted
+                            );
+                            assert_eq!(
+                                rollback_queued_from_first_entry(&entries[0], &previous)?,
+                                !exhausted
+                            );
+                        }
+                    }
+                    // GRUB ignores counters and retains its filename ordering.
+                    for bootloader in [Bootloader::Grub, Bootloader::GrubCC] {
+                        let entries =
+                            get_sorted_type1_boot_entries_helper(&root, true, staged, bootloader)?;
+                        assert_eq!(entries[0].get_verity()?, previous);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
