@@ -20,6 +20,7 @@ const COMMON_INST_ARGS: &[&str] = &["--label=bootc.test=1"];
 // Metadata field names
 const FIELD_TRY_BIND_STORAGE: &str = "try_bind_storage";
 const FIELD_EXPORT_IMAGE: &str = "export_image";
+const FIELD_BIOS: &str = "bios";
 const FIELD_SUMMARY: &str = "summary";
 const FIELD_ADJUST: &str = "adjust";
 const FIELD_ENABLED: &str = "enabled";
@@ -273,6 +274,7 @@ fn verify_ssh_connectivity(sh: &Shell, port: u16, key_path: &Utf8Path) -> Result
 
 #[derive(Debug, Default)]
 struct PlanMetadata {
+    bios: bool,
     try_bind_storage: bool,
     export_image: bool,
     skip_if_composefs: bool,
@@ -307,6 +309,13 @@ fn parse_plan_metadata(
         let Some(plan_data) = value.as_mapping() else {
             continue;
         };
+
+        if let Some(bios) = plan_data
+            .get(serde_yaml::Value::String(format!("extra-{FIELD_BIOS}")))
+            .and_then(|v| v.as_bool())
+        {
+            plan_metadata.entry(plan_name.to_string()).or_default().bios = bios;
+        }
 
         if let Some(export_image) = plan_data
             .get(serde_yaml::Value::String(format!(
@@ -656,7 +665,25 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         };
 
         // Launch VM with bcvk
-        let firmware_args_slice = firmware_args.as_slice();
+        let bios = plan_metadata
+            .iter()
+            .find(|(key, _)| plan.ends_with(key.as_str()))
+            .is_some_and(|(_, metadata)| metadata.bios);
+        let bios_args = vec!["--firmware=bios".to_string()];
+        if bios {
+            anyhow::ensure!(
+                std::env::consts::ARCH == "x86_64"
+                    && !args.composefs
+                    && !args.composefs_backend
+                    && !matches!(args.seal_state, Some(SealState::Sealed)),
+                "BIOS regression requires an unsealed x86_64 OSTree image"
+            );
+        }
+        let firmware_args_slice = if bios {
+            bios_args.as_slice()
+        } else {
+            firmware_args.as_slice()
+        };
         let launch_result = cmd!(
             sh,
             "bcvk libvirt run --name {vm_name} --detach {firmware_args_slice...} {COMMON_INST_ARGS...} {plan_bcvk_opts...} {log_dir_args...} {image}"
@@ -1088,6 +1115,7 @@ struct TmtMetadata {
 
 #[derive(Debug, Eq, PartialEq)]
 struct TestDef {
+    bios: bool,
     number: u32,
     name: String,
     test_command: String,
@@ -1307,6 +1335,11 @@ fn generate_integration() -> Result<(String, String)> {
             .unwrap_or(false);
 
         tests.push(TestDef {
+            bios: metadata
+                .extra
+                .get(FIELD_BIOS)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             number: metadata.number,
             name: display_name,
             test_command,
@@ -1429,6 +1462,13 @@ fn generate_integration() -> Result<(String, String)> {
         }
 
         // Add extra-try_bind_storage if test wants it
+        if test.bios {
+            plan_value.insert(
+                serde_yaml::Value::String(format!("extra-{FIELD_BIOS}")),
+                serde_yaml::Value::Bool(true),
+            );
+        }
+
         if test.try_bind_storage {
             plan_value.insert(
                 serde_yaml::Value::String(format!("extra-{}", FIELD_TRY_BIND_STORAGE)),
@@ -1697,6 +1737,25 @@ use anyhow::Result;
             let plan = &plans["/plan-51-switch-from-delta"];
             assert_eq!(plan.export_image, expected);
             assert!(plan.try_bind_storage);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_plan_bios() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let path = Utf8Path::from_path(file.path()).unwrap();
+        for (field, expected) in [
+            ("", false),
+            ("extra-bios: false", false),
+            ("extra-bios: true", true),
+        ] {
+            std::fs::write(
+                path,
+                format!("/plan-55-boot-bind-fstab:\n  extra-try_bind_storage: false\n  {field}\n"),
+            )?;
+            let plans = parse_plan_metadata(path)?;
+            assert_eq!(plans["/plan-55-boot-bind-fstab"].bios, expected);
         }
         Ok(())
     }

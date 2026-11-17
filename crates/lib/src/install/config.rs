@@ -118,6 +118,9 @@ pub(crate) struct InstallConfiguration {
     pub(crate) root_mount_spec: Option<String>,
     /// Mount specification for the /boot filesystem.
     pub(crate) boot_mount_spec: Option<String>,
+    /// Opt in to fstab ownership of the same-partition OSTree /boot bind.
+    /// The deployed target must have OSTree >= 2026.5.
+    pub(crate) boot_bind_fstab: Option<bool>,
     /// Bootupd configuration
     pub(crate) bootupd: Option<Bootupd>,
     /// Bootloader to use (grub, systemd, none)
@@ -214,6 +217,7 @@ impl Mergeable for InstallConfiguration {
             merge_basic(&mut self.stateroot, other.stateroot, env);
             merge_basic(&mut self.root_mount_spec, other.root_mount_spec, env);
             merge_basic(&mut self.boot_mount_spec, other.boot_mount_spec, env);
+            merge_basic(&mut self.boot_bind_fstab, other.boot_bind_fstab, env);
             self.bootupd.merge(other.bootupd, env);
             merge_basic(&mut self.bootloader, other.bootloader, env);
             merge_basic(
@@ -336,6 +340,21 @@ pub(crate) fn load_config() -> Result<Option<InstallConfiguration>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_boot_bind_fstab_gate() {
+        let env = EnvProperties {
+            sys_arch: "x86_64".into(),
+        };
+        let mut config = InstallConfiguration::default();
+        assert!(!config.boot_bind_fstab.unwrap_or(false));
+        for enabled in [true, false] {
+            let parsed: InstallConfigurationToplevel =
+                toml::from_str(&format!("[install]\nboot-bind-fstab = {enabled}\n")).unwrap();
+            config.merge(parsed.install.unwrap(), &env);
+            assert_eq!(config.boot_bind_fstab, Some(enabled));
+        }
+    }
 
     #[test]
     /// Verify that we can parse our default config file

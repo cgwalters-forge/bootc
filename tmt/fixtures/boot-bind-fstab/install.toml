@@ -1,0 +1,3 @@
+[install]
+boot-bind-fstab = true
+block = ["direct"]

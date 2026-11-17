@@ -40,6 +40,16 @@ The `install` section supports these subfields:
 - `boot-mount-spec`: A string specifying the /boot filesystem mount specification.
    If not provided and /boot is a separate mount, its UUID will be used.
    An empty string signals to omit boot mount kargs entirely.
+- `boot-bind-fstab`: Boolean, default `false`. For OSTree installations without
+   a separate boot filesystem, write `/sysroot/boot /boot none bind 0 0` to fstab.
+   This prevents GPT-auto's unused-ESP automount from expiring the OSTree bind.
+   The installer checks the **deployed target's** `ostree --version` (a single
+   probe limited to 10 seconds) and rejects versions before 2026.5 or unknown
+   versions, because older OSTree generators do not yield to fstab. Use with
+   systemd 256 or later, which honors the fstab loader-partition exclusion.
+   Separate boot mounts, including an explicitly empty mount specification,
+   retain their existing behavior. This option does not affect the native
+   composefs backend.
 - `discoverable-partitions`: Boolean.  When `true`, root discovery uses the
    Discoverable Partitions Specification via `systemd-gpt-auto-generator` and
    the `root=` kernel argument is omitted.  This requires the bootloader to
@@ -104,6 +114,22 @@ Enable DPS auto-discovery for root (requires a BLI-capable bootloader):
 [install]
 discoverable-partitions = true
 ```
+
+# Existing same-partition systems
+
+For an existing OSTree system affected by `/boot` idle expiry, first verify
+that `/boot` is a bind of `/sysroot/boot`, not a separate filesystem or the ESP.
+With OSTree 2026.5 or later and systemd 256 or later, add the following to
+`/etc/fstab` (without duplicating an existing `/boot` entry), then reboot:
+
+```fstab
+/sysroot/boot /boot none bind 0 0
+```
+
+Use the real bind entry rather than masking `boot.automount`. Do not ship it
+unconditionally in generic base images. Check rollback deployments too: older
+OSTree generators can compete with the fstab-generated unit. The install option
+only affects new installations; it does not migrate existing deployments.
 
 # SEE ALSO
 

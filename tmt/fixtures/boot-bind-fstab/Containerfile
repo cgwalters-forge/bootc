@@ -1,0 +1,7 @@
+# Build from the freshly built OSTree test image with OSTree >= 2026.5
+# and systemd >= 256; run with the boot_bind_fstab=true TMT context.
+ARG BASE=localhost/bootc
+FROM ${BASE}
+ARG ENABLE_BOOT_BIND_FSTAB=true
+COPY install.toml /usr/lib/bootc/install/99-boot-bind-fstab.toml
+RUN if [ "$ENABLE_BOOT_BIND_FSTAB" = false ]; then printf '[install]\nblock = ["direct"]\n' > /usr/lib/bootc/install/99-boot-bind-fstab.toml; fi
