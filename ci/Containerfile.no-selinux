@@ -1,0 +1,47 @@
+# Build and unit-test bootc without the `selinux` feature on a distribution
+# that doesn't ship libselinux at all (Arch Linux), proving the result
+# neither needs nor links it. Run via `just test-no-selinux`.
+FROM docker.io/library/archlinux:latest
+# Only what the build and unit tests (which run skopeo) need; libselinux
+# isn't in Arch's official repositories, so nothing here should pull it in,
+# but check rather than assume.
+RUN <<EORUN
+set -xeuo pipefail
+pacman -Syu --noconfirm --needed base-devel clang git glib2 go-md2man openssl ostree pkgconf rust skopeo zstd
+pacman -Scc --noconfirm
+# pacman -T exits 127 when the dependency is unsatisfied, other nonzero on errors.
+rc=0; pacman -T libselinux || rc=$?
+if [ "$rc" != 127 ]; then
+    echo "error: libselinux is installed, or pacman -T failed ($rc)" >&2; exit 1
+fi
+libs=$(find / -xdev -name 'libselinux.so*')
+if [ -n "$libs" ]; then
+    echo "error: found libselinux shared libraries: $libs" >&2; exit 1
+fi
+EORUN
+# As in the main Dockerfile, CI passes CARGO_INCREMENTAL=0 to save disk.
+ARG CARGO_INCREMENTAL
+ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+COPY . /src
+WORKDIR /src
+# `pre-6.15` is the initramfs crate's default, dropped by --no-default-features.
+# Some tests `cp -a` under /var/tmp, which fails to preserve permissions on
+# the container's overlay; a tmpfs supports that.
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/tmp \
+    --mount=type=cache,target=/src/target --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git <<EORUN
+set -xeuo pipefail
+make bin CARGO_OPTIONS='--no-default-features --features "install-to-disk pre-6.15"'
+target/release/bootc --version
+# ldd prints "not found" for unresolved libraries; it fails (and so does this,
+# via pipefail) only if it can't inspect the binary at all.
+ldd target/release/bootc | tee /tmp/ldd.txt
+if grep -E 'not found|libselinux' /tmp/ldd.txt; then
+    echo "error: bootc has missing or libselinux dependencies" >&2; exit 1
+fi
+readelf -d target/release/bootc > /tmp/readelf.txt
+if grep -F libselinux /tmp/readelf.txt; then
+    echo "error: bootc has a DT_NEEDED entry for libselinux" >&2; exit 1
+fi
+cargo test -p bootc-lib --no-default-features --features install-to-disk
+EORUN
