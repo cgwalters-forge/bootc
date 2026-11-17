@@ -3,7 +3,7 @@ use fn_error_context::context;
 
 use crate::{
     bootc_composefs::{
-        status::get_composefs_status,
+        status::{ImgConfigManifest, get_composefs_status},
         update::{
             DoUpgradeOpts, UpdateAction, apply_upgrade_from_downloaded,
             discard_failed_aboot_update, do_upgrade, ensure_delta_source_present, is_image_pulled,
@@ -118,18 +118,21 @@ pub(crate) async fn switch_composefs(
 
     // With a delta the target is whatever the delta says it is, and we can look
     // it up locally; without one we have to ask the registry.
-    let (image, manifest) = match &delta {
+    let (image, img) = match &delta {
         Some(delta) => {
             crate::delta::reject_unified_storage(delta, do_upgrade_opts.use_unified)?;
             ensure_delta_source_present(repo, delta)?;
             (
                 lookup_config_splitstream(repo, delta.target_manifest().config().digest())?,
-                delta.target_manifest().clone(),
+                ImgConfigManifest {
+                    config: delta.target_config().clone(),
+                    manifest: delta.target_manifest().clone(),
+                },
             )
         }
         None => {
             let (image, img_config, _) = is_image_pulled(repo, &target_imgref).await?;
-            (image, img_config.manifest)
+            (image, img_config)
         }
     };
 
@@ -138,7 +141,7 @@ pub(crate) async fn switch_composefs(
             storage,
             booted_cfs,
             &host,
-            manifest.config().digest().as_ref(),
+            img.manifest.config().digest().as_ref(),
             &cfg_verity,
             true,
         )?;
@@ -156,7 +159,7 @@ pub(crate) async fn switch_composefs(
                     &host,
                     &target_imgref,
                     &do_upgrade_opts,
-                    &manifest,
+                    &img,
                 )
                 .await;
             }
@@ -169,7 +172,7 @@ pub(crate) async fn switch_composefs(
         &host,
         &target_imgref,
         &do_upgrade_opts,
-        &manifest,
+        &img,
     )
     .await?;
 

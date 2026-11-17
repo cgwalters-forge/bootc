@@ -65,7 +65,8 @@ use crate::bootc_composefs::boot::{
     ExpectedBootImageIds, ensure_correct_composefs_digest, expected_boot_image_ids,
     print_uki_dumpfile_diff_on_mismatch,
 };
-use crate::bootc_composefs::progress;
+use crate::bootc_composefs::progress::{self, PullBytes};
+use crate::bootc_composefs::status::ImgConfigManifest;
 use crate::composefs_consts::BOOTC_TAG_PREFIX;
 use crate::install::{RootSetup, State};
 use crate::lsm;
@@ -297,7 +298,14 @@ pub(crate) async fn pull_install_composefs_repository(
     } else {
         // Direct path: pull directly into composefs via skopeo, without
         // containers-storage as intermediary.
-        pull_composefs_direct(&repo, &imgref, false, ProgressWriter::default()).await?
+        pull_composefs_direct(
+            &repo,
+            &imgref,
+            false,
+            ProgressWriter::default(),
+            PullBytes::default(),
+        )
+        .await?
     };
 
     Ok(pull_result)
@@ -396,6 +404,49 @@ pub(crate) fn inspect_image_fsverity_policy(
     crate::bootc_composefs::boot::image_fsverity_policy(repo, &entries)
 }
 
+/// Split the manifest's compressed layer sizes into bytes still to fetch and
+/// bytes whose layer `repo` already has, so that progress can account for
+/// layers composefs-rs skips without a size.
+fn pull_bytes(
+    repo: &crate::store::ComposefsRepository,
+    img: &ImgConfigManifest,
+) -> Result<PullBytes> {
+    // TODO: export layer_identifier from composefs-oci and use it here
+    layer_pull_bytes(img, |diff_id| {
+        Ok(repo
+            .has_stream(&format!("oci-layer-{diff_id}"))
+            .context("Checking layer stream")?
+            .is_some())
+    })
+}
+
+/// Counts each diff_id once, as the repository stores a repeated layer once.
+/// The totals are left unspecified if the config and manifest disagree.
+fn layer_pull_bytes(
+    img: &ImgConfigManifest,
+    mut has_layer: impl FnMut(&str) -> Result<bool>,
+) -> Result<PullBytes> {
+    let layers = img.manifest.layers();
+    let diff_ids = img.config.rootfs().diff_ids();
+    if layers.len() != diff_ids.len() {
+        return Ok(PullBytes::default());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = PullBytes::default();
+    for (layer, diff_id) in layers.iter().zip(diff_ids) {
+        if !seen.insert(diff_id.as_str()) {
+            continue;
+        }
+        let count = if has_layer(diff_id)? {
+            &mut bytes.cached
+        } else {
+            &mut bytes.total
+        };
+        *count = count.saturating_add(layer.size());
+    }
+    Ok(bytes)
+}
+
 /// Pull an image directly into the composefs repository via skopeo.
 ///
 /// This is the default path: the image is fetched directly from the source
@@ -406,6 +457,7 @@ async fn pull_composefs_direct(
     imgref: &containers_image_proxy::ImageReference,
     quiet: bool,
     prog: ProgressWriter,
+    pull_bytes: PullBytes,
 ) -> Result<PullResult<Sha512HashValue>> {
     let imgref_str = imgref.to_string();
     tracing::info!("Direct pull: fetching {imgref_str} into composefs repository");
@@ -413,7 +465,7 @@ async fn pull_composefs_direct(
     let mut config = crate::deploy::new_proxy_config();
     ostree_ext::container::merge_default_container_proxy_opts(&mut config)?;
 
-    let (reporter, prog_task) = progress::spawn(quiet, prog);
+    let (reporter, prog_task) = progress::spawn(quiet, prog, pull_bytes);
 
     let pull_result = composefs_oci::pull(
         repo,
@@ -487,7 +539,9 @@ async fn pull_composefs_unified(
     tracing::info!("Unified pull: importing from {cstor_imgref_str} (zero-copy)");
 
     let storage = std::path::Path::new(storage_path);
-    let (reporter, prog_task) = progress::spawn(quiet, prog);
+    // cstor reports newly stored uncompressed object bytes, not compressed
+    // layer transfer bytes. The manifest sizes cannot be used as its total.
+    let (reporter, prog_task) = progress::spawn(quiet, prog, PullBytes::default());
     let pull_opts = PullOptions {
         // The image is already in bootc-owned containers-storage at this point
         // (placed there by Stage 1 of the unified pull). Use ZeroCopy so we
@@ -534,6 +588,7 @@ pub(crate) async fn pull_composefs_repo(
     use_unified: bool,
     quiet: bool,
     prog: ProgressWriter,
+    img: &ImgConfigManifest,
 ) -> Result<PullRepoResult> {
     const COMPOSEFS_PULL_JOURNAL_ID: &str = "4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8";
 
@@ -594,7 +649,16 @@ pub(crate) async fn pull_composefs_repo(
 
         pull_composefs_unified(&imgstore, &storage_path, &repo, &imgref, quiet, prog).await?
     } else {
-        pull_composefs_direct(&repo, &imgref, quiet, prog).await?
+        // A delta only reports item counts, and containers-storage is read
+        // uncompressed, unlike the compressed layer sizes in the manifest.
+        let pull_bytes = if delta.is_some()
+            || imgref.transport == containers_image_proxy::Transport::ContainerStorage
+        {
+            PullBytes::default()
+        } else {
+            pull_bytes(&*repo, img)?
+        };
+        pull_composefs_direct(&repo, &imgref, quiet, prog, pull_bytes).await?
     };
 
     // Tag the manifest as a bootc-owned GC root.
@@ -649,6 +713,52 @@ mod tests {
         let tag = bootc_tag_for_manifest(digest);
         assert_eq!(tag, "localhost/bootc-sha256:abc123def456");
         assert!(tag.starts_with(BOOTC_TAG_PREFIX));
+    }
+
+    #[test]
+    fn test_layer_pull_bytes_splits_cached_layers() {
+        let layer = |size: u64, digest: char| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": size,
+                "digest": format!("sha256:{}", digest.to_string().repeat(64)),
+            })
+        };
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 2,
+                "digest": format!("sha256:{}", "c".repeat(64)),
+            },
+            "layers": [layer(100, 'a'), layer(200, 'b'), layer(100, 'a')],
+        });
+        let config = |diff_ids: &[&str]| {
+            serde_json::from_value(serde_json::json!({
+                "architecture": "amd64",
+                "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": diff_ids},
+            }))
+            .unwrap()
+        };
+        let mut img = ImgConfigManifest {
+            config: config(&["sha256:cached", "sha256:new", "sha256:cached"]),
+            manifest: serde_json::from_value(manifest).unwrap(),
+        };
+
+        let bytes = layer_pull_bytes(&img, |diff_id| Ok(diff_id == "sha256:cached")).unwrap();
+        assert_eq!(
+            bytes,
+            PullBytes {
+                total: 200,
+                cached: 100
+            }
+        );
+
+        img.config = config(&["sha256:cached"]);
+        let bytes = layer_pull_bytes(&img, |_| unreachable!()).unwrap();
+        assert_eq!(bytes, PullBytes::default());
     }
 
     #[test]
