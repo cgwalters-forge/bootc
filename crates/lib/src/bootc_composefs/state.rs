@@ -43,6 +43,14 @@ use crate::{
     utils::path_relative_to,
 };
 
+/// The image reference stored in a deployment's origin, carrying the signature
+/// policy (e.g. `ostree-image-signed:docker://...`) so that later upgrades
+/// keep enforcing what install or switch chose.
+fn origin_container_ref(imgref: &ImageReference) -> Result<String> {
+    let sigverify = ostree_ext::container::OstreeImageReference::from(imgref.clone()).sigverify;
+    Ok(format!("{sigverify}:{}", imgref.to_image_proxy_ref()?))
+}
+
 /// Read and parse the `.origin` INI file for a deployment.
 ///
 /// Returns `None` if the state directory or origin file doesn't exist
@@ -285,13 +293,9 @@ pub(crate) async fn write_composefs_state(
         allow_missing_fsverity,
     )?;
 
-    let imgref = target_imgref.to_image_proxy_ref()?;
-
-    let mut config = tini::Ini::new().section("origin").item(
-        ORIGIN_CONTAINER,
-        // TODO (Johan-Liebert1): The image won't always be unverified
-        format!("ostree-unverified-image:{imgref}"),
-    );
+    let mut config = tini::Ini::new()
+        .section("origin")
+        .item(ORIGIN_CONTAINER, origin_container_ref(target_imgref)?);
 
     config = config
         .section(ORIGIN_KEY_BOOT)
@@ -389,5 +393,40 @@ pub(crate) fn get_usr_overlay_status() -> Result<Option<FilesystemOverlay>> {
         }))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::ImageSignature;
+    use ostree_ext::container::OstreeImageReference;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_origin_container_ref() {
+        let cases = [
+            (
+                None,
+                "ostree-unverified-image:docker://quay.io/example/os:latest",
+            ),
+            (
+                Some(ImageSignature::ContainerPolicy),
+                "ostree-image-signed:docker://quay.io/example/os:latest",
+            ),
+        ];
+        for (signature, expected) in cases {
+            let imgref = ImageReference {
+                image: "quay.io/example/os:latest".into(),
+                transport: "registry".into(),
+                signature: signature.clone(),
+            };
+            let origin = origin_container_ref(&imgref).unwrap();
+            assert_eq!(origin, expected);
+
+            // Status and upgrade read the policy back from the origin.
+            let parsed = OstreeImageReference::from_str(&origin).unwrap();
+            assert_eq!(ImageReference::from(parsed), imgref);
+        }
     }
 }

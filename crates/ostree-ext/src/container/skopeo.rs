@@ -128,7 +128,9 @@ impl ContainerPolicy {
     }
 }
 
-pub(crate) fn container_policy_is_default_insecure(root: &cap_std::fs::Dir) -> Result<bool> {
+/// Whether the containers-policy.json that applies under `root` defaults to
+/// `insecureAcceptAnything`, which makes enforcing it meaningless.
+pub fn container_policy_is_default_insecure(root: &cap_std::fs::Dir) -> Result<bool> {
     let root = &RootDir::new(root, ".").context("Opening RootDir")?;
     let f = resolve_policy_path(
         root,
