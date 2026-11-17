@@ -2633,7 +2633,7 @@ fn remove_dir_no_xdev(d: &Dir, name: impl AsRef<Path>, mount_err: bool) -> Resul
 }
 
 #[context("Removing boot directory content except loader dir on ostree")]
-fn remove_all_except_loader_dirs(bootdir: &Dir, is_ostree: bool) -> Result<()> {
+fn remove_all_except_loader_dirs(bootdir: &Dir, keep_ostree_loader: bool) -> Result<()> {
     let entries = bootdir
         .entries()
         .context("Reading boot directory entries")?;
@@ -2650,7 +2650,7 @@ fn remove_all_except_loader_dirs(bootdir: &Dir, is_ostree: bool) -> Result<()> {
         // TODO: Preserve basically everything (including the bootloader entries
         // on non-ostree) by default until the very end of the install. And ideally
         // make the "commit" phase an optional step after.
-        if is_ostree && file_name.starts_with("loader") {
+        if keep_ostree_loader && file_name.starts_with("loader") {
             continue;
         }
 
@@ -2683,8 +2683,16 @@ fn clean_esp_bootloader_dirs(efidir: &Dir) -> Result<()> {
     Ok(())
 }
 
+/// Empty `/boot` and the ESP. On an ostree host, `is_ostree` is set, and
+/// `keep_ostree_loader` keeps the `loader*` entries for the ostree backend
+/// to reuse; a composefs install drops them, as its entries replace them.
 #[context("Removing boot directory content")]
-fn clean_boot_directories(rootfs: &Dir, rootfs_path: &Utf8Path, is_ostree: bool) -> Result<()> {
+fn clean_boot_directories(
+    rootfs: &Dir,
+    rootfs_path: &Utf8Path,
+    is_ostree: bool,
+    keep_ostree_loader: bool,
+) -> Result<()> {
     let bootdir =
         crate::utils::open_dir_remount_rw(rootfs, BOOT.into()).context("Opening /boot")?;
 
@@ -2695,7 +2703,7 @@ fn clean_boot_directories(rootfs: &Dir, rootfs_path: &Utf8Path, is_ostree: bool)
     }
 
     // This should not remove /boot/efi note.
-    remove_all_except_loader_dirs(&bootdir, is_ostree).context("Emptying /boot")?;
+    remove_all_except_loader_dirs(&bootdir, keep_ostree_loader).context("Emptying /boot")?;
 
     if ARCH_USES_EFI {
         if let Some(efidir) = bootdir
@@ -2920,7 +2928,14 @@ pub(crate) async fn install_to_filesystem(
                 .await??;
         }
         Some(ReplaceMode::Alongside) => {
-            clean_boot_directories(&target_rootfs_fd, &target_root_path, is_already_ostree)?
+            let keep_ostree_loader =
+                is_already_ostree && !state.composefs_options.composefs_backend;
+            clean_boot_directories(
+                &target_rootfs_fd,
+                &target_root_path,
+                is_already_ostree,
+                keep_ostree_loader,
+            )?
         }
         None => require_empty_rootdir(&rootfs_fd)?,
     }
