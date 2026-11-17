@@ -1726,7 +1726,7 @@ mod tests {
         let mut lines = BufReader::new(recv).lines();
         let start_line = lines.next_line().await?.unwrap();
         let start: Event = serde_json::from_str(&start_line)?;
-        assert!(matches!(start, Event::Start { version } if version == "0.1.0"));
+        assert!(matches!(start, Event::Start { version } if version == "0.2.0"));
 
         let retry_line = lines.next_line().await?.unwrap();
         let retry: Event = serde_json::from_str(&retry_line)?;
