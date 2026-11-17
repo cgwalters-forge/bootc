@@ -1,11 +1,15 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 #[cfg(feature = "selinux")]
 use std::ffi::CString;
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use bootc_utils::CommandRunExt;
@@ -603,6 +607,235 @@ pub(crate) fn ensure_dir_labeled_recurse(
     Ok(())
 }
 
+/// Depth below the physical root at which the final relabel splits its walk
+/// into parallel tasks. When installing alongside existing content
+/// (`to-existing-root`), directories at this depth that predate the install
+/// are not walked at all: on an ostree host that is e.g.
+/// `ostree/deploy/<stateroot>`, with its `/var` and home directories, and on
+/// other hosts e.g. `var/lib/containers`. Only a change directly in such a
+/// directory makes it count as new; the install writes deeper into existing
+/// directories only through ostree, which labels what it writes.
+const RELABEL_SPLIT_DEPTH: usize = 3;
+
+/// The maximum number of directories checked concurrently.
+const RELABEL_MAX_CONCURRENT: usize = 8;
+
+/// How often to print progress while checking labels.
+const RELABEL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A directory's device, inode and change time. The change time tells a
+/// directory created at a reused inode, or one the install wrote into, apart
+/// from what was there before.
+type DirIdentity = (u64, u64, i64, i64);
+
+fn dir_identity(meta: &Metadata) -> DirIdentity {
+    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+}
+
+fn relabel_walk_config<'p>() -> cap_std_ext::dirext::WalkConfiguration<'p> {
+    cap_std_ext::dirext::WalkConfiguration::default()
+        .noxdev()
+        .skip_mountpoints()
+}
+
+/// The directories at [`RELABEL_SPLIT_DEPTH`] that existed before an install.
+#[derive(Debug, Default)]
+pub(crate) struct PreexistingDirs(HashSet<DirIdentity>);
+
+impl PreexistingDirs {
+    /// Record the directories at [`RELABEL_SPLIT_DEPTH`] below `root`.
+    #[context("Recording existing directories")]
+    pub(crate) fn snapshot(root: &Dir) -> Result<Self> {
+        let mut dirs = HashSet::new();
+        root.walk::<_, anyhow::Error>(&relabel_walk_config(), |c| {
+            // Break on a non-directory would skip its siblings too.
+            if !c.file_type.is_dir() || c.path.components().count() < RELABEL_SPLIT_DEPTH {
+                return Ok(ControlFlow::Continue(()));
+            }
+            dirs.insert(dir_identity(&c.entry.metadata()?));
+            Ok(ControlFlow::Break(()))
+        })?;
+        Ok(Self(dirs))
+    }
+
+    fn contains(&self, meta: &Metadata) -> bool {
+        self.0.contains(&dir_identity(meta))
+    }
+}
+
+/// Files found without a label, to relabel once the walk is done.
+type Unlabeled = Vec<(Utf8PathBuf, Metadata)>;
+
+/// Check the label of one entry, recording it in `unlabeled` if it has none.
+fn check_label(
+    root: &Dir,
+    path: &Utf8Path,
+    metadata: Metadata,
+    unlabeled_type: Option<&UnlabeledType>,
+    visited: &AtomicU64,
+    unlabeled: &mut Unlabeled,
+) -> Result<SELinuxLabelState> {
+    visited.fetch_add(1, Ordering::Relaxed);
+    let r = has_security_selinux_inner(root, path, unlabeled_type)?;
+    if r == SELinuxLabelState::Unlabeled {
+        unlabeled.push((path.to_owned(), metadata));
+    }
+    Ok(r)
+}
+
+fn walk_component_path<'a>(c: &'a cap_std_ext::dirext::WalkComponent) -> Result<&'a Utf8Path> {
+    Utf8Path::from_path(c.path)
+        .ok_or_else(|| anyhow::anyhow!("Invalid non-UTF-8 path: {:?}", c.path))
+}
+
+/// Find the unlabeled files in the directory `path` (relative to `root`),
+/// including the directory itself.
+fn find_unlabeled_in(
+    root: &Dir,
+    path: &Utf8Path,
+    unlabeled_type: Option<&UnlabeledType>,
+    visited: &AtomicU64,
+) -> Result<Unlabeled> {
+    let mut unlabeled = Vec::new();
+    let metadata = root.symlink_metadata(path)?;
+    check_label(
+        root,
+        path,
+        metadata,
+        unlabeled_type,
+        visited,
+        &mut unlabeled,
+    )?;
+    let config = relabel_walk_config().path_base(path.as_std_path());
+    root.open_dir(path)?
+        .walk::<_, anyhow::Error>(&config, |c| {
+            let path = walk_component_path(c)?;
+            let metadata = c.entry.metadata()?;
+            match check_label(
+                root,
+                path,
+                metadata,
+                unlabeled_type,
+                visited,
+                &mut unlabeled,
+            )? {
+                SELinuxLabelState::Unsupported => {
+                    anyhow::bail!("Unexpected SELinuxLabelState::Unsupported during walk at {path}")
+                }
+                _ => Ok(ControlFlow::Continue(())),
+            }
+        })
+        .with_context(|| format!("Checking labels in {path}"))?;
+    Ok(unlabeled)
+}
+
+/// Walk `root` down to [`RELABEL_SPLIT_DEPTH`], calling `on_entry` for each
+/// entry above it, and return the directories at that depth, except
+/// `preexisting` ones, for the caller to walk.
+fn split_relabel_walk(
+    root: &Dir,
+    preexisting: Option<&PreexistingDirs>,
+    mut on_entry: impl FnMut(&Utf8Path, Metadata) -> Result<()>,
+) -> Result<Vec<Utf8PathBuf>> {
+    let mut subdirs = Vec::new();
+    root.walk::<_, anyhow::Error>(&relabel_walk_config(), |c| {
+        let path = walk_component_path(c)?;
+        let metadata = c.entry.metadata()?;
+        if c.file_type.is_dir() && path.components().count() == RELABEL_SPLIT_DEPTH {
+            if preexisting.is_some_and(|p| p.contains(&metadata)) {
+                tracing::debug!("Skipping existing {path}");
+            } else {
+                subdirs.push(path.to_owned());
+            }
+            return Ok(ControlFlow::Break(()));
+        }
+        on_entry(path, metadata)?;
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(subdirs)
+}
+
+/// Ensure every file in the physical root of an install has a SELinux label,
+/// without walking the `preexisting` directories (see
+/// [`RELABEL_SPLIT_DEPTH`]). Labels are checked in parallel; the policy can't
+/// be shared between threads, so the files lacking one are relabeled
+/// afterwards.
+pub(crate) async fn ensure_physical_root_labeled(
+    root: &Dir,
+    policy: &ostree::SePolicy,
+    preexisting: Option<&PreexistingDirs>,
+) -> Result<()> {
+    // When SELinux is unavailable to this process, retain the conservative
+    // xattr-presence behavior in `has_security_selinux_inner`.
+    let unlabeled_type = Arc::new(UnlabeledType::query()?);
+    let visited = Arc::new(AtomicU64::new(0));
+    let mut unlabeled = Vec::new();
+
+    let root_meta = root.dir_metadata()?;
+    let root_path = Utf8Path::new("");
+    let r = check_label(
+        root,
+        root_path,
+        root_meta,
+        unlabeled_type.as_ref().as_ref(),
+        &visited,
+        &mut unlabeled,
+    )?;
+    if r == SELinuxLabelState::Unsupported {
+        return Ok(());
+    }
+
+    // Check the top levels here, and collect the directories below them to
+    // check in parallel.
+    let subdirs = split_relabel_walk(root, preexisting, |path, metadata| {
+        let ut = unlabeled_type.as_ref().as_ref();
+        match check_label(root, path, metadata, ut, &visited, &mut unlabeled)? {
+            SELinuxLabelState::Unsupported => {
+                anyhow::bail!("Unexpected SELinuxLabelState::Unsupported during walk at {path}")
+            }
+            _ => Ok(()),
+        }
+    })?;
+
+    let mut subdirs = subdirs.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut progress = tokio::time::interval(RELABEL_PROGRESS_INTERVAL);
+    // The first tick completes immediately.
+    progress.tick().await;
+    loop {
+        while tasks.len() < RELABEL_MAX_CONCURRENT {
+            let Some(path) = subdirs.next() else {
+                break;
+            };
+            let root = root.try_clone()?;
+            let unlabeled_type = Arc::clone(&unlabeled_type);
+            let visited = Arc::clone(&visited);
+            tasks.spawn_blocking(move || {
+                find_unlabeled_in(&root, &path, unlabeled_type.as_ref().as_ref(), &visited)
+            });
+        }
+        tokio::select! {
+            r = tasks.join_next() => match r {
+                Some(r) => unlabeled.extend(r??),
+                None => break,
+            },
+            _ = progress.tick() => {
+                println!("Checking SELinux labels: {} files", visited.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    for (path, metadata) in &unlabeled {
+        relabel(root, metadata, path, None, policy)?;
+    }
+    println!(
+        "Checked SELinux labels: {} files, {} relabeled",
+        visited.load(Ordering::Relaxed),
+        unlabeled.len()
+    );
+    Ok(())
+}
+
 /// A wrapper for creating a directory, also optionally setting a SELinux label.
 pub(crate) fn ensure_dir_labeled(
     root: &Dir,
@@ -702,6 +935,60 @@ mod tests {
         }
         let found: &[(&[u8], &[u8])] = &[(b"foo", b"bar"), (SELINUX_XATTR, b"foo_t")];
         assert!(xattrs_have_selinux(&Variant::from(found)));
+    }
+
+    #[test]
+    fn test_split_relabel_walk_skips_preexisting() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        // An existing system: a deployment with a large home directory, and
+        // an ostree repo.
+        td.create_dir_all("ostree/deploy/old/var/home/user")?;
+        for i in 0..100 {
+            td.write(format!("ostree/deploy/old/var/home/user/f{i}"), "x")?;
+        }
+        td.create_dir_all("ostree/repo/objects/00")?;
+        td.write("ostree/repo/config", "")?;
+        let preexisting = PreexistingDirs::snapshot(&td)?;
+
+        // What an install writes: new trees, and a file directly in an
+        // existing directory at the split depth, which is then walked too.
+        // A change further down, like a new ostree object, isn't seen.
+        td.create_dir_all("state/deploy/new/etc")?;
+        td.create_dir_all("boot/loader/entries")?;
+        td.write("ostree/repo/objects/new", "")?;
+        td.write("ostree/repo/objects/00/new", "")?;
+
+        let mut visited = Vec::new();
+        let mut subdirs = split_relabel_walk(&td, Some(&preexisting), |p, _| {
+            visited.push(p.to_string());
+            Ok(())
+        })?;
+        subdirs.sort();
+        assert_eq!(
+            subdirs,
+            [
+                "boot/loader/entries",
+                "ostree/repo/objects",
+                "state/deploy/new"
+            ]
+        );
+        visited.sort();
+        let expected = [
+            "boot",
+            "boot/loader",
+            "ostree",
+            "ostree/deploy",
+            "ostree/repo",
+            "ostree/repo/config",
+            "state",
+            "state/deploy",
+        ];
+        assert_eq!(visited, expected);
+
+        // Without a snapshot, every directory at the split depth is walked.
+        let subdirs = split_relabel_walk(&td, None, |_, _| Ok(()))?;
+        assert_eq!(subdirs.len(), 4);
+        Ok(())
     }
 
     #[test]
