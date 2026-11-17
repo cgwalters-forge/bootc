@@ -42,6 +42,16 @@ part of a build process; it will error if any problems are detected.
 
 <!-- END GENERATED OPTIONS -->
 
+# NOTES
+
+When run under QEMU user-mode emulation (e.g. building an image for a
+foreign architecture via binfmt_misc) with QEMU older than 9.2, some
+lints can fail with errno 38 (ENOSYS). This is because bootc uses the
+`openat2` system call (via cap-std-ext), which those QEMU versions do
+not implement.
+Use QEMU 9.2 or newer, or run the lint natively on the target
+architecture. See <https://github.com/bootc-dev/bootc/issues/1481>.
+
 # VERSION
 
 <!-- VERSION PLACEHOLDER -->
