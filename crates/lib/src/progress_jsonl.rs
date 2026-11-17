@@ -280,9 +280,152 @@ impl ProgressWriter {
 
 #[cfg(test)]
 mod test {
+    use std::future::Future;
+    use std::process::{Child, Command};
+    use std::time::Duration;
+
+    use anyhow::Context;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
+
+    // The deadline lives outside the runtime under test: a blocking write can
+    // prevent even a Tokio timeout from being polled on a current-thread runtime.
+    const CHILD_DEADLINE: Duration = Duration::from_secs(15);
+    const CHILD_TEST: &str = "progress_jsonl::test::test_backpressure_child";
+
+    struct TestChild(Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            // Also reap on assertion failure or an error in the parent.
+            if let Err(e) = self.0.kill() {
+                eprintln!("Progress test child kill: {e}");
+            }
+            if let Err(e) = self.0.wait() {
+                eprintln!("Progress test child wait: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_backpressure() -> Result<()> {
+        let child = Command::new(std::env::current_exe()?)
+            .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+            .spawn()?;
+        let mut child = TestChild(child);
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                anyhow::ensure!(status.success(), "Progress test child failed: {status}");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Progress test child exceeded {CHILD_DEADLINE:?}; runtime may be blocked"
+            );
+            // Only parent-side process polling uses a delay; child synchronization
+            // uses futures and channels, never timing assumptions.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn required_event(steps: u64, padding: usize) -> Event<'static> {
+        Event::ProgressSteps {
+            task: "backpressure".into(),
+            description: "x".repeat(padding).into(),
+            id: "ordered".into(),
+            steps_cached: 0,
+            steps,
+            steps_total: 3,
+            subtasks: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "run by test_backpressure with an external deadline"]
+    async fn test_backpressure_child() -> Result<()> {
+        let (send, recv) = tokio::net::unix::pipe::pipe()?;
+        // Keep both payloads and the number of required events bounded, even on
+        // hosts with unusually large default pipe capacities or page sizes.
+        let capacity = rustix::pipe::fcntl_setpipe_size(&send, 4096)?;
+        anyhow::ensure!(capacity <= 65536, "Unexpected pipe capacity {capacity}");
+        let start = Event::Start {
+            version: API_VERSION.into(),
+        };
+        let overhead =
+            start.to_canon_json_vec()?.len() + required_event(0, 0).to_canon_json_vec()?.len() + 2; // The two JSONL newlines.
+        let padding = capacity.checked_sub(overhead).context("Pipe too small")?;
+        let events = [
+            required_event(0, padding),
+            required_event(1, 1024),
+            required_event(2, 1024),
+        ];
+        let writer = ProgressWriter::from(send);
+        // Start plus the first required event exactly fill the real kernel pipe.
+        // The reader remains open, but no task reads it until the probe succeeds.
+        writer.send(events[0].clone()).await;
+        assert_eq!(rustix::io::ioctl_fionread(&recv)?, capacity as u64);
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let producer_events = events.clone();
+        let producer = tokio::spawn(async move {
+            {
+                let pending = writer.send(producer_events[1].clone());
+                tokio::pin!(pending);
+                let mut blocked_tx = Some(blocked_tx);
+                std::future::poll_fn(|cx| {
+                    let result = pending.as_mut().poll(cx);
+                    if result.is_pending() {
+                        if let Some(tx) = blocked_tx.take() {
+                            tx.send(()).expect("probe receiver alive");
+                        }
+                    }
+                    result
+                })
+                .await;
+            }
+            writer.send(producer_events[2].clone()).await;
+            // Exercise explicit shutdown as well as dropping the last writer.
+            let mut sender = writer.into_inner().await?.context("Writer disabled")?;
+            sender.shutdown().await?;
+            anyhow::Ok(())
+        });
+        let probe = tokio::spawn(async move {
+            blocked_rx.await.context("send did not become pending")?;
+            assert_eq!(rustix::io::ioctl_fionread(&recv)?, capacity as u64);
+            anyhow::Ok(recv)
+        });
+        // This independent task must run while the required send is still
+        // pending. Only now release the reader; completion while full is not required.
+        let recv = probe.await??;
+        let mut lines = BufReader::new(recv).lines();
+        for expected in std::iter::once(&start).chain(events.iter()) {
+            let line = lines.next_line().await?.context("Missing JSON line")?;
+            assert_eq!(serde_json::from_str::<Event>(&line)?, *expected);
+        }
+        assert!(lines.next_line().await?.is_none());
+        producer.await??;
+
+        // Reader closure must disable the writer, close its fd, and make later
+        // required and lossy sends harmless, including through a surviving clone.
+        let (send, recv) = tokio::net::unix::pipe::pipe()?;
+        let writer = ProgressWriter::from(send);
+        let clone = writer.clone();
+        drop(recv);
+        writer.send(required_event(0, 0)).await;
+        assert!(writer.inner.lock().await.is_none());
+        clone.send(required_event(1, 0)).await;
+        clone.send_lossy(required_event(2, 0)).await;
+        assert!(clone.inner.lock().await.is_none());
+        drop(writer);
+        assert!(clone.into_inner().await?.is_none());
+
+        // An ordinary drop must close the pipe too, even without any sends.
+        let (send, recv) = tokio::net::unix::pipe::pipe()?;
+        drop(ProgressWriter::from(send));
+        assert!(BufReader::new(recv).lines().next_line().await?.is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_jsonl() -> Result<()> {
