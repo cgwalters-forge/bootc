@@ -1,0 +1,65 @@
+# Publish fedora-44 RPMs for each commit on this fork's `cgwalters` branch
+# (upstream main plus our carried patches) as an immutable prerelease tagged
+# forge-<12 hex of the commit>, so that image builds can pin an asset by URL
+# plus sha256 (see SHA256SUMS in each release).
+# The build mirrors the `package` job in ci.yml.
+name: Forge packages
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [cgwalters]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  BOOTC_CI_RETRIES: "10"
+  BOOTC_CI_DELAY: "60"
+  TEST_OS: fedora-44
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+
+jobs:
+  package:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Setup env
+        run: |
+          printf 'BOOTC_base=%s\n' "$(just pullspec-for-os base "$TEST_OS")" >> "$GITHUB_ENV"
+          printf 'BOOTC_buildroot_base=%s\n' "$(just pullspec-for-os buildroot-base "$TEST_OS")" >> "$GITHUB_ENV"
+
+      - name: Build packages
+        run: just check-buildsys
+
+      - name: Write checksums
+        working-directory: target/packages
+        run: sha256sum *.rpm > SHA256SUMS
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ env.TEST_OS }}
+          path: |
+            target/packages/*.rpm
+            target/packages/SHA256SUMS
+
+      # Releases are never replaced: a rebuild of the same commit produces
+      # different bytes, which would break consumers pinning a sha256.
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="forge-${GITHUB_SHA::12}"
+          if gh release view "$tag" >/dev/null 2>&1; then echo "$tag already published"; exit 0; fi
+          gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "$tag" \
+            --notes "$TEST_OS packages built from $GITHUB_SHA." target/packages/*.rpm target/packages/SHA256SUMS
