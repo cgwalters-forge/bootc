@@ -1,0 +1,76 @@
+# Historical UKI stager for test-49 only. Keep the raw kernel/initramfs in
+# /usr/lib/modules: bootc 1.16.0 ukify discovers them there, without --kernel-dir.
+ARG base=localhost/bootc
+
+FROM scratch AS packaging
+COPY contrib/packaging /
+
+FROM ${base} AS kernel
+RUN --network=none <<EORUN
+set -xeuo pipefail
+kver=$(bootc container inspect --rootfs / --json | jq -r '.kernel.version')
+bootc internals uki extract /boot/EFI/Linux/${kver}.efi /boot
+EORUN
+
+FROM ${base} AS rootfs
+ARG bootc_rpm_url
+ARG bootc_rpm_sha256
+ARG bootc_sha256
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=kernel,src=/boot,target=/run/kernel <<EORUN
+set -xeuo pipefail
+. /usr/lib/os-release
+test "$ID" = fedora
+test "$(rpm --eval '%{_arch}')" = x86_64
+curl -fsSL --retry 5 --retry-all-errors -o /tmp/bootc.rpm "${bootc_rpm_url}"
+echo "${bootc_rpm_sha256}  /tmp/bootc.rpm" | sha256sum -c
+kver=$(bootc container inspect --rootfs / --json | jq -r '.kernel.version')
+# These require the exact current bootc version. Remove them together, with
+# dependency checks, before downgrading; never force an inconsistent RPM DB.
+rpm -e bootc-tests system-reinstall-bootc
+rpm -Uvh --oldpackage /tmp/bootc.rpm
+test "$(bootc --version)" = 'bootc 1.16.0'
+echo "${bootc_sha256}  /usr/bin/bootc" | sha256sum -c
+# Current composefs-only images omit this legacy install prerequisite.
+mkdir -p /usr/lib/ostree
+printf '[composefs]\nenabled = yes\n' > /usr/lib/ostree/prepare-root.conf
+# Old ukify rejects a rootfs that already contains a UKI.
+rm -f /boot/EFI/Linux/${kver}.efi /boot/${kver}.dump
+install -m 0755 /run/kernel/${kver}/vmlinuz /usr/lib/modules/${kver}/vmlinuz
+# Do not reuse the current initramfs: include the downgraded dracut module.
+dracut --force --no-hostonly --reproducible --kver "${kver}" /usr/lib/modules/${kver}/initramfs.img
+EORUN
+
+FROM rootfs AS tools
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=packaging,src=/,target=/run/packaging \
+    /run/packaging/initialize-sealing-tools
+
+FROM tools AS uki
+ARG seal_state=sealed
+# Secrets do not invalidate the cache; the public certificate does.
+COPY --from=secureboot db.crt /usr/lib/bootc-test/secureboot-db.crt
+RUN --network=none --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=secret,id=secureboot_key \
+    --mount=type=secret,id=secureboot_cert \
+    --mount=type=bind,from=rootfs,src=/,target=/run/target <<EORUN
+set -xeuo pipefail
+kver=$(ls /run/target/usr/lib/modules)
+ukifyargs=(--measure --json pretty --output /uki/${kver}.efi)
+containerukifyargs=(--rootfs /run/target)
+case "${seal_state}" in
+    sealed)
+        ukifyargs+=(--signtool sbsign
+                    --secureboot-private-key /run/secrets/secureboot_key
+                    --secureboot-certificate /run/secrets/secureboot_cert)
+        ;;
+    unsealed) containerukifyargs+=(--allow-missing-verity) ;;
+    *) echo "Unknown seal_state: ${seal_state}" >&2; exit 1 ;;
+esac
+mkdir -p /uki
+bootc container ukify "${containerukifyargs[@]}" -- "${ukifyargs[@]}"
+EORUN
+
+FROM rootfs
+COPY --from=uki /uki/ /boot/EFI/Linux/
+LABEL bootc.test.fixture=bootc-1.16.0-stager

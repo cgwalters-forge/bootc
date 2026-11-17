@@ -1,5 +1,7 @@
 # Booted tests
 
+> This text is LLM generated.
+
 These are intended to run via tmt.
 
 ## Composefs EROFS V1/V2 regression coverage
@@ -25,16 +27,39 @@ default `v1` case is dual-format (V1 then V2); it is not an initramfs
 capability probe.
 
 `composefs-1-16-bridge` is opt-in historical-client coverage, restricted to
-the bootc 1.16.0 old-stager fixture. It requires a read-only shared container
-store and prebuilt fixture images supplied by the coordinator; it does not
-build, copy, or SCP images. The covered path is an old-stager migration where
+the bootc 1.16.0 old-stager fixture. Build and run it on an x86_64 host with
+Podman, /dev/fuse, bcvk, libvirt/KVM, virtiofsd and tmt:
+
+```console
+just test-composefs-bridge sealed
+just test-composefs-bridge unsealed
+```
+
+The recipe selects Fedora 44 base/buildroot images, sealed ext4 or unsealed
+xfs, and current dual-format UKIs (`erofs_version=v1`), independently of the
+normal build defaults. Image names include the mode so the two runs do not
+overwrite each other's fixtures. The stager uses the checksum-pinned Fedora
+x86_64 bootc 1.16.0 RPM from Koji (built for fc45), removes the current
+version-locked subpackages with dependency checks, restores the legacy
+`prepare-root.conf`, and regenerates its initramfs before creating the UKI.
+The RPM and binary hashes are in the Justfile; if Koji prunes the RPM, mirror
+the exact bytes rather than silently changing the historical client.
+
+Test-49 remains disabled by default. The recipe explicitly enables it with
+`composefs_bridge=true` and uses the plan's read-only bound image storage,
+overriding `BOOTC_skip_bind_storage`. No image copying or SCP is involved.
+**Bridge CI integration remains outstanding.** These commands are an
+on-demand prerequisite, not evidence of CI coverage or successful VM boots.
+
+The covered path is an old-stager migration where
 the old client is followed by current bootc and a newly generated initramfs.
 bootc 1.16.0 stages the V2 fallback of the dual-digest UKI; 1.16.4 and later
 clients would stage V1 directly, which this test does not cover.
-Both sealed and unsealed UKIs are covered; run one case at a time:
+Both sealed and unsealed UKIs have test cases; to use prebuilt fixtures:
 
 ```console
 cargo xtask run-tmt "$BOOTC_1160_STAGER_IMAGE" composefs-1-16-bridge \
+  --skip-bind-storage=false --filesystem ext4 \
   --composefs-backend --bootloader systemd --boot-type uki --seal-state sealed \
   --context composefs_bridge=true \
   --env BOOTC_composefs_bridge_integrity_mode=sealed \
@@ -43,6 +68,7 @@ cargo xtask run-tmt "$BOOTC_1160_STAGER_IMAGE" composefs-1-16-bridge \
   --upgrade-image "$BOOTC_CURRENT_DUAL_UKI_UPGRADE_IMAGE"
 
 cargo xtask run-tmt "$BOOTC_1160_STAGER_IMAGE" composefs-1-16-bridge \
+  --skip-bind-storage=false --filesystem xfs \
   --composefs-backend --bootloader systemd --boot-type uki --seal-state unsealed \
   --context composefs_bridge=true \
   --env BOOTC_composefs_bridge_integrity_mode=unsealed \
@@ -60,7 +86,7 @@ status image is read from `.status.booted.image.image.image`.
 The unsealed run requires separately built fixtures labeled
 `bootc.test.fixture=current-dual-uki-unsealed` and
 `bootc.test.fixture=current-dual-uki-upgrade-unsealed`; it never reuses a
-strict fixture. The coordinator supplies the matching pullspecs through the
+strict fixture. The caller supplies the matching pullspecs through the
 variables above.
 For the old-stager case it also supplies the required
 `BOOTC_1160_BOOTC_SHA256` value from the pinned fixture build; the test records
