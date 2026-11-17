@@ -1516,6 +1516,9 @@ pub(crate) struct RootSetup {
     pub(crate) disk_install: bool,
     /// True if we should skip finalizing
     skip_finalize: bool,
+    /// Existing content of the physical root, set when installing alongside
+    /// it, which the final SELinux relabel leaves alone.
+    preexisting_dirs: Option<crate::lsm::PreexistingDirs>,
     boot: Option<MountSpec>,
     pub(crate) kargs: CmdlineOwned,
 }
@@ -2407,14 +2410,20 @@ async fn install_to_filesystem_impl(
         }
     }
 
-    // As the very last step before filesystem finalization, do a full SELinux
-    // relabel of the physical root filesystem.  Any files that are already
-    // labeled (e.g. ostree deployment contents, composefs objects) are skipped.
+    // As the very last step before filesystem finalization, ensure everything
+    // the install wrote to the physical root has a SELinux label.  Files that
+    // are already labeled (e.g. ostree deployment contents, composefs objects)
+    // are left alone, and so is the existing system's content when installing
+    // alongside it.
     if let Some(policy) = state.load_policy()? {
         tracing::info!("Performing final SELinux relabeling of physical root");
-        let mut path = Utf8PathBuf::from("");
-        crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, &policy, None)
-            .context("Final SELinux relabeling of physical root")?;
+        crate::lsm::ensure_physical_root_labeled(
+            &rootfs.physical_root,
+            &policy,
+            rootfs.preexisting_dirs.as_ref(),
+        )
+        .await
+        .context("Final SELinux relabeling of physical root")?;
     } else {
         tracing::debug!("Skipping final SELinux relabel (SELinux is disabled)");
     }
@@ -2920,6 +2929,12 @@ pub(crate) async fn install_to_filesystem(
         crate::utils::remove_immutability(&rootfs_fd, path)?;
     }
 
+    // Record what's already there before writing anything, so the final
+    // relabel doesn't walk the existing system's data.
+    let preexisting_dirs = matches!(fsopts.replace, Some(ReplaceMode::Alongside))
+        .then(|| crate::lsm::PreexistingDirs::snapshot(&rootfs_fd))
+        .transpose()?;
+
     match fsopts.replace {
         Some(ReplaceMode::Wipe) => {
             let rootfs_fd = rootfs_fd.try_clone()?;
@@ -3082,6 +3097,7 @@ pub(crate) async fn install_to_filesystem(
         boot,
         kargs,
         skip_finalize,
+        preexisting_dirs,
     };
 
     install_to_filesystem_impl(&state, &mut rootfs, cleanup).await?;
