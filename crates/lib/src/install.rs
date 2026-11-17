@@ -986,15 +986,37 @@ impl SourceInfo {
         Self::new(imageref, None, None, root, false)
     }
 
+    /// Find the commit whose root xattrs tell us whether SELinux is in use.
+    /// On a booted ostree host the repository also holds container layer
+    /// and rollback commits, so use the booted deployment; in a container
+    /// image built from an ostree commit, there is exactly one commit.
+    fn find_selinux_commit(root: &Dir, repo: &ostree::Repo) -> Result<String> {
+        let cancellable = ostree::gio::Cancellable::NONE;
+        if root.try_exists("run/ostree-booted")? {
+            let sysroot = ostree::Sysroot::new_default();
+            sysroot.load(cancellable).context("Loading sysroot")?;
+            let booted = sysroot.require_booted_deployment()?;
+            return Ok(booted.csum().into());
+        }
+        let mut commits = repo
+            .list_commit_objects_starting_with(None, cancellable)?
+            .into_iter();
+        match (commits.next(), commits.next()) {
+            (Some(commit), None) => Ok(commit.into()),
+            (None, _) => anyhow::bail!("No commit found in ostree repository"),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("Multiple commits in ostree repository and no booted deployment")
+            }
+        }
+    }
+
     fn have_selinux_from_repo(root: &Dir) -> Result<bool> {
         let cancellable = ostree::gio::Cancellable::NONE;
 
-        let commit = Command::new("ostree")
-            .args(["--repo=/ostree/repo", "rev-parse", "--single"])
-            .run_get_string()?;
         let repo = ostree::Repo::open_at_dir(root.as_fd(), "ostree/repo")?;
+        let commit = Self::find_selinux_commit(root, &repo)?;
         let root = repo
-            .read_commit(commit.trim(), cancellable)
+            .read_commit(&commit, cancellable)
             .context("Reading commit")?
             .0;
         let root = root.downcast_ref::<ostree::RepoFile>().unwrap();
