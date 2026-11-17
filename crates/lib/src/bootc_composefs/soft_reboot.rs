@@ -15,10 +15,9 @@ use cap_std_ext::cap_std::fs::Dir;
 use cap_std_ext::dirext::CapStdExtDirExt;
 use composefs_ctl::composefs::fsverity::{FsVerityHashValue, Sha512HashValue};
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::Cmdline;
 use ostree_ext::systemd_has_soft_reboot;
 use rustix::mount::{UnmountFlags, unmount};
-use std::{fs::create_dir_all, os::unix::process::CommandExt, path::PathBuf, process::Command};
+use std::{fs::create_dir_all, os::unix::process::CommandExt, process::Command};
 
 const NEXTROOT: &str = "/run/nextroot";
 
@@ -59,6 +58,29 @@ pub(crate) fn reset_soft_reboot() -> Result<()> {
     println!("Cleared soft reboot queued state");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use composefs_ctl::composefs::erofs::format::FormatVersion;
+
+    #[test]
+    fn test_soft_reboot_assembly_args() {
+        for insecure in [false, true] {
+            let karg = build_composefs_karg(Sha512HashValue::EMPTY, FormatVersion::V2, insecure);
+            let args = bootc_initramfs_setup::Args::for_deployment(
+                "/sysroot".into(),
+                Some(NEXTROOT.into()),
+                karg.clone(),
+            );
+            assert!(args.config.is_none());
+            assert!(args.root_fs.is_none());
+            assert_eq!(args.sysroot, std::path::Path::new("/sysroot"));
+            assert_eq!(args.target.as_deref(), Some(std::path::Path::new(NEXTROOT)));
+            assert_eq!(args.cmdline.unwrap().to_string(), karg);
+        }
+    }
 }
 
 /// Checks if the provided deployment is soft reboot capable, and soft reboots the system if
@@ -122,14 +144,11 @@ pub(crate) async fn prepare_soft_reboot_composefs(
         booted_cfs.cmdline.allow_missing_fsverity,
     );
 
-    let args = bootc_initramfs_setup::Args {
-        cmd: vec![],
-        sysroot: PathBuf::from("/sysroot"),
-        config: Default::default(),
-        root_fs: None,
-        cmdline: Some(Cmdline::from(cmdline)),
-        target: Some(NEXTROOT.into()),
-    };
+    let args = bootc_initramfs_setup::Args::for_deployment(
+        "/sysroot".into(),
+        Some(NEXTROOT.into()),
+        cmdline,
+    );
 
     setup_root(args)?;
 

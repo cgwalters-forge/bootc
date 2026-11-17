@@ -23,10 +23,11 @@ the composefs backend, and otherwise with ostree (see
 then also no longer requires the `/ostree` symlink or the ostree
 `prepare-root.conf` composefs configuration used by the ostree backend.
 
-The `51bootc` dracut module installs this file into the initramfs automatically
-when it is present on the host image.  Image authors can therefore ship the
-file at this path in their container image and rebuild the initramfs with a
-plain `dracut --force`; no `--include` flags are needed.
+The configuration is read from the mounted composefs image before assembling
+the root, not from a copy in the initramfs or the running host. Image authors
+can ship the file at this path in their container image without rebuilding
+the initramfs when the configuration changes. Soft reboot also uses the
+staged image's configuration.
 
 # SECTIONS
 

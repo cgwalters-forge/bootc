@@ -15,9 +15,7 @@
 use std::os::fd::{AsFd, AsRawFd};
 
 use anyhow::{Context, Result, bail, ensure};
-use bootc_initramfs_setup::{
-    Config as SetupRootConfig, MountType, SETUP_ROOT_CONF_PATH, mount_subdir,
-};
+use bootc_initramfs_setup::{MountType, mount_subdir, read_config};
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::{
     cap_std::{ambient_authority, fs::Dir},
@@ -239,14 +237,7 @@ enum DeploymentState {
 /// Mount `/etc` and `/var` as the composefs initramfs does at boot, honoring
 /// the image's setup-root configuration (for example a transient `/etc`).
 fn mount_composefs_state(root: &Dir, state: &Dir) -> Result<()> {
-    let config_path = SETUP_ROOT_CONF_PATH.trim_start_matches('/');
-    let config: SetupRootConfig = root
-        .read_to_string_optional(config_path)
-        .with_context(|| format!("Reading {SETUP_ROOT_CONF_PATH}"))?
-        .map(|text| toml::from_str(&text))
-        .transpose()
-        .with_context(|| format!("Parsing {SETUP_ROOT_CONF_PATH}"))?
-        .unwrap_or_default();
+    let config = read_config(root)?;
     mount_subdir(root, state, ETC, config.etc, MountType::Bind)?;
     mount_subdir(root, state, VAR, config.var, MountType::Bind)?;
     Ok(())

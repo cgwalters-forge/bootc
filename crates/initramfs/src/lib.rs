@@ -3,7 +3,7 @@
 use std::{
     ffi::OsString,
     fmt::Debug,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use rustix::{
-    fs::{CWD, Mode, OFlags, major, minor, mkdirat, openat, stat, symlink},
+    fs::{CWD, Mode, OFlags, ResolveFlags, major, minor, mkdirat, openat, openat2, stat, symlink},
     io::Errno,
     mount::{
         FsMountFlags, MountAttrFlags, OpenTreeFlags, UnmountFlags, fsconfig_create,
@@ -139,6 +139,28 @@ pub struct Config {
 /// Default path to the setup-root configuration file, relative to the booted root.
 pub const SETUP_ROOT_CONF_PATH: &str = "/usr/lib/composefs/setup-root-conf.toml";
 
+/// Read the image's setup-root policy relative to its mounted root.
+/// An absent file selects the defaults; other I/O and parse errors are fatal.
+pub fn read_config(root: impl AsFd) -> Result<Config> {
+    // Image-controlled symlinks must not select policy from the host/initramfs.
+    let fd = match openat2(
+        root,
+        SETUP_ROOT_CONF_PATH.trim_start_matches('/'),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Config::default()),
+        Err(err) => return Err(err).with_context(|| format!("Opening {SETUP_ROOT_CONF_PATH}")),
+    };
+    let mut text = String::new();
+    std::fs::File::from(fd)
+        .read_to_string(&mut text)
+        .with_context(|| format!("Reading {SETUP_ROOT_CONF_PATH}"))?;
+    toml::from_str(&text).with_context(|| format!("Parsing {SETUP_ROOT_CONF_PATH}"))
+}
+
 /// Returns `true` if the configuration at `path` requests a transient `/etc`
 /// overlay.  Used by the systemd generator to decide whether to emit the
 /// SELinux relabel unit *before* those mounts exist (the generator runs before
@@ -184,13 +206,9 @@ pub struct Args {
     /// sysroot directory in initramfs
     pub sysroot: PathBuf,
 
-    #[arg(
-        long,
-        default_value = "/usr/lib/composefs/setup-root-conf.toml",
-        help = "Config path (for testing)"
-    )]
+    #[arg(long, requires = "root_fs", help = "Config path (for testing)")]
     /// Config path (for testing)
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     // we want to test in a userns, but can't mount erofs there
     #[arg(long, help = "Bind mount root-fs from (for testing)")]
@@ -204,6 +222,26 @@ pub struct Args {
     #[arg(long, help = "Mountpoint (don't replace sysroot, for testing)")]
     /// Mountpoint (don't replace sysroot, for testing)
     pub target: Option<PathBuf>,
+}
+
+impl Args {
+    /// Construct an offline root assembly request (for soft reboot or installation).
+    /// `composefs_karg` selects the image and its fs-verity policy, without inheriting
+    /// the running system's kernel command line or setup-root configuration.
+    pub fn for_deployment(
+        sysroot: PathBuf,
+        target: Option<PathBuf>,
+        composefs_karg: String,
+    ) -> Self {
+        Self {
+            cmd: vec![],
+            sysroot,
+            config: None,
+            root_fs: None,
+            cmdline: Some(Cmdline::from(composefs_karg)),
+            target,
+        }
+    }
 }
 
 /// Wrapper around [`composefs::mount::mount_at`]
@@ -554,11 +592,10 @@ pub fn gpt_workaround() -> Result<()> {
 /// Sets up /sysroot for switch-root
 #[context("Setting up /sysroot")]
 pub fn setup_root(args: Args) -> Result<()> {
-    let config = match std::fs::read_to_string(args.config) {
-        Ok(text) => toml::from_str(&text)?,
-        Err(err) if err.kind() == ErrorKind::NotFound => Config::default(),
-        Err(err) => Err(err)?,
-    };
+    anyhow::ensure!(
+        args.config.is_none() || args.root_fs.is_some(),
+        "--config requires --root-fs (test-only overrides)"
+    );
 
     let sysroot = open_dir(CWD, &args.sysroot)
         .with_context(|| format!("Failed to open sysroot {:?}", args.sysroot))?;
@@ -566,6 +603,38 @@ pub fn setup_root(args: Args) -> Result<()> {
     let cmdline = args
         .cmdline
         .unwrap_or(Cmdline::from_proc().context("Failed to read cmdline")?);
+
+    let candidates =
+        parse_composefs_candidates(&cmdline).context("Failed to parse composefs cmdline")?;
+    if candidates.is_empty() {
+        anyhow::bail!("No composefs image in cmdline");
+    }
+    let allow_missing_fsverity = candidates[0].is_insecure();
+    if candidates
+        .iter()
+        .any(|candidate| candidate.is_insecure() != allow_missing_fsverity)
+    {
+        anyhow::bail!("composefs candidates have mixed fs-verity policy");
+    }
+
+    let (new_root, composefs_info) = match &args.root_fs {
+        Some(path) => (
+            open_root_fs(path).context("Failed to clone specified root fs")?,
+            candidates[0].clone(),
+        ),
+        None => select_composefs_candidate(&candidates, |candidate| {
+            mount_composefs_candidate(&sysroot, candidate, allow_missing_fsverity)
+        })?,
+    };
+    let config = match args.config {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("Reading test config {}", path.display()))?;
+            toml::from_str(&text)
+                .with_context(|| format!("Parsing test config {}", path.display()))?
+        }
+        None => read_config(&new_root)?,
+    };
 
     // Auto-detect systemd.volatile=state: if the kernel cmdline requests a
     // volatile /var via the systemd fstab-generator, skip our initramfs
@@ -589,29 +658,6 @@ pub fn setup_root(args: Args) -> Result<()> {
             config.var.mount = Some(MountType::None);
         }
         config
-    };
-
-    let candidates =
-        parse_composefs_candidates(&cmdline).context("Failed to parse composefs cmdline")?;
-    if candidates.is_empty() {
-        anyhow::bail!("No composefs image in cmdline");
-    }
-    let allow_missing_fsverity = candidates[0].is_insecure();
-    if candidates
-        .iter()
-        .any(|candidate| candidate.is_insecure() != allow_missing_fsverity)
-    {
-        anyhow::bail!("composefs candidates have mixed fs-verity policy");
-    }
-
-    let (new_root, composefs_info) = match &args.root_fs {
-        Some(path) => (
-            open_root_fs(path).context("Failed to clone specified root fs")?,
-            candidates[0].clone(),
-        ),
-        None => select_composefs_candidate(&candidates, |candidate| {
-            mount_composefs_candidate(&sysroot, candidate, allow_missing_fsverity)
-        })?,
     };
 
     // we need to clone this before the next step to make sure we get the old one
@@ -710,6 +756,124 @@ mod tests {
     };
 
     use super::*;
+    use cap_std_ext::{cap_std::ambient_authority, cap_tempfile};
+
+    #[test]
+    fn test_read_config_from_root() -> Result<()> {
+        let root = cap_tempfile::tempdir(ambient_authority())?;
+        assert_eq!(read_config(&*root)?, Config::default());
+        root.create_dir_all("usr/lib/composefs")?;
+        let path = SETUP_ROOT_CONF_PATH.trim_start_matches('/');
+        let text = "[etc]\nmount = 'none'\n[var]\nmount = 'none'\n[root]\ntransient = true";
+        root.write(path, text)?;
+        assert_eq!(read_config(&*root)?, parse(text));
+        root.write(path, "[etc]\nmount = 'invalid'")?;
+        assert!(
+            read_config(&*root)
+                .unwrap_err()
+                .to_string()
+                .contains("Parsing")
+        );
+        root.remove_file(path)?;
+        root.create_dir(path)?;
+        assert!(read_config(&*root).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_override_requires_root_fs() {
+        assert!(Args::try_parse_from(["setup-root", "--config=/test.toml"]).is_err());
+        let args = Args::try_parse_from(["setup-root", "--root-fs=/image", "--config=/test.toml"])
+            .unwrap();
+        assert_eq!(args.config.as_deref(), Some(Path::new("/test.toml")));
+        assert!(Args::parse_from(["setup-root"]).config.is_none());
+    }
+
+    #[test]
+    fn test_config_symlinks_stay_in_image() -> Result<()> {
+        let temp = cap_tempfile::tempdir(ambient_authority())?;
+        temp.create_dir_all("image/usr/lib/composefs")?;
+        let root = temp.open_dir("image")?;
+        let path = SETUP_ROOT_CONF_PATH.trim_start_matches('/');
+        let policy = "[etc]\nmount = 'none'";
+        root.write("usr/lib/composefs/policy.toml", policy)?;
+        rustix::fs::symlinkat("/usr/lib/composefs/policy.toml", &root, path)?;
+        assert_eq!(read_config(&root)?, parse(policy));
+        root.remove_file(path)?;
+        // An ordinary openat would follow this out of image into temp.
+        temp.write("outside.toml", "[root]\ntransient = true")?;
+        rustix::fs::symlinkat("../../../../outside.toml", &root, path)?;
+        assert_eq!(read_config(&root)?, Config::default());
+        Ok(())
+    }
+
+    // Run with: unshare -Ur -m cargo test -p bootc-initramfs-setup -- --ignored
+    // Mounts must be isolated from the host and the other unit tests.
+    fn check_setup_root_image_policy(offline: bool) -> Result<()> {
+        let temp = cap_tempfile::tempdir(ambient_authority())?;
+        temp.create_dir_all("image/usr/lib/composefs")?;
+        for path in ["image/etc", "image/var", "physical", "target"] {
+            temp.create_dir(path)?;
+        }
+        temp.write("image/etc/origin", "image")?;
+        temp.write("image/var/origin", "image")?;
+        temp.write(
+            "image/usr/lib/composefs/setup-root-conf.toml",
+            "[etc]\nmount = 'none'\n[var]\nmount = 'none'",
+        )?;
+        // Deliberately omit state/etc and state/var: using the defaults would fail.
+        temp.create_dir_all(format!(
+            "physical/state/deploy/{}",
+            Sha512HashValue::EMPTY.to_hex()
+        ))?;
+        let base = PathBuf::from(format!("/proc/self/fd/{}", temp.as_raw_fd()));
+        let sysroot = base.join("physical");
+        let target = base.join("target");
+        let image = base.join("image");
+        let physical = bind_mount(&*temp, "physical")?;
+        mount_at_wrapper(&physical, CWD, &sysroot)?;
+        let karg = v1(Sha512HashValue::EMPTY, false);
+        let args = if offline {
+            let mut args = Args::for_deployment(sysroot, Some(target.clone()), karg);
+            args.root_fs = Some(image);
+            args
+        } else {
+            Args::try_parse_from([
+                OsString::from("setup-root"),
+                "--sysroot".into(),
+                sysroot.into_os_string(),
+                "--target".into(),
+                target.clone().into_os_string(),
+                "--root-fs".into(),
+                image.into_os_string(),
+                "--cmdline".into(),
+                karg.into(),
+            ])?
+        };
+        let result = setup_root(args);
+        if result.is_ok() {
+            assert_eq!(std::fs::read_to_string(target.join("etc/origin"))?, "image");
+            assert_eq!(std::fs::read_to_string(target.join("var/origin"))?, "image");
+        }
+        // Release the attached image before TempDir attempts recursive cleanup.
+        unmount(&target, UnmountFlags::DETACH)?;
+        if cfg!(feature = "pre-6.15") {
+            unmount(base.join("physical"), UnmountFlags::DETACH)?;
+        }
+        result
+    }
+
+    #[test]
+    #[ignore = "requires a private mount namespace with CAP_SYS_ADMIN"]
+    fn test_setup_root_image_policy() -> Result<()> {
+        check_setup_root_image_policy(false)
+    }
+
+    #[test]
+    #[ignore = "requires a private mount namespace with CAP_SYS_ADMIN"]
+    fn test_offline_setup_root_image_policy() -> Result<()> {
+        check_setup_root_image_policy(true)
+    }
 
     #[test]
     fn test_strict_mount_rejects_unverified_images() -> Result<()> {
