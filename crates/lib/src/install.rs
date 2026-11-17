@@ -2902,6 +2902,16 @@ pub(crate) async fn install_to_filesystem(
         warn_on_host_root(&target_rootfs_fd)?;
     }
 
+    // An ostree host mounts its physical root read-only and marks it
+    // immutable. The ostree backend also undoes this when it reuses the
+    // layout, but the composefs backend writes there directly.
+    if is_already_ostree {
+        let path = ".".into();
+        crate::utils::open_dir_remount_rw(&rootfs_fd, path)
+            .context("Remounting physical root read-write")?;
+        crate::utils::remove_immutability(&rootfs_fd, path)?;
+    }
+
     match fsopts.replace {
         Some(ReplaceMode::Wipe) => {
             let rootfs_fd = rootfs_fd.try_clone()?;
