@@ -83,7 +83,7 @@ const BASE_IMAGE_PREFIX: &str = "ostree/container/baseimage/bootc";
 // individual layers.
 // TODO: Read this policy from the proxy once
 // https://github.com/podman-container-tools/container-libs/pull/951 is available.
-const PULL_MAX_RETRIES: u32 = 3;
+pub(crate) const PULL_MAX_RETRIES: u32 = 3;
 const PULL_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 
 /// Progress output shared by all attempts to pull an image.
@@ -911,7 +911,7 @@ fn is_retryable_pull_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn pull_retry_delay(retry: u32) -> Duration {
+pub(crate) fn pull_retry_delay(retry: u32) -> Duration {
     PULL_RETRY_INITIAL_DELAY.saturating_mul(2_u32.saturating_pow(retry))
 }
 
@@ -1817,7 +1817,7 @@ mod tests {
         );
         // Verify the version is present (not just "bootc/")
         assert!(
-            prefix.len() > "bootc/".len(),
+            prefix.len() > b"bootc/".len(),
             "Version should be present after bootc/"
         );
     }

@@ -55,6 +55,55 @@ pub(crate) const SUBPATH: &str = "storage";
 /// relative to the /run directory
 const RUNROOT: &str = "bootc/storage";
 
+/// Only retry failures that carry a known transient network or registry diagnostic.
+const TRANSIENT_PULL_MARKERS: &[&str] = &[
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "temporary failure in name resolution",
+    "server misbehaving",
+    "429 too many requests",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "toomanyrequests",
+];
+
+fn is_transient_pull_stderr(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    TRANSIENT_PULL_MARKERS
+        .iter()
+        .any(|marker| stderr.contains(marker))
+}
+
+/// Retry the same image pull, not the surrounding storage operations.
+async fn run_pull_with_retry(cmd: &mut AsyncCommand, image: &str) -> Result<()> {
+    use crate::deploy::{PULL_MAX_RETRIES, pull_retry_delay};
+
+    for retries in 0..=PULL_MAX_RETRIES {
+        let mut output = cmd.output().await?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if retries == PULL_MAX_RETRIES || !is_transient_pull_stderr(&stderr) {
+            return output
+                .status
+                .check_status()
+                .with_context(|| format!("podman pull {image}: {stderr}"));
+        }
+        let delay = pull_retry_delay(retries);
+        tracing::warn!(
+            "Pulling {image} failed; retrying in {} seconds ({}/{PULL_MAX_RETRIES}): {stderr}",
+            delay.as_secs(),
+            retries + 1,
+        );
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("the final attempt returns its result")
+}
+
 /// Only bare names and `containers-storage:` references can name an image in storage.
 fn resolvable_in_storage(image: &str) -> bool {
     match ImageReference::try_from(image) {
@@ -472,7 +521,9 @@ impl CStorage {
         cmd.args(["pull", image]);
         tracing::debug!("Pulling image: {image}");
         let mut cmd = AsyncCommand::from(cmd);
-        cmd.run().await.context("Failed to pull image")?;
+        run_pull_with_retry(&mut cmd, image)
+            .await
+            .context("Failed to pull image")?;
         Ok(true)
     }
 
@@ -528,6 +579,110 @@ impl CStorage {
 mod tests {
     use super::*;
     static_assertions::assert_not_impl_any!(CStorage: Sync);
+
+    #[test]
+    fn test_transient_pull_stderr() {
+        let cases = [
+            ("Error: pinging registry: i/o timeout", true),
+            ("Error: TLS handshake timeout", true),
+            ("Error: connection timed out", true),
+            ("Error: read: connection reset by peer", true),
+            ("Error: dial tcp: connect: connection refused", true),
+            (
+                "Error: lookup registry: Temporary failure in name resolution",
+                true,
+            ),
+            ("Error: lookup registry: server misbehaving", true),
+            ("Error: StatusCode: 429 Too Many Requests", true),
+            (
+                "Error: received unexpected HTTP status: 502 Bad Gateway",
+                true,
+            ),
+            (
+                "Error: received unexpected HTTP status: 503 Service Unavailable",
+                true,
+            ),
+            (
+                "Error: received unexpected HTTP status: 504 Gateway Timeout",
+                true,
+            ),
+            ("Error: TOOMANYREQUESTS: pull rate limit exceeded", true),
+            ("", false),
+            ("Error: unauthorized: authentication required", false),
+            (
+                "Error: denied: requested access to the resource is denied",
+                false,
+            ),
+            ("Error: manifest unknown", false),
+            ("Error: signature policy rejected image", false),
+            (
+                "Error: x509: certificate signed by unknown authority",
+                false,
+            ),
+            ("Error: lookup registry: no such host", false),
+            ("Error: writing blob: no space left on device", false),
+            (
+                "Error: received unexpected HTTP status: 500 Internal Server Error",
+                false,
+            ),
+            (
+                "Error: received unexpected HTTP status: 404 Not Found",
+                false,
+            ),
+            (
+                "Error: opening /storage/sha256:abc502def: permission denied",
+                false,
+            ),
+        ];
+        for (stderr, expected) in cases {
+            assert_eq!(is_transient_pull_stderr(stderr), expected, "{stderr}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pull_retries_transient_first_failure() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut cmd = AsyncCommand::new("sh");
+        cmd.args([
+            "-c",
+            "if mkdir \"$1/attempted\"; then printf 'connection reset by peer' >&2; exit 1; fi",
+            "test-pull",
+        ])
+        .arg(tmp.path())
+        .stdout(Stdio::null());
+        run_pull_with_retry(&mut cmd, "test-image").await?;
+        assert!(tmp.path().join("attempted").is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pull_retry_limit_and_permanent_failure() -> Result<()> {
+        for (stderr, expected_attempts) in [
+            ("connection refused", crate::deploy::PULL_MAX_RETRIES + 1),
+            ("unauthorized", 1),
+        ] {
+            let tmp = tempfile::tempdir()?;
+            let attempts = tmp.path().join("attempts");
+            let mut cmd = AsyncCommand::new("sh");
+            cmd.args([
+                "-c",
+                "printf 'attempt\\n' >> \"$1\"; printf '%s' \"$2\" >&2; exit 1",
+                "test-pull",
+            ])
+            .arg(&attempts)
+            .arg(stderr)
+            .stdout(Stdio::null());
+            let error = run_pull_with_retry(&mut cmd, "test-image")
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(stderr));
+            assert_eq!(
+                std::fs::read_to_string(attempts)?.lines().count(),
+                expected_attempts as usize,
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_resolvable_in_storage() {
