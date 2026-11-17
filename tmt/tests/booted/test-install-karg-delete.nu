@@ -7,13 +7,14 @@
 #
 use std assert
 use tap.nu
+use install_testlib.nu
 #
 # Use an OS-matched target image to avoid version mismatches
 let target_image = (tap get_target_image)
 
 # setup filesystem
 mkdir /var/mnt
-truncate -s 10G disk.img
+install_testlib create_disk disk.img
 mkfs.ext4 disk.img
 mount -o loop disk.img /var/mnt
 

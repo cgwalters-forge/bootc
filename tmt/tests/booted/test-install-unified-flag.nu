@@ -11,6 +11,7 @@
 
 use std assert
 use tap.nu
+use install_testlib.nu
 
 # Use an OS-matched target image to avoid version mismatches
 # (e.g., XFS features created by newer mkfs.xfs not recognized by older grub2)
@@ -21,7 +22,7 @@ def main [] {
 
     # Setup filesystem - create a loopback disk image
     mkdir /var/mnt
-    truncate -s 10G disk.img
+    install_testlib create_disk disk.img
 
     # Disable SELinux enforcement for the install (same as test-install-outside-container)
     setenforce 0
