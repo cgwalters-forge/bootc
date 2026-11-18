@@ -1503,6 +1503,29 @@ fn require_boot_uuid(spec: &MountSpec) -> Result<&str> {
         .ok_or_else(|| anyhow!("/boot is not specified via UUID= (this is currently required)"))
 }
 
+/// Returns the source of the separate /boot filesystem if it is not mounted on
+/// the physical root's `boot` directory.
+///
+/// When installing to an existing ostree system, the physical root is its
+/// `/sysroot`, whose `boot` is a plain directory on the root filesystem; the
+/// /boot partition is only mounted at the deployment's `/boot`. Boot entries
+/// written to that directory would not be seen by the bootloader.
+fn unmounted_separate_boot<'a>(
+    physical_root: &Dir,
+    boot: Option<&'a MountSpec>,
+) -> Result<Option<&'a str>> {
+    let Some(boot) = boot.filter(|boot| !boot.source.is_empty()) else {
+        return Ok(None);
+    };
+    if !physical_root.try_exists(BOOT)? {
+        return Ok(None);
+    }
+    let is_mountpoint = physical_root
+        .is_mountpoint(BOOT)
+        .with_context(|| format!("Checking if /{BOOT} is a mountpoint"))?;
+    Ok((is_mountpoint == Some(false)).then_some(boot.source.as_str()))
+}
+
 impl RootSetup {
     /// Get the UUID= mount specifier for the /boot filesystem; if there isn't one, the root UUID will
     /// be returned.
@@ -2292,6 +2315,15 @@ async fn install_to_filesystem_impl(
     }
 
     if state.composefs_options.composefs_backend {
+        // Like the ostree backend, put the boot entries and GRUB's boot UUID
+        // on the separate /boot partition rather than the root filesystem.
+        let boot_source = unmounted_separate_boot(&rootfs.physical_root, rootfs.boot.as_ref())?;
+        if let Some(source) = boot_source {
+            let target = rootfs.physical_root_path.join(BOOT);
+            tracing::debug!("Mounting {source} on {target}");
+            bootc_mount::mount(source, &target)?;
+        }
+
         let fetch_ref = state.source.composefs_fetch_reference();
         let (manifest, _) = get_container_manifest_and_config(&fetch_ref).await?;
         // A capable filesystem gets a strict provisional repository.  The
@@ -3436,6 +3468,28 @@ mod tests {
             let fetched = composefs_fetch_reference(&original, config_id);
             assert_eq!(fetched.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn test_unmounted_separate_boot() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        let boot = MountSpec::new_uuid_src("5a7b437b", "/boot");
+        let empty = MountSpec::new("", "/boot");
+
+        // No boot directory in the physical root
+        assert_eq!(unmounted_separate_boot(&td, Some(&boot))?, None);
+
+        td.create_dir(BOOT)?;
+        // A single filesystem, or an explicitly empty boot mount spec
+        assert_eq!(unmounted_separate_boot(&td, None)?, None);
+        assert_eq!(unmounted_separate_boot(&td, Some(&empty))?, None);
+        // A separate /boot partition that the physical root's boot directory
+        // doesn't have mounted, as when it is an existing ostree system's /sysroot
+        assert_eq!(
+            unmounted_separate_boot(&td, Some(&boot))?,
+            Some("UUID=5a7b437b")
+        );
+        Ok(())
     }
 
     #[test]
