@@ -2102,6 +2102,22 @@ fn select_bootloader(
     }
 }
 
+fn validate_existing_root_bootloader(
+    configured: Option<Bootloader>,
+    host_root: &Path,
+) -> Result<()> {
+    if configured == Some(Bootloader::Systemd) {
+        ensure!(
+            host_root
+                .join("sys/firmware/efi")
+                .try_exists()
+                .context("Checking whether the host booted through EFI")?,
+            "systemd-boot is UEFI-only, but the host did not boot through EFI; use --bootloader grub instead"
+        );
+    }
+    Ok(())
+}
+
 /// Given a baseline root filesystem with an ostree sysroot initialized:
 /// - install the container to that root
 /// - install the bootloader
@@ -2875,6 +2891,13 @@ pub(crate) async fn install_to_filesystem(
     )
     .await?;
 
+    // An explicit selection (CLI over install config) takes priority over
+    // image-based detection. Check the host's sysfs (not the container's) before
+    // removing the existing boot files.
+    if targeting_host_root || fsopts.replace == Some(ReplaceMode::Alongside) {
+        validate_existing_root_bootloader(state.config_opts.bootloader, Path::new("/proc/1/root"))?;
+    }
+
     // Check to see if this happens to be the real host root
     if !fsopts.acknowledge_destructive {
         warn_on_host_root(&target_rootfs_fd)?;
@@ -3352,6 +3375,22 @@ mod tests {
             select_bootloader(Some(Bootloader::Grub), Some(Bootloader::None), &root)?,
             Bootloader::Grub
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_existing_root_bootloader() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path();
+        let err = validate_existing_root_bootloader(Some(Bootloader::Systemd), root).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("systemd-boot is UEFI-only"), "{message}");
+        assert!(message.contains("--bootloader grub"), "{message}");
+        validate_existing_root_bootloader(Some(Bootloader::Grub), root)?;
+        validate_existing_root_bootloader(None, root)?;
+
+        std::fs::create_dir_all(root.join("sys/firmware/efi"))?;
+        validate_existing_root_bootloader(Some(Bootloader::Systemd), root)?;
         Ok(())
     }
 
