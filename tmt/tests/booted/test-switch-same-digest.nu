@@ -25,5 +25,6 @@ podman tag localhost/bootc localhost/bootc-same-digest
 # as the booted deployment.
 let result = do { bootc switch --transport containers-storage localhost/bootc-same-digest } | complete
 assert ($result.exit_code != 0) "Expected bootc switch to fail for same-digest image"
+assert str contains $result.stderr "already running"
 
 tap ok
